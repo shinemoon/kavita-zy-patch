@@ -18,7 +18,9 @@ import os
 import re
 import socketserver
 import sys
+import threading
 import traceback
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -36,8 +38,8 @@ if CONF.exists():
         k, v = line.split("=", 1)
         _cfg[k.strip()] = v.strip().strip('"')
 
-API_PORT = int(_cfg.get("API_PORT", "5099"))
-API_BIND = _cfg.get("API_BIND", "0.0.0.0")
+API_PORT = int(os.environ.get("ZY_API_PORT") or _cfg.get("API_PORT", "5099"))
+API_BIND = os.environ.get("ZY_API_BIND") or _cfg.get("API_BIND", "0.0.0.0")
 TOKEN = (_cfg.get("TOKEN", "") or "").strip()
 TOKEN_FILE = _cfg.get("TOKEN_FILE", "")
 if not TOKEN and TOKEN_FILE and Path(TOKEN_FILE).exists():
@@ -45,6 +47,14 @@ if not TOKEN and TOKEN_FILE and Path(TOKEN_FILE).exists():
 
 BRIDGE_ROOT = _cfg.get("BRIDGE_ROOT", "/vol2/1001/zhangyue-bridge")
 AUTH_JSON = Path(BRIDGE_ROOT) / ".auth.json"
+
+# ---- 自动同步钩子 (Kavita 前端在读书时触发) ------------------------------
+# AUTO_SYNC=0 关掉全部自动行为 (前端会读 /zy/api/auto/cfg 自行判断)。
+AUTO_SYNC = (_cfg.get("AUTO_SYNC", "1") or "1").strip()
+AUTO_PUSH_DEBOUNCE = int(_cfg.get("AUTO_PUSH_DEBOUNCE", "8") or 8)
+AUTO_PULL_GAP = int(_cfg.get("AUTO_PULL_GAP", "120") or 120)
+# push / pull 都会读写 kavita.db + 打掌阅 API, 串行化, 不并发。
+_auto_lock = threading.Lock()
 
 log_fh = None
 
@@ -198,6 +208,89 @@ def api_pull(dry_run: bool = False) -> dict:
     return core.pull_once(auth_or_none(), dry_run=dry_run)
 
 
+# ---- 自动同步钩子 (Kavita 读书页在调) ------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _series_pages_read(series_id: int) -> tuple[int, int]:
+    """(已读页合计, 总页合计) —— 只看 Kavita 侧, 用来判断 pull 有没有改动。"""
+    try:
+        _, _, kavita_db, _ = bridge()
+        read = total = 0
+        for p in kavita_db.iter_progress():
+            if p.series_id != series_id:
+                continue
+            read += p.pages_read or 0
+            total += p.total_pages or 0
+        return read, total
+    except Exception:
+        return 0, 0
+
+
+def api_auto_cfg() -> dict:
+    return {
+        "ok": True,
+        "enabled": AUTO_SYNC == "1",
+        "push_debounce_sec": AUTO_PUSH_DEBOUNCE,
+        "pull_gap_sec": AUTO_PULL_GAP,
+    }
+
+
+def api_auto_pull(body: dict) -> dict:
+    """掌阅 → Kavita, 单本。
+
+    与手动 pull 的区别: only_forward=True —— 本地比掌阅靠前就原地不动。
+    自动行为不该在用户打开书时把 Kavita 往回拨。
+    """
+    if AUTO_SYNC != "1":
+        return {"ok": True, "skipped": "auto_disabled"}
+    sid = int(body.get("series_id") or 0)
+    if not sid:
+        raise ValueError("缺 series_id")
+    core, mapping, _, _ = bridge()
+    if mapping.get(sid) is None:
+        return {"ok": True, "skipped": "no_link", "series_id": sid}
+    if not _auto_lock.acquire(blocking=False):
+        return {"ok": False, "busy": True, "series_id": sid}
+    try:
+        before, total = _series_pages_read(sid)
+        res = core.pull_once(auth_or_none(), series_ids={sid}, only_forward=True)
+        after, _ = _series_pages_read(sid)
+    finally:
+        _auto_lock.release()
+    mapping.state_set(f"auto_pull_last_{sid}", _now_iso())
+    changed = after > before
+    log(f"auto-pull series={sid} kavita {before}->{after}/{total} "
+        f"updated={res.get('updated')} skipped={res.get('skipped')}")
+    return {"ok": True, "series_id": sid, "changed": changed,
+            "pages_read": after, "pages": total,
+            "before": before, "detail": res}
+
+
+def api_auto_push(body: dict) -> dict:
+    """Kavita → 掌阅, 单本。push_decision 那道闸仍然生效 (不回退)。"""
+    if AUTO_SYNC != "1":
+        return {"ok": True, "skipped": "auto_disabled"}
+    sid = int(body.get("series_id") or 0)
+    if not sid:
+        raise ValueError("缺 series_id")
+    core, mapping, _, _ = bridge()
+    if mapping.get(sid) is None:
+        return {"ok": True, "skipped": "no_link", "series_id": sid}
+    if not _auto_lock.acquire(blocking=False):
+        return {"ok": False, "busy": True, "series_id": sid}
+    try:
+        res = core.push_once(auth_or_none(), series_ids={sid})
+    finally:
+        _auto_lock.release()
+    mapping.state_set(f"auto_push_last_{sid}", _now_iso())
+    log(f"auto-push series={sid} pushed={res.get('pushed')} "
+        f"skipped={res.get('skipped')} failed={res.get('failed')}")
+    return {"ok": True, "series_id": sid, "detail": res}
+
+
 def api_link(body: dict) -> dict:
     _, mapping, _, _ = bridge()
     required = ("kavita_series_id", "zy_book_id", "zy_book_name")
@@ -307,11 +400,14 @@ ROUTES_GET = {
     "/zy/api/status": api_status,
     "/zy/api/health": lambda: {"ok": True, "ts": __import__("time").time()},
     "/zy/api/selfcheck": api_selfcheck,
+    "/zy/api/auto/cfg": api_auto_cfg,
 }
 ROUTES_POST = {
     "/zy/api/push": lambda b: api_push(bool(b.get("dry_run"))),
     "/zy/api/pull": lambda b: api_pull(bool(b.get("dry_run"))),
     "/zy/api/link": api_link,
+    "/zy/api/auto/pull": api_auto_pull,
+    "/zy/api/auto/push": api_auto_push,
 }
 
 

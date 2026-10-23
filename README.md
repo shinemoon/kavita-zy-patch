@@ -20,10 +20,13 @@
 ```
 Kavita SPA (容器 :5000)
   └─ index.html 末尾 <script src="zy-kavita-patch.js">   ← 注入点
+        ├─ 入口按钮 → 控制台 :5012
+        ├─ 读书钩子 (v0.4.0)  ← 见下节「自动同步」
         └─ fetch → 补丁后端 (host :5111)
                       ├─ /zy/api/status     两侧进度对照
                       ├─ /zy/api/selfcheck  体检 (warning 数据源)
-                      ├─ /zy/api/push|pull  调 bridge sync 包
+                      ├─ /zy/api/push|pull  调 bridge sync 包 (全库)
+                      ├─ /zy/api/auto/pull|push  单本 (读书钩子用)
                       └─ /zy/api/link       建映射
                             └─ /vol2/1001/zhangyue-bridge/sync
                                   ├─ sync/kavita_db.py  直读写 kavita.db
@@ -31,6 +34,24 @@ Kavita SPA (容器 :5000)
 ```
 
 补丁不碰 Kavita 任何一行代码，纯外部注入。
+
+## 自动同步：读书钩子 (v0.4.0)
+
+目标是让 Kavita 读书时的前进/后退跟掌阅 App 一样自然，不用记着点按钮。
+
+| 时机 | 动作 | 语义 |
+|---|---|---|
+| 进书 `/library/x/series/S/book/C` | `auto/pull` | 掌阅 → Kavita，**只前进不回退**；位置真变了才 `location.reload()` 落到掌阅那页 |
+| 阅读中 Kavita 存进度（`POST api/reader/progress`） | `auto/push` | Kavita → 掌阅，去抖 8s；`push_decision` 闸门照旧，回退/半页内不动 |
+| 离开书 / 标签页隐藏 | flush | 立刻把压着的 push 发掉（`sendBeacon`，token 走 query） |
+| 系列详情页 | `auto/pull` | 只刷进度条，不重载 |
+
+- 前端启动先读 `GET /zy/api/auto/cfg`，`AUTO_SYNC=0` 就完全不挂钩子（一行代码都不跑）
+- 钩子是 `XMLHttpRequest` + `fetch` 的轻包装，只看 URL 含 `reader/progress`；不改 Angular 任何东西
+- 防抖/防环：同书 pull 间隔 `AUTO_PULL_GAP`（默认 120s，存 sessionStorage）、重载间隔 10s、
+  push 去抖 `AUTO_PUSH_DEBOUNCE`（默认 8s）；pull 写的是 DB 不走 reader，不会触发自己
+- 调试：浏览器控制台 `__ZY__.auto()` 看开关 + 最近 24 条动作；`__ZY__.pull(26)` / `__ZY__.push(26)` 手动触发
+- 后端 `auto/pull|push` 只处理传进来的 `series_id`，不再全库扫；两个动作互斥（同一把锁，忙则返回 `busy`）
 
 ## 5012 控制台：「Kavita 改造」卡
 
@@ -61,7 +82,8 @@ Kavita SPA (容器 :5000)
 | crontab `@reboot` | 开机 30s 后跑一次（把 5111/5012 拉起来） |
 
 `deploy/heal.sh` 幂等巡检：容器在跑 → Kavita 可访问 → 前端注入还在
-（不在就自动 `reapply.sh` 重打）→ 5111 / 5012 活着（不活就拉起）。结果写
+（不在就自动 `reapply.sh` 重打）→ 5111 / 5012 活着（不活就拉起）→ 代码比进程新就
+重启对应 unit（改了 `src/*.py` 不用等人手动 sudo）。结果写
 `state/heal.json`，事件写 `state/logs/heal.log`（512KB 轮转，成功巡检每小时只留一条
 heartbeat）。
 
@@ -153,8 +175,12 @@ warning 条只上 error + 最多 1 条 warn，info 不上条。
 | `API_PORT` | 补丁后端端口（**避开已占端口**） |
 | `TOKEN_FILE` | 共享 token 存放位置 |
 | `BRIDGE_ROOT` | zhangyue-bridge 目录 |
+| `AUTO_SYNC` | `1` = 开读书钩子；`0` = 前端完全不挂钩子 |
+| `AUTO_PUSH_DEBOUNCE` | 阅读中存进度后等几秒再 push（默认 8） |
+| `AUTO_PULL_GAP` | 同一本书两次 auto pull 的最小间隔秒数（默认 120） |
 
 改端口后要 `./install.sh` 重装（token 和端口会重新渲染进前端）。
+改 `AUTO_*` 只需重启补丁后端（`systemctl restart kavita-zy-api` 或等 heal 3 分钟内自己发现代码变新）。
 
 ## 仓库里不含什么
 

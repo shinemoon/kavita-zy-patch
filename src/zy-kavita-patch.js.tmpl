@@ -2,6 +2,15 @@
  *
  * 注入到 Kavita SPA。纯 vanilla JS, 不碰 Angular。
  *
+ * v0.4.0 (2026-10-23): 加了**读书钩子** —— 进书自动 pull, 阅读中自动 push。
+ *   - 进书 (/library/x/series/S/book/C) → POST /zy/api/auto/pull (掌阅→Kavita,
+ *     只前进不回退); 位置真变了才 location.reload() 落到掌阅那页
+ *   - 阅读中 Kavita 存进度 (POST api/reader/progress) → 去抖 8s 后 auto/push
+ *     (Kavita→掌阅, push_decision 闸门照旧, 不会把掌阅往回拨)
+ *   - 离开书 / 页面隐藏 → 立刻 flush 未发的 push (sendBeacon, token 走 query)
+ *   开关和时延都在 patch.conf 的 AUTO_SYNC / AUTO_PUSH_DEBOUNCE / AUTO_PULL_GAP;
+ *   前端启动先读 /zy/api/auto/cfg, 关掉就完全不挂钩子。
+ *
  * v0.3.0 (2026-10-23): 入口挪到**两个**地方, 解决"看不到按钮"。
  *   - 顶栏 (navbar) 圆点+图标+文字按钮 —— 任何宽度都可见 (窄屏只留图标)
  *   - 左侧导航项 —— 打开侧边抽屉时的长文本入口
@@ -165,6 +174,184 @@
     }
   }
 
+  // ---- 自动同步: 读书钩子 (v0.4.0) ------------------------------------
+  // 语义对齐掌阅 App:
+  //   进书            → pull (掌阅 -> Kavita, 只前进不回退, 位置变了才重载)
+  //   阅读中存进度    → push (Kavita -> 掌阅, 去抖, push_decision 闸门防回退)
+  //   离开书/页面隐藏 → 立刻 flush 未发出的 push
+  var AUTO = { on: false, debounce: 8, gap: 120 };
+  var READER_RE = /\/library\/\d+\/series\/(\d+)\/book\/\d+/;
+  var SERIES_RE = /\/library\/\d+\/series\/(\d+)(?:\/|$)/;
+  var rt = { reader: null, series: null };
+  var pushTimers = {};
+  var autoLog = [];
+
+  function note(msg) {
+    autoLog.push({ t: new Date().toISOString().slice(11, 19), m: msg });
+    if (autoLog.length > 24) autoLog.shift();
+  }
+
+  function apiPost(path, body, keepalive) {
+    var init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-ZY-Token': TOKEN },
+      body: JSON.stringify(body || {})
+    };
+    if (keepalive) init.keepalive = true;
+    return fetch(BASE + path, init).then(function (r) {
+      return r.json().catch(function () { return {}; });
+    });
+  }
+
+  // pull: 掌阅 -> Kavita。allowReload=true 时位置真变了才重载到掌阅那页。
+  function pullSeries(sid, allowReload) {
+    if (!AUTO.on || !sid) return;
+    var ck = 'zy_pull_' + sid;
+    var now = Date.now();
+    if (now - (+(sessionStorage.getItem(ck) || 0)) < AUTO.gap * 1000) return;
+    try { sessionStorage.setItem(ck, String(now)); } catch (e) {}
+    note('pull #' + sid + ' …');
+    apiPost('/auto/pull', { series_id: sid }).then(function (j) {
+      if (!j || j.ok === false) { note('pull #' + sid + ' busy'); return; }
+      if (j.skipped) { note('pull #' + sid + ' ' + j.skipped); return; }
+      note('pull #' + sid + ' ' + j.before + '->' + j.pages_read + '/' + j.pages);
+      if (!j.changed || !allowReload) return;
+      var rk = 'zy_reload_' + sid;
+      if (Date.now() - (+(sessionStorage.getItem(rk) || 0)) < 10000) return;
+      try { sessionStorage.setItem(rk, String(Date.now())); } catch (e) {}
+      note('pull #' + sid + ' 位置变了, 重载到掌阅位置');
+      setTimeout(function () { location.reload(); }, 120);
+    }).catch(function (e) { note('pull #' + sid + ' ERR ' + e.message); });
+  }
+
+  function pushNow(sid) {
+    if (!AUTO.on || !sid) return;
+    apiPost('/auto/push', { series_id: sid }).then(function (j) {
+      var d = (j && j.detail) || {};
+      note('push #' + sid + ' +' + (d.pushed || 0) + ' ~' + (d.skipped || 0) +
+           ' !' + (d.failed || 0));
+    }).catch(function (e) { note('push #' + sid + ' ERR ' + e.message); });
+  }
+
+  function schedulePush(sid) {
+    if (!AUTO.on || !sid) return;
+    if (pushTimers[sid]) clearTimeout(pushTimers[sid]);
+    pushTimers[sid] = setTimeout(function () {
+      delete pushTimers[sid];
+      pushNow(sid);
+    }, AUTO.debounce * 1000);
+  }
+
+  function flushPush(useBeacon) {
+    Object.keys(pushTimers).forEach(function (sid) {
+      clearTimeout(pushTimers[sid]);
+      delete pushTimers[sid];
+      if (useBeacon && navigator.sendBeacon) {
+        try {
+          navigator.sendBeacon(
+            BASE + '/auto/push?token=' + encodeURIComponent(TOKEN),
+            JSON.stringify({ series_id: +sid }));
+          note('push #' + sid + ' beacon');
+          return;
+        } catch (e) { /* 落回普通请求 */ }
+      }
+      pushNow(+sid);
+    });
+  }
+
+  function routeTick() {
+    var p = location.pathname;
+    var rm = READER_RE.exec(p);
+    var rn = rm ? +rm[1] : null;
+    var sm = SERIES_RE.exec(p);
+    var sn = (!rn && sm) ? +sm[1] : null;
+
+    if (rn !== rt.reader) {
+      if (rt.reader) flushPush(false);        // 离开上一本, 尾巴先推掉
+      rt.reader = rn;
+      if (rn) pullSeries(rn, true);           // 进书: 取掌阅进度
+    }
+    if (sn !== rt.series) {
+      rt.series = sn;
+      if (sn) pullSeries(sn, false);          // 详情页: 只刷进度, 不重载
+    }
+  }
+
+  // Kavita 保存阅读进度 = 一次 POST api/reader/progress。抓到它就排一次 push。
+  function onReaderRequest(url, body) {
+    if (!AUTO.on || !url) return;
+    if (String(url).indexOf('reader/progress') < 0) return;
+    var sid = null;
+    try {
+      if (typeof body === 'string') sid = +JSON.parse(body).seriesId || null;
+      else if (body && typeof body === 'object') sid = +body.seriesId || null;
+    } catch (e) {}
+    if (!sid) {
+      var m = READER_RE.exec(location.pathname);
+      sid = m ? +m[1] : null;
+    }
+    if (sid) { note('save #' + sid); schedulePush(sid); }
+  }
+
+  function hookNetwork() {
+    if (hookNetwork.done) return;
+    hookNetwork.done = true;
+
+    var OX = XMLHttpRequest.prototype.open;
+    var OS = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      this.__zyUrl = u;
+      return OX.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function (b) {
+      try { onReaderRequest(this.__zyUrl, b); } catch (e) {}
+      return OS.apply(this, arguments);
+    };
+
+    if (window.fetch && !window.fetch.__zyWrapped) {
+      var OF = window.fetch;
+      var WF = function (input, init) {
+        try {
+          var u = (typeof input === 'string') ? input : (input && input.url);
+          if (init && typeof init.body === 'string') onReaderRequest(u, init.body);
+        } catch (e) {}
+        return OF.apply(this, arguments);
+      };
+      WF.__zyWrapped = true;
+      window.fetch = WF;
+    }
+
+    var OPS = history.pushState;
+    var ORS = history.replaceState;
+    history.pushState = function () {
+      var r = OPS.apply(this, arguments);
+      setTimeout(routeTick, 60);
+      return r;
+    };
+    history.replaceState = function () {
+      var r = ORS.apply(this, arguments);
+      setTimeout(routeTick, 60);
+      return r;
+    };
+    window.addEventListener('popstate', function () { setTimeout(routeTick, 60); });
+    window.addEventListener('pagehide', function () { flushPush(true); });
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') flushPush(true);
+    });
+    setInterval(routeTick, 900);
+    routeTick();
+  }
+
+  function autoBoot() {
+    api('/auto/cfg').then(function (j) {
+      AUTO.on = !!j.enabled;
+      AUTO.debounce = j.push_debounce_sec || 8;
+      AUTO.gap = j.pull_gap_sec || 120;
+      if (AUTO.on) hookNetwork();
+      note('auto ' + (AUTO.on ? 'on' : 'off'));
+    }).catch(function () { note('auto cfg 读取失败'); });
+  }
+
   // ---- 生命周期 -------------------------------------------------------
   function tick() {
     injectCss();
@@ -192,6 +379,7 @@
         }).then(tick).catch(tick);
         setInterval(tick, 15000);
         setInterval(function () { probe().then(tick).catch(tick); }, 30000);
+        autoBoot();
         return;
       }
       if (tries++ > 60) return;
@@ -203,5 +391,13 @@
   else boot();
 
   // 调试口: 浏览器控制台执行 __ZY__.ver 可确认当前加载哪一版
-  window.__ZY__ = { api: api, health: health, console: CONSOLE, ver: VER, tick: tick };
+  //         __ZY__.auto() 可看自动同步开关 + 最近 24 条动作
+  window.__ZY__ = {
+    api: api, health: health, console: CONSOLE, ver: VER, tick: tick,
+    auto: function () {
+      return { on: AUTO.on, reader: rt.reader, series: rt.series,
+               debounce: AUTO.debounce, gap: AUTO.gap, log: autoLog.slice() };
+    },
+    pull: pullSeries, push: pushNow
+  };
 })();

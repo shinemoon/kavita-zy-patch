@@ -209,7 +209,38 @@ if [ "$web" != "200" ]; then
   fi
 fi
 
-# ---- 5b. 双写者纠偏 (只有 root 能做) ---------------------------------
+# ---- 5b. 代码比进程新 → 重启后端 (只有 root 能 systemctl restart) ------
+# 改了 src/*.py 或 sync 包之后, 不用等人手动 sudo systemctl restart:
+# heal 每次巡检顺带比一次 mtime, 代码新就重启。非 root (crontab 那条) 跳过。
+reload_if_stale() {   # $1=unit, 其余=代码文件
+  local unit="$1"; shift
+  [ "$AM_ROOT" = "yes" ] || return 0
+  [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "active" ] || return 0
+  local started_epoch newest=0 f mt
+  started_epoch="$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null)" +%s 2>/dev/null || echo 0)"
+  [ "$started_epoch" -gt 0 ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    [ "$mt" -gt "$newest" ] && newest="$mt"
+  done
+  [ "$newest" -gt "$started_epoch" ] || return 0
+  log "WARN $unit 代码比进程新, 重启加载"
+  if systemctl restart "$unit" >/dev/null 2>&1; then
+    note_action "reload-$unit"
+    log "OK $unit 已重启 (新代码生效)"
+  else
+    log "FAIL 重启 $unit 失败"
+  fi
+}
+
+reload_if_stale kavita-zy-api.service \
+  "$ROOT/src/api_server.py" "$ROOT/patch.conf" \
+  "$BRIDGE_ROOT/sync/sync/sync.py" "$BRIDGE_ROOT/sync/sync/config.py"
+reload_if_stale kavita-zy-web.service \
+  "$BRIDGE_ROOT/sync/web.py" "$BRIDGE_ROOT/sync/sync/sync.py"
+
+# ---- 5c. 双写者纠偏 (只有 root 能做) ---------------------------------
 # 端口活着但服务不是 systemd 起的那份 = 上一代脚本留下的孤儿。此时 unit 会
 # 一直 EADDRINUSE 重试 (Restart=always), `systemctl restart` 也永远失败。
 # 条件收紧: unit 必须 enabled (说明这台机器就是要 systemd 管), 且它当前没跑。
