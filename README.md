@@ -75,6 +75,7 @@ Kavita SPA (容器 :5000)
 |---|---|---|
 | 进书 `/library/x/series/S/book/C` | `auto/pull` | 掌阅 → Kavita，**只前进不回退**；位置真变了才 `location.reload()` 落到掌阅那页 |
 | 阅读中 Kavita 存进度（`POST api/reader/progress`） | `auto/push` | Kavita → 掌阅，去抖 8s；`push_decision` 闸门照旧，回退/半页内不动 |
+| 阅读中（不存进度也兜） | `auto/push` (tick) | 每 60s 兜一次，只在书页可见时；没推进时后端不写日志，不刷屏 |
 | 离开书 / 标签页隐藏 | flush | 立刻把压着的 push 发掉（`sendBeacon`，token 走 query） |
 | 系列详情页 | `auto/pull` | 只刷进度条，不重载 |
 
@@ -85,10 +86,29 @@ Kavita SPA (容器 :5000)
 - 调试：浏览器控制台 `__ZY__.auto()` 看开关 + 最近 24 条动作；`__ZY__.pull(26)` / `__ZY__.push(26)` 手动触发
 - 后端 `auto/pull|push` 只处理传进来的 `series_id`，不再全库扫；两个动作互斥（同一把锁，忙则返回 `busy`）
 - **看得见** (v0.4.1)：右下角小提示 —— pull 真的动了位置弹「已同步掌阅进度 41 → 49/100」，
-  push 真的推成功弹「进度已推送到掌阅」。没动就不弹（否则天天弹等于没弹）
-- **心跳** (v0.4.1)：前端加载后 `POST /zy/api/auto/hb {ver,path,on}`，后端按 (版本,路径) 5 分钟节流
-  落一条 `hb vX.Y.Z auto=on path=...` 到 `state/logs/api.log`，同时写 `state/last_hb.json`。
-  排查"钩子到底跑没跑"先看这两处 —— 没有 = 浏览器根本没加载这一版钩子，别去怀疑 pull/push 逻辑
+  push 真的推成功弹「已推送到掌阅 27.37%」。没动就不弹（否则天天弹等于没弹）
+- **心跳** (v0.4.1, v0.4.4 扩)：前端加载后 `POST /zy/api/auto/hb {ver,path,on,saves,pushes,base,msgs}`，
+  后端按 (版本,路径,计数器) 5 分钟节流落一条
+  `hb vX.Y.Z auto=on path=... saves=N pushes=M | 客户端最近 6 条动作` 到 `state/logs/api.log`
+  + `state/last_hb.json`。
+  **排查"钩子跑没跑"看 `saves` 有没有随阅读增长** —— 不增长 = 这一页没有钩子（缓存 /
+  加载时后端正好在重启 / 设备连不到 5111），别去怀疑 pull/push 逻辑
+
+### v0.4.4：让"自动"真的能跑起来
+
+2026-10-24 事故复盘：用户读了整晚，`api.log` 里一次 `hb` / `auto-push` 都没有，
+而 Kavita 自己的 `POST /api/reader/progress` 一直在进（服务端日志有 13 次）。
+四个可能断点全都堵上：
+
+| 断点 | 后果 | 修法 |
+|---|---|---|
+| `GET /auto/cfg` 失败（后端正重启/网络抖） | `AUTO.on` 永远 false，**整页从此没有钩子**，且不发心跳（`.catch` 里只记 note） | cfg 失败 → 15~100s 退避重试（最多 20 次）+ **仍然发心跳**（带失败原因），服务端能立刻看到 |
+| 连续翻页不断重置去抖 | 读得快时 push 永远等不到 | 去抖 + **最大等待 30s**：到点先推一次 |
+| Kavita 不是每次位置变化都存进度 | 位置动了但没 push | 书页可见时**每 60s 定时兜底**一次（`tick`，没推进则不落日志） |
+| `http://host:5111` 不可达（HTTPS 页面 / 跨网段 / 手机走域名） | 所有调用静默失败 | 启动时**探测两个 base**：先 `<origin>/zy/api`（需要反代），再 `host:5111`；严格校验 `/health` 返回 `{ok:true,ts}` —— Kavita SPA 对未知路径也返 200 HTML，宽松判定会误判 |
+
+配套日志：`auto-push` 行现在带 `kv=..% zy=..% why=noop|forward|regress|no-baseline`，
+不再只有 `pushed=0 skipped=1` 这种没法定位的计数。
 
 **多标签 / 多设备**：钩子按标签页独立工作，同一本书的 pull 有 `AUTO_PULL_GAP` 间隔，
 所以两台设备同时开着同一本书时只有先到的那台会 pull；push 各自照推（`push_decision` 会挡回退）。

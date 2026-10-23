@@ -252,14 +252,25 @@ def api_auto_hb(body: dict) -> dict:
     ver = str(body.get("ver") or "?")
     path = str(body.get("path") or "")
     on = bool(body.get("on"))
+    saves = int(body.get("saves") or 0)
+    pushes = int(body.get("pushes") or 0)
+    base = str(body.get("base") or "")[:80]
+    msgs = body.get("msgs") or []
+    if isinstance(msgs, list):
+        msgs = [str(m)[:120] for m in msgs][-6:]
+    else:
+        msgs = []
     now = _time.time()
-    key = f"{ver} {path}"
+    act = f"saves={saves} pushes={pushes}"
+    key = f"{ver} {path} {act}"
     if key != _last_hb["key"] or now - _last_hb["ts"] > 300:
-        log(f"hb v{ver} auto={'on' if on else 'off'} path={path or '/'}")
+        log(f"hb v{ver} auto={'on' if on else 'off'} path={path or '/'} {act}"
+            + ((" | " + " ; ".join(msgs)) if msgs else ""))
         _last_hb = {"key": key, "ts": now}
         try:
             (HERE / "state" / "last_hb.json").write_text(
                 json.dumps({"ver": ver, "path": path, "on": on,
+                            "saves": saves, "pushes": pushes,
                             "at": _now_iso()}, ensure_ascii=False), "utf-8")
         except Exception:
             pass
@@ -300,9 +311,13 @@ def api_auto_pull(body: dict) -> dict:
 
 
 def api_auto_push(body: dict) -> dict:
-    """Kavita → 掌阅, 单本。push_decision 那道闸仍然生效 (不回退)。"""
+    """Kavita → 掌阅, 单本。push_decision 那道闸仍然生效 (不回退)。
+
+    body.tick=true 表示"定时兜底"触发: 没真推送时不写日志, 免得每 60s 一行。
+    """
     if AUTO_SYNC != "1":
         return {"ok": True, "skipped": "auto_disabled"}
+    quiet = bool(body.get("tick"))
     sid = int(body.get("series_id") or 0)
     if not sid:
         raise ValueError("缺 series_id")
@@ -316,9 +331,27 @@ def api_auto_push(body: dict) -> dict:
     finally:
         _auto_lock.release()
     mapping.state_set(f"auto_push_last_{sid}", _now_iso())
-    log(f"auto-push series={sid} pushed={res.get('pushed')} "
-        f"skipped={res.get('skipped')} failed={res.get('failed')}")
+    if (not quiet) or res.get("pushed") or res.get("failed"):
+        log(f"auto-push series={sid} pushed={res.get('pushed')} "
+            f"skipped={res.get('skipped')} failed={res.get('failed')}"
+            + (" (tick)" if quiet else "")
+            + _push_brief(res))
     return {"ok": True, "series_id": sid, "detail": res}
+
+
+def _push_brief(res: dict) -> str:
+    """把 push_once 的 detail 压成一行可读摘要 (排查"推了没生效"必备)。"""
+    for it in res.get("detail") or []:
+        if not isinstance(it, dict):
+            continue
+        pct = it.get("pct")
+        if pct is None:
+            continue
+        zy = it.get("zy")
+        why = it.get("skipped") or it.get("why") or ("ok" if it.get("ok") else "?")
+        return (f" kv={pct * 100:.4f}% zy={'?' if zy is None else '%.4f%%' % (zy * 100)}"
+                f" why={why}")
+    return ""
 
 
 def api_link(body: dict) -> dict:

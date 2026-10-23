@@ -27,7 +27,59 @@
   var PORT   = __ZY_PORT__;
   var VER    = '__ZY_VER__';
   var BASE   = 'http://' + location.hostname + ':' + PORT + '/zy/api';
+  var BASE_TRIED = 'direct-host-port';
+  // 探测顺序:
+  //   1) 同源反代 /zy/api → 后端。HTTPS 页面、跨网段、手机走域名时,
+  //      直连 host:5111 会被混合内容/防火墙挡掉 —— 这是唯一还能通的路径。
+  //   2) 直连 host:5111 (LAN + http 页面的老路)
+  // 探测失败就保持 (2) 当默认, 后面请求自己失败 (会记进 note)。
+  var BASE_CANDIDATES = [location.origin + '/zy/api'];
+  if (location.protocol === 'http:') {
+    BASE_CANDIDATES.push('http://' + location.hostname + ':' + PORT + '/zy/api');
+  }
   var CONSOLE = 'http://' + location.hostname + ':__ZY_WEB_PORT__/';
+
+  function _probe(url) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        if (ctrl) { try { ctrl.abort(); } catch (e) {} }
+        resolve(false);
+      }, 3000);
+      var init = { headers: { 'X-ZY-Token': TOKEN } };
+      if (ctrl) init.signal = ctrl.signal;
+      fetch(url + '/health', init).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          if (done) return;
+          done = true; clearTimeout(timer);
+          // 必须严格: Kavita 的 SPA 对未知路径也返回 200 + index.html,
+          // 宽松判定会把 "没有反代" 误认为 "反代可用"。
+          resolve(!!(r.ok && j && j.ok === true && typeof j.ts === 'number'));
+        });
+      }).catch(function () {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        resolve(false);
+      });
+    });
+  }
+
+  function resolveBase() {
+    var chain = Promise.resolve(null);
+    BASE_CANDIDATES.forEach(function (c) {
+      chain = chain.then(function (found) {
+        if (found) return found;
+        return _probe(c).then(function (ok) { return ok ? c : null; });
+      });
+    });
+    return chain.then(function (found) {
+      if (found) { BASE = found; BASE_TRIED = found; }
+      return BASE;
+    });
+  }
 
   // ---- 轻量工具 -------------------------------------------------------
   function el(tag, cls, txt) {
@@ -212,13 +264,18 @@
 
   // 心跳: 让服务端 api.log 能证明"这个浏览器加载了哪一版钩子"
   var hbLast = { t: 0, key: '' };
+  var saveCount = 0, pushCount = 0;
   function heartbeat(force) {
     var key = VER + ' ' + location.pathname;
     var now = Date.now();
     if (!force && key === hbLast.key && now - hbLast.t < 60000) return;
+    if (force && now - hbLast.t < 5000) return;   // 强制也限 5s 一次
     hbLast = { t: now, key: key };
-    apiPost('/auto/hb', { ver: VER, path: location.pathname, on: AUTO.on })
-      .catch(function () {});
+    apiPost('/auto/hb', {
+      ver: VER, path: location.pathname, on: AUTO.on,
+      saves: saveCount, pushes: pushCount, base: BASE_TRIED,
+      msgs: autoLog.slice(-6).map(function (x) { return x.m; })
+    }).catch(function () {});
   }
 
   function apiPost(path, body, keepalive) {
@@ -245,6 +302,7 @@
       if (!j || j.ok === false) { note('pull #' + sid + ' busy'); return; }
       if (j.skipped) { note('pull #' + sid + ' ' + j.skipped); return; }
       note('pull #' + sid + ' ' + j.before + '->' + j.pages_read + '/' + j.pages);
+      if (!j.changed) note('pull #' + sid + ' 掌阅没有更新');
       if (j.changed) {
         toast('已同步掌阅进度 ' + j.before + ' → ' + j.pages_read + '/' + j.pages);
       }
@@ -257,13 +315,24 @@
     }).catch(function (e) { note('pull #' + sid + ' ERR ' + e.message); });
   }
 
-  function pushNow(sid) {
+  function pushNow(sid, quiet) {
     if (!AUTO.on || !sid) return;
-    apiPost('/auto/push', { series_id: sid }).then(function (j) {
+    apiPost('/auto/push', { series_id: sid, tick: !!quiet }).then(function (j) {
       var d = (j && j.detail) || {};
+      pushCount++;
       note('push #' + sid + ' +' + (d.pushed || 0) + ' ~' + (d.skipped || 0) +
-           ' !' + (d.failed || 0));
-      if (d.pushed > 0) toast('进度已推送到掌阅');
+           ' !' + (d.failed || 0) + (quiet ? ' (tick)' : ''));
+      heartbeat(true);
+      if (d.pushed > 0) {
+        // 带上具体百分比 —— 用户看到数字才知道"真的推了"
+        var p = null;
+        var det = (j && j.detail && j.detail.detail) || [];
+        for (var k = 0; k < det.length; k++) {
+          if (det[k] && det[k].ok && det[k].pct != null) { p = det[k].pct; break; }
+        }
+        toast(p == null ? '进度已推送到掌阅'
+                        : '已推送到掌阅 ' + (p * 100).toFixed(2) + '%');
+      }
       else if (j && j.detail && j.detail.length) {
         var why = '';
         for (var i = 0; i < j.detail.length; i++) {
@@ -277,13 +346,23 @@
     }).catch(function (e) { note('push #' + sid + ' ERR ' + e.message); });
   }
 
+  // 去抖 + 最大等待: 连续翻页会不断重置计时器, 纯去抖在"读得快"时永远不触发。
+  // 最大等待 30s —— 到点先推一次, 后面再按去抖来。
+  var PUSH_MAX_WAIT = 30;
+  var pushFirst = {};
+
   function schedulePush(sid) {
     if (!AUTO.on || !sid) return;
+    var now = Date.now();
+    if (!pushFirst[sid]) pushFirst[sid] = now;
     if (pushTimers[sid]) clearTimeout(pushTimers[sid]);
+    var wait = AUTO.debounce * 1000;
+    if (now + wait - pushFirst[sid] >= PUSH_MAX_WAIT * 1000) wait = 0;
     pushTimers[sid] = setTimeout(function () {
       delete pushTimers[sid];
+      pushFirst[sid] = 0;
       pushNow(sid);
-    }, AUTO.debounce * 1000);
+    }, wait);
   }
 
   function flushPush(useBeacon) {
@@ -336,7 +415,7 @@
       var m = READER_RE.exec(location.pathname);
       sid = m ? +m[1] : null;
     }
-    if (sid) { note('save #' + sid); schedulePush(sid); }
+    if (sid) { saveCount++; note('save #' + sid); schedulePush(sid); heartbeat(true); }
   }
 
   function hookNetwork() {
@@ -385,18 +464,38 @@
       if (document.visibilityState === 'hidden') flushPush(true);
     });
     setInterval(routeTick, 900);
+    // 定时兜底 push: Kavita 的"存进度"并不覆盖所有位置变化 (滚动式 epub 只在
+    // 特定时机存), 阅读中每 60s 兜一次。push_decision 会挡 noop / 回退, 不脏写。
+    setInterval(function () {
+      if (!AUTO.on || !rt.reader) return;
+      if (document.visibilityState === 'hidden') return;
+      pushNow(rt.reader, true);
+    }, 60000);
     routeTick();
   }
 
+  var bootTries = 0, bootOk = false;
   function autoBoot() {
-    api('/auto/cfg').then(function (j) {
+    if (bootOk) return;
+    bootTries++;
+    resolveBase().then(function () {
+      note('base ' + BASE);
+      return api('/auto/cfg');
+    }).then(function (j) {
       AUTO.on = !!j.enabled;
       AUTO.debounce = j.push_debounce_sec || 8;
       AUTO.gap = j.pull_gap_sec || 120;
+      bootOk = true;
       if (AUTO.on) hookNetwork();
       note('auto ' + (AUTO.on ? 'on' : 'off'));
       heartbeat(true);   // 服务端据此确认"这一版钩子真的在跑"
-    }).catch(function () { note('auto cfg 读取失败'); });
+    }).catch(function (e) {
+      // 后端重启/网络抖动时 cfg 读不到 —— 不重试的话这一整页就永远没有钩子
+      // (2026-10-24 事故: 页面在 5111 重启窗口加载, 读了整晚一次都没推)。
+      note('auto cfg 读取失败 ' + (e && e.message) + ' (第' + bootTries + '次)');
+      heartbeat(true);
+      if (bootTries < 20) setTimeout(autoBoot, 15000 + bootTries * 5000);
+    });
   }
 
   // ---- 生命周期 -------------------------------------------------------
@@ -443,7 +542,9 @@
     api: api, health: health, console: CONSOLE, ver: VER, tick: tick,
     auto: function () {
       return { on: AUTO.on, reader: rt.reader, series: rt.series,
-               debounce: AUTO.debounce, gap: AUTO.gap, log: autoLog.slice() };
+               debounce: AUTO.debounce, gap: AUTO.gap,
+               base: BASE_TRIED, boot: bootTries, ok: bootOk,
+               saves: saveCount, pushes: pushCount, log: autoLog.slice() };
     },
     pull: pullSeries, push: pushNow
   };
