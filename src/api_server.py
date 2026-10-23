@@ -265,12 +265,13 @@ def api_auto_hb(body: dict) -> dict:
     key = f"{ver} {path} {act}"
     if key != _last_hb["key"] or now - _last_hb["ts"] > 300:
         log(f"hb v{ver} auto={'on' if on else 'off'} path={path or '/'} {act}"
+            + (f" base={base}" if base else "")
             + ((" | " + " ; ".join(msgs)) if msgs else ""))
         _last_hb = {"key": key, "ts": now}
         try:
             (HERE / "state" / "last_hb.json").write_text(
                 json.dumps({"ver": ver, "path": path, "on": on,
-                            "saves": saves, "pushes": pushes,
+                            "saves": saves, "pushes": pushes, "base": base,
                             "at": _now_iso()}, ensure_ascii=False), "utf-8")
         except Exception:
             pass
