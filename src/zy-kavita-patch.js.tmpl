@@ -264,6 +264,16 @@
       note('push #' + sid + ' +' + (d.pushed || 0) + ' ~' + (d.skipped || 0) +
            ' !' + (d.failed || 0));
       if (d.pushed > 0) toast('进度已推送到掌阅');
+      else if (j && j.detail && j.detail.length) {
+        var why = '';
+        for (var i = 0; i < j.detail.length; i++) {
+          if (j.detail[i] && j.detail[i].skipped) { why = String(j.detail[i].skipped); break; }
+        }
+        // 只有"回退被挡"值得说一声 —— 用户会以为"推了却没生效"
+        if (why.indexOf('regress') === 0) {
+          toast('掌阅进度更靠前，本次不回拨（Kavita 落后）');
+        }
+      }
     }).catch(function (e) { note('push #' + sid + ' ERR ' + e.message); });
   }
 
