@@ -53,6 +53,15 @@ Kavita SPA (容器 :5000)
 - 调试：浏览器控制台 `__ZY__.auto()` 看开关 + 最近 24 条动作；`__ZY__.pull(26)` / `__ZY__.push(26)` 手动触发
 - 后端 `auto/pull|push` 只处理传进来的 `series_id`，不再全库扫；两个动作互斥（同一把锁，忙则返回 `busy`）
 
+**三个前提**（排查"钩子好像没生效"时先看这三条）：
+
+1. **页面里得有补丁**：浏览器打开 Kavita 后 `F12 → __ZY__.ver` 应能打印版本号。打印不出来 =
+   `zy-kavita-patch.js` 没加载（容器重建后会 404，自愈最多 1 分钟重打）—— 此时**刷新一次页面**。
+2. **只在浏览器开着 Kavita 网页时工作**：在掌阅 App 里读，Kavita 不知道；下次打开 Kavita 网页
+   （进书 / 详情页）才会 pull 一次。
+3. **`BASE = http://<当前访问的主机名>:5111`**：所以从哪台设备读，那台设备就要能直连 `5111`。
+   走 HTTPS 反代访问 Kavita 会被浏览器按混合内容拦掉（需把 5111 也反代成 https 并改 `src/zy-kavita-patch.js.tmpl` 的 BASE）。
+
 ## 5012 控制台：「Kavita 改造」卡
 
 `http://<host>:5012/` 顶部第二张卡片，把「新装一台 Kavita 要做的所有事」收在一处：
@@ -70,15 +79,15 @@ Kavita SPA (容器 :5000)
 
 ## 自启动 + 自愈
 
-免 root 首选 crontab（`deploy/install-cron.sh`：开机 30s 后 + 每 3 分钟巡检）；
+免 root 首选 crontab（`deploy/install-cron.sh`：开机 30s 后 + 每 1 分钟巡检）；
 有 root 再叠 systemd（`deploy/install-autostart.sh`：进程崩了自动重启）：
 
 | unit / 条目 | 干什么 |
 |---|---|
 | `kavita-zy-api.service` | 补丁后端 :5111 |
 | `kavita-zy-web.service` | 控制台 :5012 |
-| `kavita-zy-heal.service` + `.timer` | 每 3 分钟跑 `deploy/heal.sh` |
-| crontab `*/3 * * * *` | 同上（免 root 版） |
+| `kavita-zy-heal.service` + `.timer` | 每 3 分钟跑 `deploy/heal.sh`（root 版） |
+| crontab `*/1 * * * *` | 同上（免 root 版） |
 | crontab `@reboot` | 开机 30s 后跑一次（把 5111/5012 拉起来） |
 
 `deploy/heal.sh` 幂等巡检：容器在跑 → Kavita 可访问 → 前端注入还在
@@ -180,7 +189,7 @@ warning 条只上 error + 最多 1 条 warn，info 不上条。
 | `AUTO_PULL_GAP` | 同一本书两次 auto pull 的最小间隔秒数（默认 120） |
 
 改端口后要 `./install.sh` 重装（token 和端口会重新渲染进前端）。
-改 `AUTO_*` 只需重启补丁后端（`systemctl restart kavita-zy-api` 或等 heal 3 分钟内自己发现代码变新）。
+改 `AUTO_*` 只需重启补丁后端（`systemctl restart kavita-zy-api` 或等 heal 3 分钟内自己发现代码变新（cron 版 1 分钟））。
 
 ## 仓库里不含什么
 

@@ -14,9 +14,13 @@ BUILD_DIR="$HERE/build"
 die() { echo "ERR: $*" >&2; exit 1; }
 
 # node 不在默认 PATH (走 nvm), 语法闸要用它
+# 注: cron / systemd 环境可能没有 HOME, set -u 下直接展开会 unbound
+HOME_DIR="${HOME:-}"
+if [ -z "$HOME_DIR" ]; then HOME_DIR="$(getent passwd "$(id -u)" | cut -d: -f6)"; fi
+HOME_DIR="${HOME_DIR:-/root}"
 NODE_BIN="$(command -v node 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
-  for c in /vol2/1001/.nvm/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
+  for c in /vol2/1001/.nvm/versions/node/*/bin/node "$HOME_DIR"/.nvm/versions/node/*/bin/node; do
     [ -x "$c" ] && { NODE_BIN="$c"; break; }
   done
 fi
@@ -114,16 +118,16 @@ do_install() {
   docker cp "$BUILD_DIR/zy-kavita-patch.js" "$CONTAINER:${inner}/zy-kavita-patch.js"
   docker cp "$BUILD_DIR/index.html.patched"  "$CONTAINER:${inner}/index.html"
 
-  "$HERE/ctl.sh" restart-api >/dev/null 2>&1 || "$HERE/ctl.sh" start-api || true
+  bash "$HERE/ctl.sh" restart-api >/dev/null 2>&1 || bash "$HERE/ctl.sh" start-api || true
 
   cat <<EOF
 
 已装 v$PATCH_VERSION
   前端   $CONTAINER:${inner}/zy-kavita-patch.js
   注入   index.html 末尾 <script src="zy-kavita-patch.js">
-  后端   $API_BIND:$API_PORT   (./ctl.sh status)
+  后端   $API_BIND:$API_PORT   (bash ./ctl.sh status)
   验     curl -s $KAVITA_URL/zy-kavita-patch.js | head -3
-  撤     ./uninstall.sh
+  撤     ./install.sh uninstall
 EOF
 }
 
@@ -133,7 +137,7 @@ do_uninstall() {
   local wr; wr="$(locate_wwwroot)" || die "定位不到 wwwroot"
   local inner; inner="$(echo "$wr" | sed "s|$(container_updir)||")"
   docker cp "$BACKUP_DIR/index.html.orig" "$CONTAINER:${inner}/index.html"
-  "$HERE/ctl.sh" stop-api >/dev/null 2>&1 || true
+  bash "$HERE/ctl.sh" stop-api >/dev/null 2>&1 || true
   echo "已卸载 (index.html 还原, 后端停)"
   echo "容器内 zy-kavita-patch.js 留着无害, 下次装会覆盖"
 }
@@ -145,7 +149,7 @@ case "${1:-install}" in
   status)
     echo "kavita=$(http_code)"
     curl -s -m 5 -o /dev/null -w 'asset=%{http_code}\n' "$KAVITA_URL/zy-kavita-patch.js"
-    "$HERE/ctl.sh" status || true
+    bash "$HERE/ctl.sh" status || true
     ;;
   *) echo "usage: $0 {install|uninstall|render|status}"; exit 2 ;;
 esac

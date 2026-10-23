@@ -32,5 +32,5 @@ fi
 echo "补丁已失效 (asset=$code index=$in_html), 重新安装"
 
 echo "== 3/3 重装"
-"$HERE/install.sh" install
-"$HERE/ctl.sh" start || true
+bash "$HERE/install.sh" install
+bash "$HERE/ctl.sh" start || true

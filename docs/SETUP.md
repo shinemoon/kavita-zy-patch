@@ -80,7 +80,7 @@ curl -s http://127.0.0.1:5000/ | grep -c zy-kavita-patch.js                     
 
 | 方式 | 需要 | 好处 | 命令 |
 |---|---|---|---|
-| **crontab**（推荐先装） | 普通用户 | 开机 + 每 3 分钟巡检 | `bash deploy/install-cron.sh` |
+| **crontab**（推荐先装） | 普通用户 | 开机 + 每 1 分钟巡检 | `bash deploy/install-cron.sh` |
 | **systemd** | root | 进程崩了自动重启（`Restart=always`） | `sudo bash deploy/install-autostart.sh` |
 
 面板上对应「装自启 (免 root)」和「装自启 (systemd)」两个按钮。
@@ -91,7 +91,7 @@ crontab 版写的是当前用户的受管块（卸载 `bash deploy/uninstall-cro
 ```cron
 # >>> kavita-zy (managed by install-cron.sh) >>>
 @reboot /bin/sleep 30; /bin/bash /vol2/1001/kavita-zy-patch/deploy/heal.sh
-*/3 * * * * /bin/bash /vol2/1001/kavita-zy-patch/deploy/heal.sh
+*/1 * * * * /bin/bash /vol2/1001/kavita-zy-patch/deploy/heal.sh
 # <<< kavita-zy <<<
 ```
 
@@ -223,7 +223,7 @@ push 带闸：回退超过半页不写、半页内 noop、掌阅已读完不降�
 **原因**：前端注入落在容器的 overlay 可写层（`docker inspect` 的 `GraphDriver.Data.UpperDir`），
 `docker pull` + recreate 之后层层清空。**数据层与库文件不受影响**（都在卷上）。
 
-**修**：装了自启 + 自愈的话，**3 分钟内自己回来**（`kavita-zy-heal.timer` 检查
+**修**：装了自启 + 自愈的话，**1 分钟内自己回来**（cron 版；systemd timer 版 3 分钟）（`kavita-zy-heal.timer` 检查
 asset/index，缺就重打）。不想等：5012 点 **立即自检**；或
 
 ```bash
@@ -233,6 +233,9 @@ bash /vol2/1001/kavita-zy-patch/deploy/heal.sh      # 连 5111/5012 一起看
 
 > `reapply.sh` 是首选：补丁还在就什么都不做。
 > 自愈日志：`state/logs/heal.log`；上次结果：`state/heal.json`。
+>
+> **重打之后，已经开着的浏览器标签页仍然没有钩子**（那一次页面加载时脚本是 404）。
+> 手动刷新一次即可（`Ctrl/Cmd+Shift+R` 更保险）。判断方法：F12 控制台敲 `__ZY__.ver`，能打印版本号才是真的加载上了。
 
 ---
 
