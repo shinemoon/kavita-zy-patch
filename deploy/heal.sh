@@ -250,9 +250,11 @@ reload_if_stale() {   # $1=unit, 其余=代码文件
 
 reload_if_stale kavita-zy-api.service \
   "$ROOT/src/api_server.py" "$ROOT/patch.conf" \
-  "$BRIDGE_ROOT/sync/sync/sync.py" "$BRIDGE_ROOT/sync/sync/config.py"
+  "$BRIDGE_ROOT/sync/sync/sync.py" "$BRIDGE_ROOT/sync/sync/config.py" \
+  "$BRIDGE_ROOT/sync/sync/kpages.py" "$BRIDGE_ROOT/sync/sync/mapping.py"
 reload_if_stale kavita-zy-web.service \
-  "$BRIDGE_ROOT/sync/web.py" "$BRIDGE_ROOT/sync/sync/sync.py"
+  "$BRIDGE_ROOT/sync/web.py" "$BRIDGE_ROOT/sync/sync/sync.py" \
+  "$BRIDGE_ROOT/sync/sync/kpages.py"
 
 # ---- 5c. 双写者纠偏 (只有 root 能做) ---------------------------------
 # 端口活着但服务不是 systemd 起的那份 = 上一代脚本留下的孤儿。此时 unit 会

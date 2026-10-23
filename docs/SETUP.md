@@ -222,6 +222,37 @@ python3 tools/apply_edition.py --all
 
 回滚：把 `.bak-<ts>` 覆盖回书库路径，再 `POST /api/series/scan`。
 
+### 4.1 页数 = 显示粒度（重要，2026-10-23）
+
+一页 = 一段原书字节片，`N = clamp(总字节 / 4096, 100, MAX_PAGES)`，`MAX_PAGES` 默认 **3000**。
+
+`N` 同时决定两件事：Kavita 的显示粒度（`1/N`），和「翻页要读多久才动一格」。
+
+| `N` | 剑来（41.9MB）每页 | 粒度 | 读多久动一格 |
+|---|---|---|---|
+| 600（旧默认） | 70KB ≈ 2.3 万字 | 0.17% | ≈ 一小时 |
+| 3000（现默认） | 14KB ≈ 4700 字 | 0.033% | ≈ 十分钟 |
+
+2026-10-23 事故：剑来还是 600 页版，用户读了一晚上页号一次没翻 → Kavita 记的进度
+一直停在 163/600 = 27.2%，掌阅侧 pct 也一格不动。主因是**页太粗**；次因是当时 push
+只读页号、页内位置被丢掉（页内精度在 v0.4.3 修好，见第 6 节）。
+
+调参（默认够用，一般不用改）：
+
+```bash
+ZY_KPAGES_MAX_PAGES=3000 ZY_KPAGES_TARGET_BYTES=4096 \
+  python3 tools/apply_edition.py --series 27
+```
+
+**改页数后必须紧接着 pull 一次**，把 `PagesRead` 从旧页号重映射到新页号，否则
+Kavita 显示的是「旧页号 / 新总页数」这种假进度（163/3000 = 5.4%）：
+
+```bash
+python3 zync.py pull
+```
+
+重排版瞬间会把书架百分比打回低位、再被 pull 拉上来，属正常中间态。
+
 ---
 
 ## 5. 体检
@@ -245,6 +276,23 @@ python3 /vol2/1001/kavita-zy-patch/src/selftest.py
 | 想全自动 | `python3 zync.py daemon --interval 30`（push 30s / pull 5min，**默认没起**） |
 
 push 带闸：回退超过半页不写、半页内 noop、掌阅已读完不降级（`ZY_PUSH_ALLOW_REWIND=1` 才回退）。
+
+**页内精度（v0.4.3）**：Kavita 只把「读到第几页」写进 `PagesRead`，页内位置写在
+`BookScrollId`（xpath，如 `//body/div[2]/p[30]`）。push 会把这条 xpath 还原成
+**该页内部的字节比例**，再按掌阅的字节口径算 `readPercent` —— 所以一页之内读到
+哪里都能反映到掌阅，不必等翻页。
+
+看日志分辨走没走页内精度：
+
+```bash
+grep 'push OK' /vol2/1001/zhangyue-bridge/state/logs/sync.log | tail
+# ... pct01=0.272836 (页内)   ← 用了 xpath
+# ... pct01=0.272000          ← 只到页起点（xpath 缺失/解析不了）
+# skip push ... (noop)        ← 两侧已对齐，不用推
+```
+
+页内精度救不了「页太粗」的显示问题：`PagesRead` 仍然是整页跳，想让它动得快
+就得把 `MAX_PAGES` 调大并重建（见 4.1）。
 
 ---
 
@@ -304,3 +352,4 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 页面白屏 / 挂载点是目录 | 重建时 `state/wwwroot/` 里文件不存在 → docker 建成目录。`bash install.sh publish` 后 `docker compose up -d --force-recreate` |
 | 进度显示 44% 打开是目录 | 该书还没重排版 → 做第 4 步 |
 | 两侧差值 < 1 个点 | 正常，页粒度导致，不是 bug |
+| **读了一晚上，掌阅 pct 一格不动** | ① `zync.py push --dry-run` 看 pct 有没有 `(页内)` —— 没有就是 `BookScrollId` 丢了；② 看 Kavita 里 `PagesRead` 变没变（没变 = 浏览器没存进度 / 钩子没加载，查 api.log 的 `hb` 行）；③ 页数太少（600 页的大书一页 2.3 万字）→ 按 4.1 用 `ZY_KPAGES_MAX_PAGES=3000` 重建 + `zync.py pull` 重映射 |
