@@ -64,6 +64,13 @@
     'background:var(--elevation-layer2);color:var(--text-muted-color);}',
     '#zy-nav-item.zy-ok .zy-badge{background:rgba(74,198,148,.2);color:#4ac694;}',
     '#zy-nav-item.zy-err .zy-badge{background:rgba(189,54,47,.25);color:#BD362F;}',
+    // 自动同步的可见反馈 (只在真的动了位置/推成功时出现, 3.5s 自隐)
+    '#zy-toast{position:fixed;right:1rem;bottom:1rem;z-index:99999;max-width:22rem;',
+    'background:rgba(20,22,25,.94);color:#e8eaed;border:1px solid rgba(255,255,255,.14);',
+    'border-radius:8px;padding:.6rem .8rem;font-size:.8rem;line-height:1.35;',
+    'box-shadow:0 6px 24px rgba(0,0,0,.35);opacity:0;transform:translateY(8px);',
+    'transition:opacity .18s,transform .18s;pointer-events:none;}',
+    '#zy-toast.on{opacity:1;transform:none;}',
   ].join('');
 
   function injectCss() {
@@ -191,6 +198,29 @@
     if (autoLog.length > 24) autoLog.shift();
   }
 
+  // 右下角小提示: 只在真的同步了位置时弹, 否则用户永远不知道钩子在干活
+  function toast(msg) {
+    try {
+      var n = document.getElementById('zy-toast');
+      if (!n) { n = el('div'); n.id = 'zy-toast'; document.body.appendChild(n); }
+      n.textContent = msg;
+      n.classList.add('on');
+      clearTimeout(toast._t);
+      toast._t = setTimeout(function () { n.classList.remove('on'); }, 3500);
+    } catch (e) {}
+  }
+
+  // 心跳: 让服务端 api.log 能证明"这个浏览器加载了哪一版钩子"
+  var hbLast = { t: 0, key: '' };
+  function heartbeat(force) {
+    var key = VER + ' ' + location.pathname;
+    var now = Date.now();
+    if (!force && key === hbLast.key && now - hbLast.t < 60000) return;
+    hbLast = { t: now, key: key };
+    apiPost('/auto/hb', { ver: VER, path: location.pathname, on: AUTO.on })
+      .catch(function () {});
+  }
+
   function apiPost(path, body, keepalive) {
     var init = {
       method: 'POST',
@@ -215,6 +245,9 @@
       if (!j || j.ok === false) { note('pull #' + sid + ' busy'); return; }
       if (j.skipped) { note('pull #' + sid + ' ' + j.skipped); return; }
       note('pull #' + sid + ' ' + j.before + '->' + j.pages_read + '/' + j.pages);
+      if (j.changed) {
+        toast('已同步掌阅进度 ' + j.before + ' → ' + j.pages_read + '/' + j.pages);
+      }
       if (!j.changed || !allowReload) return;
       var rk = 'zy_reload_' + sid;
       if (Date.now() - (+(sessionStorage.getItem(rk) || 0)) < 10000) return;
@@ -230,6 +263,7 @@
       var d = (j && j.detail) || {};
       note('push #' + sid + ' +' + (d.pushed || 0) + ' ~' + (d.skipped || 0) +
            ' !' + (d.failed || 0));
+      if (d.pushed > 0) toast('进度已推送到掌阅');
     }).catch(function (e) { note('push #' + sid + ' ERR ' + e.message); });
   }
 
@@ -270,10 +304,12 @@
       if (rt.reader) flushPush(false);        // 离开上一本, 尾巴先推掉
       rt.reader = rn;
       if (rn) pullSeries(rn, true);           // 进书: 取掌阅进度
+      heartbeat(true);
     }
     if (sn !== rt.series) {
       rt.series = sn;
       if (sn) pullSeries(sn, false);          // 详情页: 只刷进度, 不重载
+      heartbeat(true);
     }
   }
 
@@ -349,6 +385,7 @@
       AUTO.gap = j.pull_gap_sec || 120;
       if (AUTO.on) hookNetwork();
       note('auto ' + (AUTO.on ? 'on' : 'off'));
+      heartbeat(true);   // 服务端据此确认"这一版钩子真的在跑"
     }).catch(function () { note('auto cfg 读取失败'); });
   }
 

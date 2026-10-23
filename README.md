@@ -27,6 +27,7 @@ Kavita SPA (容器 :5000)
                       ├─ /zy/api/selfcheck  体检 (warning 数据源)
                       ├─ /zy/api/push|pull  调 bridge sync 包 (全库)
                       ├─ /zy/api/auto/pull|push  单本 (读书钩子用)
+                      ├─ /zy/api/auto/hb   前端心跳 (证明钩子真在跑)
                       └─ /zy/api/link       建映射
                             └─ /vol2/1001/zhangyue-bridge/sync
                                   ├─ sync/kavita_db.py  直读写 kavita.db
@@ -34,6 +35,37 @@ Kavita SPA (容器 :5000)
 ```
 
 补丁不碰 Kavita 任何一行代码，纯外部注入。
+
+## 前端落地的两种模式 (v0.4.1)
+
+| 模式 | 怎么落地 | 容器重建 / 换镜像 |
+|---|---|---|
+| **mount（推荐）** | compose 把宿主两个文件只读挂进 `wwwroot` | **不丢**；镜像升级后自愈会自动用新镜像的 `index.html` 重建 |
+| copy（旧） | `docker cp` 打进容器 overlay 可写层 | 丢了，靠自愈每 1–3 分钟重打 |
+
+挂载模式要往 `docker-compose.yml` 的 `volumes:` 加两行（**先 `install.sh publish` 生成文件，再 `up -d`**）：
+
+```yaml
+    volumes:
+      - /vol1/1001/APPS/kavita:/kavita/config
+      - /fs/1001/ftp/dav/Books:/books:ro
+      - /vol2/1001/kavita-zy-patch/state/wwwroot/index.html:/kavita/wwwroot/index.html:ro
+      - /vol2/1001/kavita-zy-patch/state/wwwroot/zy-kavita-patch.js:/kavita/wwwroot/zy-kavita-patch.js:ro
+```
+
+要点（都是踩过的）：
+
+1. **顺序不能反**：宿主文件不存在就 `up -d`，docker 会把挂载点建成**目录**，Kavita 直接白屏。
+   先 `bash install.sh publish`，再 `docker compose up -d`。
+2. **单文件挂载钉的是 inode**。`install`/`cp` 到新文件再 rename 会换 inode，容器里永远是旧内容，
+   而 HTTP 一切 200 —— 这就是"补丁更新了但页面还是老版本"的成因。所以：
+   - `publish_host` 一律用 `cat > 目标`（同 inode 覆盖）
+   - `reapply.sh` 每次比对宿主/容器 md5，不一致就 `docker restart`（restart 会重新解析挂载源）
+3. **镜像升级**：挂着的 `index.html` 是旧镜像的，引用的 chunk 哈希在新镜像里不存在 → 白屏。
+   `publish_host` 直接从**当前镜像**里 `docker run --rm cat` 取原版重建，`heal.sh` 额外验一个
+   `main-*.js` 是否 200，失败即触发重建。
+4. 卸载要先从 compose 删掉这两行再重建；容器里是只读挂载，`install.sh uninstall` 会提示而不会硬改。
+
 
 ## 自动同步：读书钩子 (v0.4.0)
 
@@ -52,11 +84,20 @@ Kavita SPA (容器 :5000)
   push 去抖 `AUTO_PUSH_DEBOUNCE`（默认 8s）；pull 写的是 DB 不走 reader，不会触发自己
 - 调试：浏览器控制台 `__ZY__.auto()` 看开关 + 最近 24 条动作；`__ZY__.pull(26)` / `__ZY__.push(26)` 手动触发
 - 后端 `auto/pull|push` 只处理传进来的 `series_id`，不再全库扫；两个动作互斥（同一把锁，忙则返回 `busy`）
+- **看得见** (v0.4.1)：右下角小提示 —— pull 真的动了位置弹「已同步掌阅进度 41 → 49/100」，
+  push 真的推成功弹「进度已推送到掌阅」。没动就不弹（否则天天弹等于没弹）
+- **心跳** (v0.4.1)：前端加载后 `POST /zy/api/auto/hb {ver,path,on}`，后端按 (版本,路径) 5 分钟节流
+  落一条 `hb vX.Y.Z auto=on path=...` 到 `state/logs/api.log`，同时写 `state/last_hb.json`。
+  排查"钩子到底跑没跑"先看这两处 —— 没有 = 浏览器根本没加载这一版钩子，别去怀疑 pull/push 逻辑
+
+**多标签 / 多设备**：钩子按标签页独立工作，同一本书的 pull 有 `AUTO_PULL_GAP` 间隔，
+所以两台设备同时开着同一本书时只有先到的那台会 pull；push 各自照推（`push_decision` 会挡回退）。
 
 **三个前提**（排查"钩子好像没生效"时先看这三条）：
 
 1. **页面里得有补丁**：浏览器打开 Kavita 后 `F12 → __ZY__.ver` 应能打印版本号。打印不出来 =
-   `zy-kavita-patch.js` 没加载（容器重建后会 404，自愈最多 1 分钟重打）—— 此时**刷新一次页面**。
+   `zy-kavita-patch.js` 没加载 —— 挂载模式正常不会发生；拷贝模式容器重建后会 404（自愈最多 1–3 分钟重打）。
+   此时**刷新一次页面**。加载了但版本号是旧的 = inode 漂移，跑 `deploy/reapply.sh`。
 2. **只在浏览器开着 Kavita 网页时工作**：在掌阅 App 里读，Kavita 不知道；下次打开 Kavita 网页
    （进书 / 详情页）才会 pull 一次。
 3. **`BASE = http://<当前访问的主机名>:5111`**：所以从哪台设备读，那台设备就要能直连 `5111`。
@@ -111,12 +152,12 @@ sudo bash /vol2/1001/kavita-zy-patch/deploy/uninstall-autostart.sh
 ```bash
 cd /vol2/1001/kavita-zy-patch
 
-./install.sh                # 装 / 升级 (幂等, 重跑即重打)
-./install.sh uninstall      # 还原 index.html + 停后端
-./install.sh status         # 看装没装
-./deploy/reapply.sh         # Kavita 升级后重打 (自动判断要不要打)
+bash install.sh             # 装 / 升级 (幂等, 重跑即重打)
+bash install.sh publish     # 只把注入版 index.html + 补丁 JS 写到挂载目录 (不动容器)
+bash install.sh uninstall   # 还原 index.html + 停后端 (挂载模式会提示改 compose)
+bash install.sh status      # 看模式 / asset / 注入 / 后端
+bash deploy/reapply.sh      # Kavita 升级后重打 (自动判断要不要打, 含 inode 漂移检测)
 bash deploy/heal.sh         # 自愈巡检一次 (容器/注入/5111/5012)
-bash deploy/install-autostart.sh    # 装 systemd 自启 + 每 3 分钟巡检 (需 root)
 
 ./ctl.sh status             # 后端进程状态
 ./ctl.sh restart-api        # 改完 api_server.py 后重启
@@ -128,16 +169,21 @@ bash deploy/install-autostart.sh    # 装 systemd 自启 + 每 3 分钟巡检 (�
 三个设计决定：
 
 **1. 不改镜像，只注入静态文件**
-补丁打进容器 overlay 的可写层（`wwwroot/`），镜像本身不动。Kavita 升级不会让补丁跟镜像版本冲突，只是 overlay 被清掉需要重打。
+前端只有两个文件：`wwwroot/index.html`（末尾加一行 script）+ `wwwroot/zy-kavita-patch.js`。
+两种落法（见「前端落地的两种模式」）：挂载模式把宿主 `state/wwwroot/` 的两个文件只读挂进容器，
+容器重建也不丢；拷贝模式 `docker cp` 进 overlay，重建即丢、靠自愈重打。
+镜像本身不动，Kavita 升级不会跟镜像版本冲突。
 
 **2. 每次都从原版重建 index.html**
-`backups/index.html.orig` 是第一次装时从容器 `docker cp` 出来的真原版。每次 install 都从它出发，先用正则摘掉所有历史注入痕迹，再追加当前版本。所以：
+`backups/index.html.orig` 是原版备份 —— 挂载模式下直接从**当前镜像**里 `docker run --rm cat` 取一份，
+所以镜像升级后自动跟上新 asset 哈希。每次 install 都从它出发，先用正则摘掉所有历史注入痕迹，再追加当前版本。所以：
 - 改版本号 → 直接重跑 install
 - 改标记名 → 直接重跑 install（正则认的是 `ZY-KAVITA-PATCH` 前缀 + `zy-kavita-patch.js` 文件名）
 - 装错了 → uninstall 是精确还原，不是「反向正则删除」
 
 **3. 路径自己找，不写死**
-`locate_wwwroot()` 扫 `docker inspect` 的 `GraphDriver.Data.UpperDir`，按候选路径逐个试，最后 fallback 到 `find index.html`。镜像换目录结构不会写死失效。
+拷贝模式下 `locate_wwwroot()` 扫 `docker inspect` 的 `GraphDriver.Data.UpperDir`，按候选路径逐个试，
+最后 fallback 到 `find index.html`。镜像换目录结构不会写死失效。挂载模式不看 overlay。
 
 **新增子目录时怎么加：**
 前端是一个自包含文件（`src/zy-kavita-patch.js.tmpl`）。加新功能时改这个文件 + 改 `PATCH_VERSION`，然后 `./install.sh`。浏览器按 `?v=版本号` 缓存，改版本号就自动破缓存。
@@ -146,11 +192,14 @@ bash deploy/install-autostart.sh    # 装 systemd 自启 + 每 3 分钟巡检 (�
 
 | 现象 | 查什么 |
 |---|---|
-| 页面看不到导航项 | `./install.sh status`；`curl -s $KAVITA_URL/zy-kavita-patch.js \| head -3` |
+| 页面看不到导航项 | `bash install.sh status`；`curl -s $KAVITA_URL/zy-kavita-patch.js \| head -3` |
 | 导航项有但徽标空/「离线」 | `./ctl.sh status` 后端是否活；F12 Console 看 fetch 报错 |
 | 徽标全不显示 | 大概率没有映射记录。跑 `python3 src/selftest.py` 看 `/zy/api/status` 的 rows |
+| **asset 200 但 `__ZY__.ver` 还是旧版本** | 单文件挂载的 inode 漂移：`bash deploy/reapply.sh`（会比对 md5 并 `docker restart` 重挂） |
+| **自动同步像没生效** | ① `state/logs/api.log` 里有没有 `hb vX.Y.Z`（没有 = 前端钩子没加载/没跑）；② 有没有 `auto-pull` / `auto-push` 行；③ `push` 行里 `pushed=0 skipped=1` = `push_decision` 挡了（回退或半页内），不是坏了 |
+| 页面白屏 / 挂载点变成目录 | 重建时宿主文件不存在 → docker 建了目录。`bash install.sh publish` 后再 `docker compose up -d --force-recreate` |
 | warning 条内容不更新 | `localStorage` 里 `zy-warn-dismissed-at` 6h TTL，清掉即可 |
-| e2e 测试 | `node src/e2e-check.mjs`（需 NVM + playwright） |
+| e2e 测试 | `node src/verify-auto.mjs`（NVM + playwright；会打真后端, 只读/幂等） |
 
 `src/selftest.py` 不依赖浏览器，直接打后端四个接口列问题，最快的诊断入口。
 

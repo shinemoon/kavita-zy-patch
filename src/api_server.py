@@ -238,6 +238,36 @@ def api_auto_cfg() -> dict:
     }
 
 
+_last_hb = {"key": "", "ts": 0.0}
+
+
+def api_auto_hb(body: dict) -> dict:
+    """前端心跳: 证明"哪个浏览器、哪一版钩子"活着。
+
+    只读不写业务数据。同 (版本, 路径) 5 分钟内只落一条 log, 免得刷屏。
+    排查"自动同步没生效"第一步就看这里有没有记录 —— 没有 = 前端钩子没跑到。
+    """
+    global _last_hb
+    import time as _time
+    ver = str(body.get("ver") or "?")
+    path = str(body.get("path") or "")
+    on = bool(body.get("on"))
+    now = _time.time()
+    key = f"{ver} {path}"
+    if key != _last_hb["key"] or now - _last_hb["ts"] > 300:
+        log(f"hb v{ver} auto={'on' if on else 'off'} path={path or '/'}")
+        _last_hb = {"key": key, "ts": now}
+        try:
+            (HERE / "state" / "last_hb.json").write_text(
+                json.dumps({"ver": ver, "path": path, "on": on,
+                            "at": _now_iso()}, ensure_ascii=False), "utf-8")
+        except Exception:
+            pass
+    else:
+        _last_hb["ts"] = now
+    return {"ok": True, "ver": ver}
+
+
 def api_auto_pull(body: dict) -> dict:
     """掌阅 → Kavita, 单本。
 
@@ -353,6 +383,25 @@ def api_selfcheck() -> dict:
     if not TOKEN:
         add("warn", "token", "共享 token 未生成", "跑 ./install.sh")
 
+    # 4.5 前端落地模式 (v0.4.1): 挂载 = 容器重建不丢; 拷贝 = 丢了靠自愈重打
+    try:
+        mount_dir = Path(_cfg.get("WWWROOT_MOUNT_DIR",
+                                  "/vol2/1001/kavita-zy-patch/state/wwwroot"))
+        idx = mount_dir / "index.html"
+        js = mount_dir / "zy-kavita-patch.js"
+        if not (idx.is_file() and js.is_file()):
+            add("warn", "mount_dir",
+                f"挂载目录不全: {mount_dir} (缺 index.html 或 zy-kavita-patch.js)",
+                "bash install.sh publish (重建前必须先有文件, 否则 docker 会建目录)")
+        else:
+            hb = HERE / "state" / "last_hb.json"
+            if not hb.exists():
+                add("info", "auto_hb",
+                    "还没有前端心跳 (没有浏览器加载过 v0.4.1 钩子)",
+                    "打开一次 Kavita 页面; 之后 api.log 里应有 hb 行")
+    except Exception as e:
+        add("warn", "mount_dir", str(e))
+
     # 5. 映射覆盖
     try:
         _, mapping, _, _ = bridge()
@@ -408,6 +457,7 @@ ROUTES_POST = {
     "/zy/api/link": api_link,
     "/zy/api/auto/pull": api_auto_pull,
     "/zy/api/auto/push": api_auto_push,
+    "/zy/api/auto/hb": api_auto_hb,
 }
 
 

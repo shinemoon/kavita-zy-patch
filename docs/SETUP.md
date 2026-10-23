@@ -37,6 +37,37 @@ setfacl -m u:youruser:rwx /vol1/1001/APPS/kavita   # 目录，WAL 要建 -wal/-s
 
 ## 1. 装改造（一键）
 
+**先决定前端怎么落地**（两种都能用，推荐挂载）：
+
+| 模式 | 做法 | 容器重建/换镜像 |
+|---|---|---|
+| **mount（推荐）** | compose 加两行只读挂载 | 不丢；镜像升级后自愈自动重建 |
+| copy | 什么都不加，`install.sh` 自己 `docker cp` | 丢，靠自愈每 1–3 分钟重打 |
+
+挂载模式一次性步骤（**顺序别反**，宿主文件不存在就重建 → docker 会把挂载点建成目录 → 白屏）：
+
+```bash
+cd /vol2/1001/kavita-zy-patch
+bash install.sh publish          # 生成 state/wwwroot/{index.html,zy-kavita-patch.js}
+```
+
+然后编辑 Kavita 的 `docker-compose.yml`，在 `volumes:` 里加：
+
+```yaml
+      - /vol2/1001/kavita-zy-patch/state/wwwroot/index.html:/kavita/wwwroot/index.html:ro
+      - /vol2/1001/kavita-zy-patch/state/wwwroot/zy-kavita-patch.js:/kavita/wwwroot/zy-kavita-patch.js:ro
+```
+
+```bash
+docker compose up -d             # 重建
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/zy-kavita-patch.js   # 200
+bash /vol2/1001/kavita-zy-patch/install.sh status                                   # mode=mount
+```
+
+> 本机实际落点：`/vol1/1001/APPS/kavita/docker-compose.yml`（backup：`docker-compose.yml.bak-20261023`）。
+> 单文件挂载钉 inode —— 以后只在宿主用 `install.sh publish`（它用 `cat >` 同 inode 覆盖）；
+> 若手贱用了 `install`/`mv`，`deploy/reapply.sh` 会比 md5 并 `docker restart` 修好。
+
 打开 `http://<host>:5012/`，找到 **Kavita 改造** 卡片：
 
 - 看自检（容器 / 前端资源 / index 注入 / 补丁后端 / token / kavita.db / 映射 / 重排版 / 掌阅凭据 / **资产版本** / **自启** / **自愈**）
@@ -48,9 +79,10 @@ CLI 等价：
 
 ```bash
 cd /vol2/1001/kavita-zy-patch
-bash install.sh install      # 注入 + 生成 token + 起 5111
-bash install.sh status       # kavita/asset/api 三行
-bash install.sh uninstall    # 精确还原 index.html + 停后端
+bash install.sh install      # 注入 + 生成 token + 起 5111 (挂载模式会写 state/wwwroot)
+bash install.sh publish      # 只写挂载目录, 不碰容器
+bash install.sh status       # kavita / asset / index / mode / api
+bash install.sh uninstall    # 精确还原 + 停后端 (挂载模式会提示改 compose)
 ```
 
 验证：
@@ -218,20 +250,20 @@ push 带闸：回退超过半页不写、半页内 noop、掌阅已读完不降�
 
 ## 7. Kavita 升级 / 容器重建之后
 
-**症状**：Kavita 左栏「掌阅同步」消失，`zy-kavita-patch.js` 404。
+**挂载模式下不需要做什么**：前端两个文件在宿主 `state/wwwroot/`，重建后依旧在。
+只有一个例外 —— 镜像升级（`docker pull` 了新版）时，挂着的 `index.html` 引用的 chunk 哈希在新镜像里
+不存在，页面会白屏。自愈每 1–3 分钟验一个 `main-*.js`，取不到就自动从**新镜像**里取 `index.html` 重建注入版。
 
-**原因**：前端注入落在容器的 overlay 可写层（`docker inspect` 的 `GraphDriver.Data.UpperDir`），
-`docker pull` + recreate 之后层层清空。**数据层与库文件不受影响**（都在卷上）。
-
-**修**：装了自启 + 自愈的话，**1 分钟内自己回来**（cron 版；systemd timer 版 3 分钟）（`kavita-zy-heal.timer` 检查
-asset/index，缺就重打）。不想等：5012 点 **立即自检**；或
+手动一次：
 
 ```bash
-bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 自动判断要不要重打, 幂等
-bash /vol2/1001/kavita-zy-patch/deploy/heal.sh      # 连 5111/5012 一起看
+bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode 漂移修复, 幂等
 ```
 
-> `reapply.sh` 是首选：补丁还在就什么都不做。
+**拷贝模式**（没挂载）：容器重建会把补丁连同 overlay 上写层一起清掉 ——
+`zy-kavita-patch.js` 404、左栏「掌阅同步」消失。数据层与库文件不受影响（都在卷上）。
+装了自启 + 自愈的话 1–3 分钟内自己回来；不想等就 `bash deploy/reapply.sh`。
+
 > 自愈日志：`state/logs/heal.log`；上次结果：`state/heal.json`。
 >
 > **重打之后，已经开着的浏览器标签页仍然没有钩子**（那一次页面加载时脚本是 404）。
@@ -243,11 +275,12 @@ bash /vol2/1001/kavita-zy-patch/deploy/heal.sh      # 连 5111/5012 一起看
 
 | # | 改的东西 | 落在哪 | 容器重建会丢吗 | 回滚 |
 |---|---|---|---|---|
-| 1 | 前端注入（导航项 / 卡片徽标 / 面板） | 容器 overlay：`/kavita/wwwroot/index.html` + `zy-kavita-patch.js` | **会** | `bash install.sh uninstall` |
-| 2 | 补丁后端 | 宿主进程 `:5111`（`run/api.pid`） | 不会 | `bash ctl.sh stop` |
+| 1 | 前端注入（导航项 / 入口按钮 / 读书钩子） | 挂载模式：宿主 `state/wwwroot/` → 容器 `/kavita/wwwroot/`；拷贝模式：容器 overlay | 挂载：**不丢**；拷贝：**会** | 删 compose 两行 + 重建；或 `bash install.sh uninstall`（拷贝模式） |
+| 2 | 补丁后端 | 宿主进程 `:5111`（systemd `kavita-zy-api`） | 不会 | `bash ctl.sh stop` |
 | 3 | 进度直写 | `/vol1/1001/APPS/kavita/kavita.db` 的 `AppUserProgresses`（`PagesRead` / `TotalReads` / `BookScrollId`） | 不会 | 备份 db；或在书页手动改回 |
 | 4 | 库文件重排 | `/fs/1001/ftp/dav/Books/` 里的 epub 被替换 + `state/kpages/*.json` | 不会 | `state/backup/*.epub.bak-*` 覆盖回 + 重扫 |
 | 5 | 映射表 | `/vol2/1001/zhangyue-bridge/state/sync.sqlite`（`book_link`） | 不会 | 删行 |
+| 6 | compose 两行挂载 | `/vol1/1001/APPS/kavita/docker-compose.yml` | — | 删掉那两行（备份 `docker-compose.yml.bak-20261023`） |
 
 **Kavita 的代码和镜像一行没改。** 第 1 项只写它自己的静态目录，第 3 项是 SQL，
 第 4 项是它本来就该扫的书库文件。
@@ -266,5 +299,8 @@ bash /vol2/1001/kavita-zy-patch/deploy/heal.sh      # 连 5111/5012 一起看
 | 「安装自启」点了报 root | 面板没有免密 sudo → 手跑 `sudo bash deploy/install-autostart.sh`（一次） |
 | 自检红「自愈巡检」 | 点「立即自检」看输出；`state/logs/heal.log` 有失败原因 |
 | 「继续阅读」报错跳回详情页 | 书内链接坏了：重跑 `apply_edition.py --series N`（构建即自校验）；或回滚 `.bak` |
+| **自动 push/pull 像没生效** | 按顺序看三处：① `bash install.sh status` 里 `mode=`；② `state/logs/api.log` 有没有 `hb vX.Y.Z`（没有 = 浏览器没加载这一版钩子 → 强刷 / 查 inode 漂移）；③ 有没有 `auto-pull` / `auto-push` 行，`pushed=0 skipped=1` 是 `push_decision` 主动挡（回退或半页内），不是故障 |
+| asset 200 但 `__ZY__.ver` 是旧版 | 单文件挂载 inode 漂移：`bash deploy/reapply.sh`（比对 md5 + `docker restart` 重挂） |
+| 页面白屏 / 挂载点是目录 | 重建时 `state/wwwroot/` 里文件不存在 → docker 建成目录。`bash install.sh publish` 后 `docker compose up -d --force-recreate` |
 | 进度显示 44% 打开是目录 | 该书还没重排版 → 做第 4 步 |
 | 两侧差值 < 1 个点 | 正常，页粒度导致，不是 bug |

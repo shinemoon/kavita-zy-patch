@@ -153,6 +153,20 @@ if [ "$kv" = "200" ] || [ "$kv" = "302" ]; then
   injected=no
   kv_index="$(curl -s -m 6 "$KAVITA_URL/")" || kv_index=""
   case "$kv_index" in *zy-kavita-patch.js*) injected=yes ;; esac
+
+  # 挂载模式下镜像升级 → 挂着的 index.html 会引用旧镜像的 chunk 哈希 → 页面白屏,
+  # 但 asset 和注入都还是"好的"。所以额外验一个 index 里引用的 main-*.js 能不能拿到。
+  if [ "$injected" = yes ]; then
+    main_js="$(printf '%s' "$kv_index" | grep -oE 'main-[A-Z0-9]+\.js' | head -1)"
+    if [ -n "$main_js" ]; then
+      mc="$(http_code "$KAVITA_URL/$main_js")"
+      if [ "$mc" != "200" ]; then
+        log "挂载的 index.html 引用了不存在的 $main_js (http=$mc), 镜像升级了? 重建注入版"
+        injected=stale
+      fi
+    fi
+  fi
+
   if [ "$asset" != "200" ] || [ "$injected" != "yes" ]; then
     log "注入失效 (asset=$asset index=$injected), 重打"
     if bash "$ROOT/deploy/reapply.sh" >>"$LOG" 2>&1; then
