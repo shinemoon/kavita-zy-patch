@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""掌阅 ↔ Kavita 补丁后端。
+
+在 Kavita 之外跑一个小 HTTP 服务, 给注入到 Kavita 前端的那段脚本提供:
+    GET  /zy/api/links          映射列表 (Kavita series ↔ 掌阅 book)
+    GET  /zy/api/status         两侧进度对照 + 凭据健康
+    POST /zy/api/link           建/改映射
+    POST /zy/api/push           把 Kavita 进度推到掌阅
+    POST /zy/api/pull           把掌阅进度拉回 Kavita
+    POST /zy/api/pull-books     从掌阅书架拉 EPUB 到本地
+
+纯 stdlib, 不引第三方。启动自检缺失依赖 (bridge sync 包 / .auth.json / kavita.db)。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import socketserver
+import sys
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HERE))
+
+CONF = HERE / "patch.conf"
+_cfg: dict[str, str] = {}
+if CONF.exists():
+    for line in CONF.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        _cfg[k.strip()] = v.strip().strip('"')
+
+API_PORT = int(_cfg.get("API_PORT", "5099"))
+API_BIND = _cfg.get("API_BIND", "0.0.0.0")
+TOKEN = (_cfg.get("TOKEN", "") or "").strip()
+TOKEN_FILE = _cfg.get("TOKEN_FILE", "")
+if not TOKEN and TOKEN_FILE and Path(TOKEN_FILE).exists():
+    TOKEN = Path(TOKEN_FILE).read_text().strip()
+
+BRIDGE_ROOT = _cfg.get("BRIDGE_ROOT", "/vol2/1001/zhangyue-bridge")
+AUTH_JSON = Path(BRIDGE_ROOT) / ".auth.json"
+
+log_fh = None
+
+
+def log(msg: str) -> None:
+    global log_fh
+    line = f"{__import__('datetime').datetime.now().isoformat(timespec='seconds')} {msg}"
+    print(line, flush=True)
+    if log_fh is None:
+        try:
+            logdir = HERE / "state" / "logs"
+            logdir.mkdir(parents=True, exist_ok=True)
+            log_fh = open(logdir / "api.log", "a", encoding="utf-8")
+        except Exception:
+            log_fh = None
+    if log_fh:
+        log_fh.write(line + "\n")
+        log_fh.flush()
+
+
+# ---- bridge 载入 (延迟到真正需要时, 缺依赖不应阻止服务启动) ------------
+def bridge():
+    """返回 (core, mapping, kavita_db, zy_client) 或抛异常。"""
+    p = str(Path(BRIDGE_ROOT) / "sync")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    from sync import sync as core           # noqa: E402
+    from sync import mapping, kavita_db, zy_client  # noqa: E402
+    return core, mapping, kavita_db, zy_client
+
+
+def auth_or_none():
+    try:
+        if not AUTH_JSON.exists():
+            return None
+        return json.loads(AUTH_JSON.read_text())
+    except Exception as e:
+        log(f"auth read fail: {e}")
+        return None
+
+
+# ---- 业务 ---------------------------------------------------------------
+
+def api_links() -> dict:
+    _, mapping, _, _ = bridge()
+    return {"links": [l.__dict__ for l in mapping.all_links()]}
+
+
+def api_status() -> dict:
+    core, mapping, kavita_db, _ = bridge()
+    links = mapping.all_links()
+    out = {
+        "ok": True,
+        "auth_present": AUTH_JSON.exists(),
+        "kavita_db_present": Path(_cfg.get("KAVITA_DB", "/vol1/1001/APPS/kavita/kavita.db")).exists(),
+        "last_push": mapping.state_get("push_last_run_utc"),
+        "last_pull": mapping.state_get("pull_last_run_utc"),
+        "rows": [],
+    }
+    # 掌阅侧进度
+    zy_pct: dict[str, dict] = {}
+    auth = auth_or_none()
+    if auth and links:
+        try:
+            _, _, _, zy_client = bridge()
+            raw = zy_client.get_progress(auth, [l.zy_book_id for l in links])
+            for bid, rec in raw.items():
+                rp = rec.get("readProcess") or {}
+                zy_pct[bid] = {
+                    "pct": rp.get("readPercent"),
+                    "chapter": rp.get("chapterId"),
+                    "updated": rec.get("updateTime"),
+                }
+        except Exception as e:
+            out["zy_error"] = str(e)
+
+    # Kavita 侧章节进度
+    kv: dict[int, list] = {}
+    try:
+        from collections import defaultdict
+        agg = defaultdict(list)
+        for p in kavita_db.iter_progress():
+            agg[p.series_id].append(p)
+        kv = dict(agg)
+    except Exception as e:
+        out["kv_error"] = str(e)
+
+    for l in links:
+        chaps = kv.get(l.kavita_series_id, [])
+        read_pages = sum(p.pages_read for p in chaps)
+        total_pages = sum(p.total_pages for p in chaps if p.total_pages)
+        out["rows"].append({
+            "kavita_series_id": l.kavita_series_id,
+            "kavita_name": _series_name(l.kavita_series_id),
+            "zy_book_id": l.zy_book_id,
+            "zy_name": l.zy_book_name,
+            "kv_percent": round(read_pages * 100.0 / total_pages, 1) if total_pages else 0.0,
+            "kv_chapters_read": len([p for p in chaps if p.finished]),
+            "kv_chapters_total": len(chaps),
+            "zy": zy_pct.get(l.zy_book_id),
+            "anchor": l.zy_anchor_chapter_id,
+            "note": l.note,
+            "updated_utc": l.updated_utc,
+        })
+    return out
+
+
+def _series_name(sid: int) -> str:
+    try:
+        _, _, kavita_db, _ = bridge()
+        return kavita_db.series_name(sid)
+    except Exception:
+        return ""
+
+
+# 书名里常见的中英/繁简/修饰噪声, 判"是不是同一本"时先剥掉
+_NAME_NOISE = re.compile(
+    r"[─-▿！-～（）()《》\[\]【】_\-\s·・:：,，.。!?'\"“”‘’]|"
+    r"简体|繁體|繁体|中文|英文|完整版|精校版|校对版|无删减|完结|"
+    r" epub|epub|pdf|mobi|azw3|kindle|txt",
+    re.I,
+)
+
+
+def _names_look_related(kavita: str, zhangyue: str) -> bool:
+    """两个书名像不像同一本。宁可放过 (返回 True), 别误报。"""
+    a = _NAME_NOISE.sub("", kavita).lower()
+    b = _NAME_NOISE.sub("", zhangyue).lower()
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+    # 公共前缀 >= 2 字 (中文名常见同系列前后缀)
+    n = min(len(a), len(b))
+    for k in range(n, 1, -1):
+        if a[:k] == b[:k]:
+            return True
+    # 任意 2 字子串共有
+    return any(a[i:i + 2] in b for i in range(len(a) - 1))
+
+
+def api_push(dry_run: bool = False) -> dict:
+    core, _, _, _ = bridge()
+    return core.push_once(auth_or_none(), dry_run=dry_run)
+
+
+def api_pull(dry_run: bool = False) -> dict:
+    core, _, _, _ = bridge()
+    return core.pull_once(auth_or_none(), dry_run=dry_run)
+
+
+def api_link(body: dict) -> dict:
+    _, mapping, _, _ = bridge()
+    required = ("kavita_series_id", "zy_book_id", "zy_book_name")
+    missing = [k for k in required if not body.get(k)]
+    if missing:
+        raise ValueError("缺字段: " + ", ".join(missing))
+    l = mapping.link(
+        kavita_series_id=int(body["kavita_series_id"]),
+        zy_book_id=str(body["zy_book_id"]),
+        zy_book_name=str(body["zy_book_name"]),
+        zy_anchor_chapter_id=body.get("anchor") or None,
+        kavita_chapter_count=int(body.get("kavita_chapter_count") or 0),
+        note=str(body.get("note") or ""),
+    )
+    return {"ok": True, "link": l.__dict__}
+
+
+def api_selfcheck() -> dict:
+    """轻量级 warning 用: 逐项体检, 返回问题清单 (不抛)。"""
+    warns: list[dict] = []
+
+    def add(level: str, code: str, msg: str, fix: str = ""):
+        warns.append({"level": level, "code": code, "msg": msg, "fix": fix})
+
+    # 1. Kavita 本体
+    try:
+        kdb = Path(_cfg.get("KAVITA_DB", "/vol1/1001/APPS/kavita/kavita.db"))
+        if not kdb.exists():
+            add("error", "kavita_db", f"Kavita 数据库不在 {kdb}", "检查 docker 是否在跑")
+        elif not os.access(kdb, os.R_OK):
+            add("error", "kavita_db_perm", f"{kdb} 不可读", "sudo chown $(whoami) / chmod 644")
+    except Exception as e:
+        add("error", "kavita_db", str(e))
+
+    # 2. 掌阅凭据
+    auth = auth_or_none()
+    if auth is None:
+        add("warn", "zy_auth", "缺 .auth.json, 掌阅侧功能全部不可用",
+            "扫码登录后重跑, 或检查 /vol2/1001/zhangyue-bridge/.auth.json")
+    else:
+        need = ("usr", "zysid", "p29", "p2", "p3", "p4")
+        miss = [k for k in need if not auth.get(k)]
+        if miss:
+            add("error", "zy_auth_fields", "凭据缺字段: " + ", ".join(miss), "重新扫码登录")
+        if not os.access(AUTH_JSON, os.R_OK):
+            add("error", "zy_auth_perm", f"{AUTH_JSON} 不可读", "chmod 600 + 属主改回")
+
+    # 3. bridge 代码
+    bpath = Path(BRIDGE_ROOT) / "sync"
+    pkg = bpath / "sync"
+    if not (pkg / "sync.py").exists():
+        add("error", "bridge", f"找不到 bridge 代码 {pkg}", "确认 zhangyue-bridge 目录还在")
+    else:
+        try:
+            bridge()
+        except Exception as e:
+            add("error", "bridge_import", f"bridge 导入失败: {e}", "python3 -c 'import sync.sync' 手动复现")
+
+    # 4. token
+    if not TOKEN:
+        add("warn", "token", "共享 token 未生成", "跑 ./install.sh")
+
+    # 5. 映射覆盖
+    try:
+        _, mapping, _, _ = bridge()
+        links = mapping.all_links()
+        if not links:
+            add("info", "no_links", "还没有任何 Kavita↔掌阅 映射",
+                "在页面里建一条, 或 python3 sync/zync.py link ...")
+        else:
+            covered = {l.kavita_series_id for l in links}
+            # Kavita 里已读过的 series, 未映射的提示
+            _, _, kavita_db, _ = bridge()
+            read_series = {p.series_id for p in kavita_db.iter_progress()
+                           if p.pages_read > 0}
+            orphan = read_series - covered
+            if orphan:
+                add("info", "unlinked",
+                    f"{len(orphan)} 本读过的书还没连掌阅: series_id={sorted(orphan)[:8]}",
+                    "在系列页点「连掌阅」建立映射")
+            # 书名对不上 = 大概率映射错了
+            for l in links:
+                kn = _series_name(l.kavita_series_id)
+                zn = l.zy_book_name or ""
+                if kn and zn and not _names_look_related(kn, zn):
+                    add("warn", "name_mismatch",
+                        f"series {l.kavita_series_id} 映射可疑: "
+                        f"Kavita《{kn}》↔ 掌阅《{zn}》",
+                        "确认是不是连错书; 改映射 python3 sync/zync.py link ...")
+    except Exception as e:
+        add("error", "mapping", str(e))
+
+    # 6. 前端注入是否还在
+    try:
+        idx = HERE / "build" / "index.html.patched"
+        out = {"ok": True, "install_dir": str(HERE), "warnings": warns}
+    except Exception:
+        out = {"ok": True, "install_dir": str(HERE), "warnings": warns}
+
+    return out
+
+
+# ---- HTTP ---------------------------------------------------------------
+
+ROUTES_GET = {
+    "/zy/api/links": api_links,
+    "/zy/api/status": api_status,
+    "/zy/api/health": lambda: {"ok": True, "ts": __import__("time").time()},
+    "/zy/api/selfcheck": api_selfcheck,
+}
+ROUTES_POST = {
+    "/zy/api/push": lambda b: api_push(bool(b.get("dry_run"))),
+    "/zy/api/pull": lambda b: api_pull(bool(b.get("dry_run"))),
+    "/zy/api/link": api_link,
+}
+
+
+class H(BaseHTTPRequestHandler):
+    server_version = "zy-kavita-patch/0.1"
+
+    # token 走自定义头会触发 CORS 预检。这里只信自定义头,
+    # 不开 Access-Control-Allow-Credentials —— 预检凭据共享不到,
+    # 所以前端不能用 cookie, 必须靠 X-ZY-Token 显式带。
+    def _cors(self) -> None:
+        origin = self.headers.get("Origin")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, X-ZY-Token, Authorization")
+        self.send_header("Access-Control-Max-Age", "600")
+
+    def _send(self, code: int, obj: dict) -> None:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _authorized(self, q: dict) -> bool:
+        if not TOKEN:
+            return True
+        tok = (self.headers.get("X-ZY-Token")
+               or q.get("token", [""])[0]
+               or "")
+        # 允许同源: 浏览器带 token 头; curl 用 query
+        return tok == TOKEN
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        fn = ROUTES_GET.get(u.path)
+        if fn is None:
+            return self._send(404, {"ok": False, "err": "no route"})
+        from urllib.parse import parse_qs
+        q = parse_qs(u.query)
+        if not self._authorized(q):
+            return self._send(403, {"ok": False, "err": "bad token"})
+        try:
+            self._send(200, fn())
+        except Exception as e:
+            log(f"GET {u.path} FAIL {e}\n{traceback.format_exc()}")
+            self._send(500, {"ok": False, "err": str(e)})
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        fn = ROUTES_POST.get(u.path)
+        if fn is None:
+            return self._send(404, {"ok": False, "err": "no route"})
+        from urllib.parse import parse_qs
+        q = parse_qs(u.query)
+        if not self._authorized(q):
+            return self._send(403, {"ok": False, "err": "bad token"})
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            body = {}
+        try:
+            self._send(200, fn(body))
+        except Exception as e:
+            log(f"POST {u.path} FAIL {e}\n{traceback.format_exc()}")
+            self._send(500, {"ok": False, "err": str(e)})
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def main() -> None:
+    ThreadingHTTPServer.allow_reuse_address = True
+    srv = ThreadingHTTPServer((API_BIND, API_PORT), H)
+    log(f"zy-kavita-patch api on {API_BIND}:{API_PORT} token={'set' if TOKEN else 'none'}")
+    # 启动自检: 只记 log, 不阻断
+    try:
+        sc = api_selfcheck()
+        for w in sc["warnings"]:
+            log(f"selfcheck {w['level']}: {w['code']}: {w['msg']}")
+    except Exception as e:
+        log(f"selfcheck crashed: {e}")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+[Unit]
+Description=ZhangYue/Kavita self-heal (inject patch, restart api/web if down)
+Documentation=file:///vol2/1001/kavita-zy-patch/docs/SETUP.md
+After=network-online.target docker.service kavita.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/vol2/1001/kavita-zy-patch
+ExecStart=/bin/bash /vol2/1001/kavita-zy-patch/deploy/heal.sh
+TimeoutStartSec=300
+Nice=10

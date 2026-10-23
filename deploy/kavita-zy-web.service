@@ -1,0 +1,19 @@
+[Unit]
+Description=ZhangYue bridge console (:5012)
+Documentation=file:///vol2/1001/kavita-zy-patch/docs/SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/vol2/1001/zhangyue-bridge/sync
+Environment=ZY_WEB_PORT=5012
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /vol2/1001/zhangyue-bridge/sync/web.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/vol2/1001/zhangyue-bridge/state/logs/web.out
+StandardError=append:/vol2/1001/zhangyue-bridge/state/logs/web.out
+
+[Install]
+WantedBy=multi-user.target

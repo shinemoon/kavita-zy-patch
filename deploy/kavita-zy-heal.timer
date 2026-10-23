@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ZhangYue/Kavita self-heal every 3 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=3min
+AccuracySec=15s
+Unit=kavita-zy-heal.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+backups/
+build/
+state/
+run/
+src/node_modules/
+src/__pycache__/
+__pycache__/

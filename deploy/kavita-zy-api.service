@@ -1,0 +1,17 @@
+[Unit]
+Description=ZhangYue to Kavita patch API (:5111)
+Documentation=file:///vol2/1001/kavita-zy-patch/docs/SETUP.md
+After=network-online.target docker.service kavita.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/vol2/1001/kavita-zy-patch
+ExecStart=/usr/bin/python3 /vol2/1001/kavita-zy-patch/src/api_server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/vol2/1001/kavita-zy-patch/state/logs/api.out
+StandardError=append:/vol2/1001/kavita-zy-patch/state/logs/api.out
+
+[Install]
+WantedBy=multi-user.target
