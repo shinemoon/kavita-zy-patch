@@ -292,7 +292,7 @@ def api_auto_pull(body: dict) -> dict:
     if not sid:
         raise ValueError("缺 series_id")
     core, mapping, _, _ = bridge()
-    if mapping.get(sid) is None:
+    if not mapping.links_for_series(sid):
         return {"ok": True, "skipped": "no_link", "series_id": sid}
     if not _auto_lock.acquire(blocking=False):
         return {"ok": False, "busy": True, "series_id": sid}
@@ -323,7 +323,7 @@ def api_auto_push(body: dict) -> dict:
     if not sid:
         raise ValueError("缺 series_id")
     core, mapping, _, _ = bridge()
-    if mapping.get(sid) is None:
+    if not mapping.links_for_series(sid):
         return {"ok": True, "skipped": "no_link", "series_id": sid}
     if not _auto_lock.acquire(blocking=False):
         return {"ok": False, "busy": True, "series_id": sid}
