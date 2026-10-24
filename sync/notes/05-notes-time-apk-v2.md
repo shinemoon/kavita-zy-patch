@@ -363,9 +363,17 @@ CLI: `python3 zync.py notes {sync|pull|push} [--series N] [--dry-run]`
 | `delMarkOrNote` type=2 | 返回 `{"status":0,"res":"success"}` 且条目**真的消失** (18→17) ✓ |
 | 复测 (插入→删除之后的任何 upload, 包括 `books:[]` 空载荷) | 一律 `600001 authority is error!` |
 
-→ 结论: **写通道的协议是对的** (已经用真账号做过一次插入 + 一次删除, 用户原有的 17 条一条没少),
-  但账号的写权限随后被服务端拒了 (`authority is error`)。读接口同时正常, 说明不是登录失效。
-  最可能是风控 (短时间多次写/删) 或写接口需要 `zysid` 重新握手。**下一步: 重新扫码登录刷新 zysid 后再试。**
+→ 当时的结论「写权限被服务端风控 / 需要重新扫码刷新 zysid」**是错的** (2026-10-24 23:45 已定位)。
+  真因是**我们自己的 URL 拼装 bug**: `_call()` 对 `path` 无条件追加 `?` + query, 而 `/uploadData?isCheck=1`
+  自带查询串 → 拼成 `...uploadData?isCheck=1?usr=..&zysid=..`,
+  服务端只看到 `isCheck="1?usr=..."`, `usr` / `zysid` 全部丢失 → 一律 `authority is error`。
+  - 只有 uploadData 会中招 (路径常量里带 `?isCheck=1`), 所以 **delMarkOrNote 正常、uploadData 挂**,
+    读接口也都正常 (路径不带 `?`), 看起来像"写权限被拒", 实际是鉴权参数根本没发出去。
+  - `books:[]` 空载荷返 `code 0` 也解释得通: 无书则不做逐书鉴权。
+  - 修法: `sep = "&" if "?" in path else "?"`; 回归测试 `test_notes_time.py` 增「uploadData URL 用 & 续接」。
+  - 修复后真推: 剑来 17→18 条 (Kavita 新划线 + 批注 `Demo` 落到云端 `155_0_0$##3-0-155-39900…`),
+    之后 auto-push 的 `notes-push` 无 errors, 全部 noop 幂等。
+  - **教训**: "读能用、写被拒" 先看**实际发出的 URL/headers**, 别先归因风控/风控/token 过期。
 
 ### 7.2 笔记下载 (掌阅 → Kavita)
 
@@ -407,8 +415,8 @@ data = {"20261024":[{"bid":0,"local_bid":"<32hex>_local",
 
 | 项 | 掌阅→Kavita | Kavita→掌阅 |
 |---|---|---|
-| 划线 | 协议就绪, 等服务端肯给 downloadDataV2 数据 | 协议验证过 (插入+删除都做过真机验证), 当前被服务端 600001 拦, 等重新登录 |
-| 书签 | 同上 | 未实推 (type=1 待验) |
+| 划线 | 协议就绪, 等服务端肯给 downloadDataV2 数据 | ✅ 已打通 (URL 拼装 bug 修后); 真推成功 |
+| 书签 | 同上 | 协议就绪 (6 字段已对齐 APK), 待有 Kavita 书签时实推 |
 | 阅时 | 可按天精确 + 按周书级 + 分摊到天 | 账号级已验证; **书级需要设备本地数字 bookid** |
 
 ### 7.6 建议顺序
@@ -463,13 +471,15 @@ time-pull series=26 written=1 skipped=3 mode={'book': 1}
 notes-pull series=26 pushed=0 marks=0 added=0 updated=0 del=0 skip=0 empty=1
 ```
 
-### 8.4 写通道现状
+### 8.4 写通道现状 (2026-10-24 23:45 修复)
 
-仍然 `600001 authority is error!`（连 `books:[]` 空载荷都拒）。协议已经过真机验证
-（插入 1 条成功 + 删除 1 条成功，用户原有 17 条无损），现在只差账号写权限。
+之前记录的 `600001 authority is error!` **不是账号权限问题**, 是我们自己的 URL 拼装 bug:
+`_call()` 无条件用 `?` 续接 query, 而 `/uploadData?isCheck=1` 自带查询串 → 拼出
+`...?isCheck=1?usr=..&zysid=..` → 鉴权参数全丢 → 一律 600001。改成 `&` 续接后:
+真推成功 (剑来 17→18 条划线, Kavita 新划线 + 批注落到云端), auto-push 的 notes-push 无 errors。
+`books:[]` 空载荷返 0 是因为没有书就不做逐书鉴权 —— 这条曾误导我们以为是"token 过期"。
 
-**解锁步骤**：App 里重新扫码登录刷新 `zysid` → `python3 zync.py notes push --dry-run`
-看 `would_push` 数量 → 去掉 `--dry-run` 真推。
+**不需要重新扫码登录**。写通道已可用。
 
 ### 8.5 测试
 
