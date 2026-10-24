@@ -1,0 +1,5 @@
+state/sync.sqlite
+state/logs/
+__pycache__/
+*.bak
+*.pyc

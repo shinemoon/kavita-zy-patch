@@ -1,0 +1,17 @@
+# 凭据（绝不入库）
+.auth.json
+.auth-cookies.json
+
+# 大件 / 运行态
+state/
+books/
+apk/
+ghidra-proj/
+ghidra-out/
+tools/node_modules/
+
+# 产物
+**/__pycache__/
+*.pyc
+*.bak
+*.log

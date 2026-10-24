@@ -1,0 +1,6 @@
+{
+  "_comment": "sync config (placeholder, currently everything baked into Python)",
+  "poll_seconds": 30,
+  "pull_every_seconds": 300,
+  "zy_push_throttle_ms": 300
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=Zhangyue Bridge Web (Kavita <-> iReader sync control panel)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/vol2/1001/zhangyue-bridge/sync
+ExecStart=/usr/bin/python3 /vol2/1001/zhangyue-bridge/sync/web.py
+Environment=ZY_WEB_HOST=127.0.0.1
+Environment=ZY_WEB_PORT=5012
+Environment=ZY_WEB_TOKEN=
+Restart=always
+RestartSec=5
+StandardOutput=append:/vol2/1001/zhangyue-bridge/state/logs/web.out
+StandardError=append:/vol2/1001/zhangyue-bridge/state/logs/web.out
+
+[Install]
+WantedBy=default.target
