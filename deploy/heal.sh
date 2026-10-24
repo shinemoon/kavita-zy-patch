@@ -351,7 +351,8 @@ reload_if_stale kavita-zy-api.service \
   "$BRIDGE_ROOT/sync/sync/sync.py" "$BRIDGE_ROOT/sync/sync/config.py" \
   "$BRIDGE_ROOT/sync/sync/kpages.py" "$BRIDGE_ROOT/sync/sync/mapping.py" \
   "$BRIDGE_ROOT/sync/sync/kavita_db.py" "$BRIDGE_ROOT/sync/sync/epubprep.py" \
-  "$BRIDGE_ROOT/sync/sync/zpct.py"
+  "$BRIDGE_ROOT/sync/sync/zpct.py" "$BRIDGE_ROOT/sync/sync/zy_time.py" \
+  "$BRIDGE_ROOT/sync/sync/zy_notes.py"
 reload_if_stale kavita-zy-web.service \
   "$BRIDGE_ROOT/sync/web.py" "$BRIDGE_ROOT/sync/sync/sync.py" \
   "$BRIDGE_ROOT/sync/sync/kpages.py" "$BRIDGE_ROOT/sync/sync/cloud_books.py" \
