@@ -154,6 +154,37 @@ sqlite3.OperationalError: ON CONFLICT clause does not match any PRIMARY KEY or U
 已经正确, dry-run 确认 `failed=0`。
 ---
 
+## 笔记 / 书签 / 阅读时长 双向同步（2026-10-24 起）
+
+CLI：
+
+```sh
+cd /vol2/1001/zhangyue-bridge/sync
+python3 zync.py notes {sync|pull|push} [--series N] [--dry-run]
+python3 zync.py time  {sync|pull|push} [--day D] [--start D --end D] [--dry-run]
+python3 tests/test_notes_time.py
+```
+
+关键事实（都实测过，细节见 `sync/notes/05-notes-time-apk-v2.md`）：
+
+* **书身份是文件内容 MD5**，不是设备自增 id → 手机/平板读同一份文件落到同一个桶，
+  多设备时长/笔记天然合并。自传书的 `local_bid = <文件MD5 32hex 大写>_local`。
+* **时长读回来是精确的**：`read_report/book?book_id=<MD5>_local` 直接给
+  `daybyday_times[].detail[] = {read_day, read_minutes}`（每天每书），
+  不再需要按天总量分摊。周级分摊只在取不到逐日数据时兜底（`mode=alloc`）。
+* **时长只能写“当天”**：服务端按收到请求的日期归日，`data` 里的日期 key 和
+  `timestamp` 都不生效（传 20261020/20261021 全落到上传当天）。所以
+  Kavita → 掌阅必须当天推，历史回填做不到。分钟位图按并集合并 → 重复推幂等。
+* **KEY 大小写敏感**：小写 `<md5>_local` 会落到另一个空桶（踩过一次）。
+
+| 数据 | 掌阅 → Kavita | Kavita → 掌阅 |
+|---|---|---|
+| 划线 / 批注 | ✅ | ⚠️ 协议已通，当前账号写接口返 `600001 authority is error`（需重新扫码刷新 zysid） |
+| 书签 | ✅ | 同上 |
+| 阅读时长 | ✅ 精确到每天每书 | ✅ 当天可写（位图，幂等） |
+
+---
+
 ## 仓库结构（2026-10-24 纳入 git）
 
 本目录整体是一个 git 仓库，远端 = `git@github.com:shinemoon/kavita-zy-patch.git`，

@@ -117,21 +117,46 @@ POST https://uc.ireader.com/postal/reading_time/report   (gzip)
 * 服务端按 (usr, 日, 书) **按位或**合并 → 同一分钟重复上报不该翻倍 (待实测, 见 §4)
 * `sign` 服务端不校验 (伪造 sign / 不带 sign 都进了 body 解析)
 
-### 2.3 拉回 (关键限制!)
+### 2.3 拉回 —— **逐书逐日可以拿到** (2026-10-24 修正)
 
-APK 里**没有** "按书按天读回时长" 的接口。能用的只有:
+早期结论"云端只能给周每书 + 天总量"是探测不到位。正确接口:
 
-| 接口 | 粒度 | 说明 |
-|---|---|---|
-| `ClientApi_Summary.ReadTime` | 账号总/周 | `{totalTime, weekTimelong{read,listen,reading_local}}` |
-| `usercenter/user/read_report/statistics?date_type=week&start_date&end_date` | **按天总时长** + **按周每书(前10)** | 实测: 必须传完整周 (周一~周日), 否则全 0 |
-| `usercenter/user/read_report/book?book_id=` | 按书 | 参数名对 (`bookid` 会报"参数错误"), 但返空 book_info; 需真机 id 形态, 未打通 |
-| `usercenter/user/read_report/statistics?date_type=month/year` | 月/年聚合 | 每书用 month/year 聚合值 |
+```
+GET https://webboot.zhangyue.com/usercenter/user/read_report/book?book_id=<KEY>
+KEY = 自传书: <文件MD5 32hex 大写>_local   商店书: <数字 bookid>
+→ body: {read, read_progress, read_days_cnt, first_read_date, book_info{name,cover,...},
+         daybyday_times:[{read_month:"2026-10", read_time:"513",
+                          detail:[{read_day:"24", read_minutes:16}, ...]}]}
+```
 
-实测 (`2026-10-19 ~ 10-25`): `read=121`, `days=[9,0,11,31,61,9,0]`, `top books=[30,14]`。
+* `detail[]` = **每天每书分钟**, 精确原始值 (不是分摊)
+* **KEY 大小写敏感**: 小写 `<md5>_local` 会落到另一个几乎空的桶 (实测大写 1268 分钟 / 小写 2 分钟)
+* `?bookid=` 报"参数错误", 只认 `book_id`
+* `read_report/statistics?date_type=week|month|year` 仍可用, 但周榜只 top10,
+  且 `reading_longest_books[]` 里带 `local_book_id` (= `<md5>_local`), 用来自证身份
+* `zy_time.pull()` 现在主路径走这条路 (mode=`book`), 只有取不到逐日数据的书才退回周级分摊
+  (mode=`alloc`/`exact`), 并在 report 里分开计数
 
-=> **掌阅 → Kavita 的时长只能是**: "某天账号共读了 N 分钟" 精确 + "某周某书 M 分钟" 精确,
-    **没有** "某天某书多少分钟"。要落到 Kavita 的 per-book session, 必须显式选一种归属策略。
+### 2.4 书身份 = 文件内容 MD5 → 多设备天然合并 (2026-10-24 验证)
+
+* 自传书 `bid=0`, 服务端按 `local_bid` 记账; `local_bid` 的基座是 **文件内容 MD5**
+  (`hg.e.k(BookItem)`: `mBookID!=0 ? 数字id : core.getFileMD5(mFile)`; 云书架 book_id = `MD5(file)` + 32 hex)
+* 所以手机/平板读同一份文件 → 同一个桶, 时长自然合并; **不是**设备自增 id
+  (APK 里另有 `mLocalBookId = MD5(file)+MD5(path)` 用于本地去重, 但云端书身份用 MD5 本体)
+* 实测: 用 `<MD5>_local` 推 1 分钟, `read_report/book` 的当天分钟数 +1,
+  周榜 `reading_longest_books` 里同名书同步增长 → 书级确实入账
+
+### 2.5 写入只能"当天" (2026-10-24 实测, 重要)
+
+| 试验 | 结果 |
+|---|---|
+| data key `20261020`, `timestamp`=now | 落到 **10-24** (上传日) |
+| data key `20261021`, `timestamp`=now | 落到 **10-24** |
+| data key `20261020`, `timestamp`=2026-10-20 12:00 | 仍落到 **10-24** |
+
+→ 服务端按"收到请求的那一天"归日, 日期 key / body.timestamp 都不生效。
+**结论: 历史回填协议层不可能**, Kavita→掌阅 只能当天推 (每小时/按需增量均可)。
+另: 服务端按分钟位图求并集, 同一天重复推同一批分钟不翻倍 (幂等), 已验证 (8→15→16 分钟逐次 +1/+7 不重复)。
 
 ---
 
@@ -143,26 +168,28 @@ APK 里**没有** "按书按天读回时长" 的接口。能用的只有:
 | 书签 | ✅ 自带 markpercent | ✅ 同上, 字段最少 | 最简单的一类 |
 | 批注(想法) | ✅ summary+remark (remark 挂在划线上) | ⚠️ 若 Kavita 注释无对应选区, 只能挂到"划线+remark"形态 | 不造 bookScaleNotes, 统一走 booknotes+remark |
 | 手写笔迹 | ⚠️ base64 笔迹 | ❌ | 不做 |
-| 阅读时长 | ⚠️ 按天总时长精确; 按周每书精确; **按天每书不可得** | ✅ 可写 (分钟位图, 无签名门槛) | 见 §4 策略 |
+| 阅读时长 | ✅ **按天每书精确** (`read_report/book`) | ⚠️ 可写但要**当天**, 不能补历史 (§2.5) | 见 §2.3~§2.5 |
 | 阅读进度 | ✅ 已做 (readPercent 公式) | ✅ 已做 (push) | — |
 
-**结论: 双向都可以做, 但"时长"两侧精度天然不对称** —— 写(掌阅)可以精确到分钟位图,
-读(掌阅)只能到"天总量 + 周每书"。任何声称"每天每书精确回读"的方案都是编的。
+**结论: 双向都能做到"分钟"级精度** —— 写(掌阅)用分钟位图; 读(掌阅)用
+`read_report/book` 的逐日 `read_minutes`。唯一不对称是**写只能写当天**, 历史回填做不到 (§2.5)。
+(上面 2.3 那一版"按天每书不可得"的结论已在 2026-10-24 推翻, 见 §2.3 新内容。)
 
 ---
 
-## 4. 阅读时长的归属策略 (需要明写, 不许悄悄近似)
+## 4. 阅读时长的归属策略 (2026-10-24 更新: 不再需要分摊)
 
-候选:
+`read_report/book` 打通后, **掌阅 → Kavita 的时长是精确值** (mode=`book`),
+T1/T2 的分摊方案降级为"接口取不到该书的逐日数据时的兜底":
 
-* **T1 单书日** — 只有当某天账号只读了一本书 (周聚合里 top1 == 当天总量) 时, 判定该天归该书,
-  其余天只导入"账号级总量"(Kavita 里不落 per-book session, 落一个 `ZY 账号` 虚拟条目? 不做)。
-* **T2 周内按天比例分摊** — 已知周内每书 M 分钟 + 每天总量 d_i, 用 daily share 摊到书上。
-  数学上唯一确定的是总量, 分摊是假设 (误差最大 ~±20 分钟/周)。**必须在 UI 标"估算"**。
-* **T3 只写 Kavita→掌阅, 不回读** — 最保守, 放弃"掌阅历史时长进 Kavita"。
+* **主路径 `book`** — `read_report/book?book_id=<MD5>_local` → 每天每书分钟, 直接落 Kavita 会话。
+* **兜底 `alloc`** — 该书 key 取不到数据 (比如书被重新打包导致内容 MD5 变了, 见藤井三卷)
+  时, 退回周级 `reading_longest_books` 按天总量比例分摊, 并在 report 里标 `mode=alloc`。
+* **兜底 `exact`** — 兜底里若整周只有一本有映射的书, 天总量全归它。
 
-我的建议: **T2 + 标记** (数据不全比没有好, 但必须让用户知道这是估算), 且默认只回填
-"有映射的书"(series 26/27/29 那几本), 不要全账号铺开。
+**写方向限制**: 只能写"当天"(见 §2.5) + 位图并集幂等 → Kavita→掌阅 必须
+当天跑 (auto 钩子/定时), 不能补历史。两端口径因此天然不对称, 但都不是估算:
+读回来的每天每书数是掌阅自己的原始值。
 
 ---
 

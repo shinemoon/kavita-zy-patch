@@ -86,5 +86,30 @@ check("分摊 守恒 剑来", sum(a.values()) == 30, a)
 check("分摊 守恒 狐", sum(b.values()) == 14, b)
 check("分摊 不超过天总量", all(a[d] <= days[d] for d in days), a)
 
+# --- 阅读时长: 逐书逐日读回 (read_report/book, 2026-10-24 打通) -------------
+check("book_key 大写 + _local",
+      zy_time.book_key("70776A64C32C1C065DAB241F3E9F133AFFFFFFFF") ==
+      "70776A64C32C1C065DAB241F3E9F133A_local", zy_time.book_key("70776A64C32C1C065DAB241F3E9F133AFFFFFFFF"))
+
+_fake_body = {"daybyday_times": [
+    {"read_month": "2026-10", "read_time": "26", "detail": [
+        {"read_day": "24", "read_minutes": 16},
+        {"read_day": "1", "read_minutes": 11},
+        {"read_day": "00", "read_minutes": 99},        # 脏数据 -> 丢
+    ]},
+    {"read_month": "bad", "detail": [{"read_day": "2", "read_minutes": 5}]},  # 月格式错 -> 丢
+]}
+_orig_book_report = zy_time.book_report
+zy_time.book_report = lambda key: _fake_body
+_days = zy_time.book_days("X_local")
+zy_time.book_report = _orig_book_report
+check("book_days 解析 + 补零", _days.get("2026-10-24") == 16 and _days.get("2026-10-01") == 11, _days)
+check("book_days 丢脏数据", len(_days) == 2, _days)
+
+# push 只允许当天 (服务端按上传日归日)
+_today = date.today()
+_r = zy_time.push(_today.replace(day=1) if _today.day > 1 else _today, dry_run=True)
+check("push 非当天被拒", bool(_r["errors"]) and _r["written"] == 0, _r)
+
 print("\nFAIL =", FAIL)
 sys.exit(1 if FAIL else 0)
