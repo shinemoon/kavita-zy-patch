@@ -280,6 +280,43 @@ def api_auto_hb(body: dict) -> dict:
     return {"ok": True, "ver": ver}
 
 
+_TIME_LAST: dict[tuple[str, int], float] = {}
+_TIME_GAP = 600.0        # 同一本书 10 分钟内只同步一次时长 (避免每次存进度都打接口)
+
+
+def _time_sync(kind: str, sid: int, quiet: bool = True) -> dict:
+    """顺手做阅读时长同步 (失败不影响进度同步)。
+
+    push: 只写**当天** (掌阅服务端按上传日归日, 见 notes/05 §2.5)
+    pull: 最近 7 天的逐书逐日 (read_report/book, 精确)
+    """
+    import time as _t
+    key = (kind, sid)
+    now = _t.monotonic()
+    if now - _TIME_LAST.get(key, 0.0) < _TIME_GAP:
+        return {"skipped": "throttled"}
+    p = str(Path(BRIDGE_ROOT) / "sync")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    try:
+        from sync import zy_time                      # noqa: E402
+        from datetime import date, timedelta
+        if kind == "push":
+            res = zy_time.push(date.today(), series_ids={sid})
+        else:
+            today = date.today()
+            res = zy_time.pull(today - timedelta(days=6), today, series_ids={sid})
+        if (not quiet) or res.get("written"):
+            log(f"time-{kind} series={sid} written={res.get('written')} "
+                f"skipped={res.get('skipped')} mode={res.get('mode')}")
+        _TIME_LAST[key] = now
+        return res
+    except Exception as e:
+        _TIME_LAST[key] = now
+        log(f"time-{kind} series={sid} fail: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def api_auto_pull(body: dict) -> dict:
     """掌阅 → Kavita, 单本。
 
@@ -306,9 +343,10 @@ def api_auto_pull(body: dict) -> dict:
     changed = after > before
     log(f"auto-pull series={sid} kavita {before}->{after}/{total} "
         f"updated={res.get('updated')} skipped={res.get('skipped')}")
+    time_res = _time_sync("pull", sid)
     return {"ok": True, "series_id": sid, "changed": changed,
             "pages_read": after, "pages": total,
-            "before": before, "detail": res}
+            "before": before, "detail": res, "time": time_res}
 
 
 def api_auto_push(body: dict) -> dict:
@@ -337,7 +375,8 @@ def api_auto_push(body: dict) -> dict:
             f"skipped={res.get('skipped')} failed={res.get('failed')}"
             + (" (tick)" if quiet else "")
             + _push_brief(res))
-    return {"ok": True, "series_id": sid, "detail": res}
+    time_res = _time_sync("push", sid, quiet)
+    return {"ok": True, "series_id": sid, "detail": res, "time": time_res}
 
 
 def _push_brief(res: dict) -> str:
