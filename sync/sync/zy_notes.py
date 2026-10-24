@@ -910,7 +910,11 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
         book32 = kb32(link.zy_book_id)
         total_bytes = max(1, geo.total_bytes)
         cloud = cloud_versions(book32)
-        known = {(r["kind"], r["zy_key"]): r for r in links_for_series(link.kavita_series_id)}
+        rows_known = links_for_series(link.kavita_series_id)
+        known = {(r["kind"], r["zy_key"]): r for r in rows_known}
+        # 按 Kavita 注解 id 反查来源: pull 回来的行, key 是云端原始位置;
+        # push 重算位置时可能落在另一处同名文本 -> key 对不上 -> 被当成新条目重复回灌。
+        byid = {(r["kind"], int(r["kavita_annotation_id"] or 0)): r for r in rows_known}
         idx_row = {}
         try:
             for row in notebooks():
@@ -944,8 +948,9 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 continue
             remark = (a.get("CommentPlainText") or "").strip()
             sig = _sig("note", key, text, remark)
-            row = known.get(("note", key))
+            row = known.get(("note", key)) or byid.get(("note", int(a.get("Id") or 0)))
             if row is not None and row["source"] == "zy":
+                ann_keys.add(row["zy_key"])   # 保留云端原始 key, 别误判成"Kavita 已删"
                 report["skipped"] += 1        # 掌阅自己上传的, 不回灌
                 continue
             if row is not None and (row["sig"] or "") == sig:
@@ -976,8 +981,9 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             key = mark_key(book32, pos)
             mark_keys.add(key)
             sig = _sig("mark", key, "", "")
-            row = known.get(("bookmark", key))
+            row = known.get(("bookmark", key)) or byid.get(("bookmark", int(b.get("Id") or 0)))
             if row is not None and row["source"] == "zy":
+                mark_keys.add(row["zy_key"])
                 report["skipped"] += 1
                 continue
             if row is not None and (row["sig"] or "") == sig:

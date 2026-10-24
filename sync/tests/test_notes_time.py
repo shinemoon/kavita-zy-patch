@@ -292,6 +292,15 @@ check("push 删除只动 kv 来源", _r5["deleted"] == 1 and ("kvgone" + _key0[:
 check("push 不删 zy 来源", all(not k.startswith("zyorigin") for k in _deleted_keys), _deleted_keys)
 check("push 划线删除用 type=2", all(t == 2 for _, _, t in _DELETED), _DELETED)
 
+# pull 回来的行: zy_key 是云端原始位置, push 重算位置可能算到别处 -> 按注解 id 认来源
+_anns_zy2 = [{"Id": 4242, "SelectedText": "第二段要说的话", "CommentPlainText": ""}]
+zy_notes.kavita_annotations = lambda sid: _anns_zy2
+zy_notes.link_put("note", BOOK32, "zypos" + _key0[:12], series_id=99, chapter_id=4242,
+                  annotation_id=4242, marktime=5, source="zy", sig="")
+_r7 = zy_notes.push([99])
+check("push 按注解id认出来源 (位置算偏也不回灌)", _r7["pushed"] == 0, _r7)
+zy_notes.link_delete("note", BOOK32, "zypos" + _key0[:12])
+
 # 书签: 字段对齐 APK BookMark 的 6 键
 zy_notes.kavita_annotations = lambda sid: []
 zy_notes.kavita_bookmarks = lambda sid: [{"Id": 7, "Page": 3, "ChapterTitle": "第三章"}]
