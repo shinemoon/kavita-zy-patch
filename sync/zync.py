@@ -62,6 +62,33 @@ def cmd_daemon(args):
     return 0
 
 
+def cmd_notes(args):
+    from sync import zy_notes
+    sid = args.series or None
+    if args.action == "pull":
+        out = zy_notes.pull(sid, dry_run=args.dry_run)
+    elif args.action == "push":
+        out = zy_notes.push(sid, dry_run=args.dry_run)
+    else:
+        out = zy_notes.sync(sid, dry_run=args.dry_run)
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0 if not out.get("errors") else 1
+
+
+def cmd_time(args):
+    from datetime import date
+    from sync import zy_time
+    if args.action == "push":
+        out = zy_time.push(date.fromisoformat(args.day), dry_run=args.dry_run)
+    elif args.action == "pull":
+        out = zy_time.pull(date.fromisoformat(args.start), date.fromisoformat(args.end),
+                           dry_run=args.dry_run)
+    else:
+        out = zy_time.sync(date.fromisoformat(args.day), dry_run=args.dry_run)
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0 if not out.get("errors") else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="zhangyue-bridge")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -95,6 +122,21 @@ def main(argv=None):
     p_daemon = sub.add_parser("daemon")
     p_daemon.add_argument("--interval", type=int, default=30)
     p_daemon.set_defaults(func=cmd_daemon)
+
+    p_nt = sub.add_parser("notes", help="划线/书签 双向同步")
+    p_nt.add_argument("action", choices=("sync", "pull", "push"))
+    p_nt.add_argument("--series", type=int, action="append", default=[],
+                      help="只处理这些 Kavita series id (可多次)")
+    p_nt.add_argument("--dry-run", action="store_true")
+    p_nt.set_defaults(func=cmd_notes)
+
+    p_tm = sub.add_parser("time", help="阅读时长 双向同步")
+    p_tm.add_argument("action", choices=("sync", "pull", "push"))
+    p_tm.add_argument("--day", default=None, help="push 用: YYYY-MM-DD (默认今天)")
+    p_tm.add_argument("--start", default=None, help="pull 用: 起始日")
+    p_tm.add_argument("--end", default=None, help="pull 用: 结束日")
+    p_tm.add_argument("--dry-run", action="store_true")
+    p_tm.set_defaults(func=cmd_time)
 
     args = ap.parse_args(argv)
     return args.func(args)
