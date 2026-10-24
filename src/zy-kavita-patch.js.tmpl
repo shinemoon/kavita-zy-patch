@@ -134,13 +134,24 @@
   }
 
   // ---- 后端探活 (只为徽标) -------------------------------------------
-  var health = { state: 'unknown', books: null };
+  var health = { state: 'unknown', books: null, err: '', base: '' };
 
   function probe() {
     return api('/health').then(function () {
-      health.state = 'ok';
-    }).catch(function () {
-      health.state = 'off';
+      health.state = 'ok'; health.err = ''; health.base = BASE;
+    }).catch(function (e) {
+      health.state = 'off'; health.base = BASE;
+      health.err = (e && e.message) ? e.message : 'unreachable';
+      // 探活失败可能是 BASE 猜错了 (换了访问地址/端口映射变了) —— 重探一次候选,
+      // 拿对了就立刻重试, 不要整页一直挂着"离线"。
+      return resolveBase().then(function (base) {
+        health.base = base;
+        return api('/health').then(function () {
+          health.state = 'ok'; health.err = ''; note('base 改走 ' + base);
+        }).catch(function (e2) {
+          health.err = (e2 && e2.message) ? e2.message : health.err;
+        });
+      }).catch(function () {});
     });
   }
 
@@ -227,7 +238,9 @@
     } else if (health.state === 'off') {
       item.classList.add('zy-err');
       b.textContent = '离线';
-      b.title = '后端 ' + PORT + ' 没连上';
+      b.title = '后端 ' + health.base + ' 没连上: ' + health.err
+        + '  (浏览器控制台跑 __ZY__.auto() 看详情)';
+      if (top) top.title = '掌阅同步后端不可达: ' + health.base + ' ' + health.err;
     } else {
       b.textContent = '…';
     }
@@ -271,10 +284,12 @@
     if (!force && key === hbLast.key && now - hbLast.t < 60000) return;
     if (force && now - hbLast.t < 5000) return;   // 强制也限 5s 一次
     hbLast = { t: now, key: key };
+    var msgs = autoLog.slice(-6).map(function (x) { return x.m; });
+    if (health.err) msgs.push('health: ' + health.err);
     apiPost('/auto/hb', {
       ver: VER, path: location.pathname, on: AUTO.on,
-      saves: saveCount, pushes: pushCount, base: BASE_TRIED,
-      msgs: autoLog.slice(-6).map(function (x) { return x.m; })
+      saves: saveCount, pushes: pushCount, base: BASE_TRIED + (health.err ? ' !' + health.err : ''),
+      msgs: msgs
     }).catch(function () {});
   }
 
@@ -348,19 +363,29 @@
 
   // 去抖 + 最大等待: 连续翻页会不断重置计时器, 纯去抖在"读得快"时永远不触发。
   // 最大等待 30s —— 到点先推一次, 后面再按去抖来。
+  // v0.4.5: 一轮阅读的**第一次**存进度快推 (3s) —— 手机切走/锁屏会冻结定时器,
+  //         纯去抖在后台标签里可能整晚都不发。
   var PUSH_MAX_WAIT = 30;
+  var PUSH_FAST = 3;          // 忙碌束的第一发, 秒
+  var PUSH_FAST_GAP = 10;     // 两发快推之间至少隔 10s
   var pushFirst = {};
+  var pushLastAt = {};
 
   function schedulePush(sid) {
     if (!AUTO.on || !sid) return;
     var now = Date.now();
+    var burstStart = !pushTimers[sid];
     if (!pushFirst[sid]) pushFirst[sid] = now;
     if (pushTimers[sid]) clearTimeout(pushTimers[sid]);
     var wait = AUTO.debounce * 1000;
     if (now + wait - pushFirst[sid] >= PUSH_MAX_WAIT * 1000) wait = 0;
+    if (burstStart && now - (pushLastAt[sid] || 0) > PUSH_FAST_GAP * 1000) {
+      wait = Math.min(wait, PUSH_FAST * 1000);
+    }
     pushTimers[sid] = setTimeout(function () {
       delete pushTimers[sid];
       pushFirst[sid] = 0;
+      pushLastAt[sid] = Date.now();
       pushNow(sid);
     }, wait);
   }
@@ -461,7 +486,11 @@
     window.addEventListener('popstate', function () { setTimeout(routeTick, 60); });
     window.addEventListener('pagehide', function () { flushPush(true); });
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'hidden') flushPush(true);
+      if (document.visibilityState === 'hidden') { flushPush(true); return; }
+      // 回到前台: 后台标签的定时器可能被冻结过 —— 补一次探活/心跳/钩子自检
+      probe().then(tick).catch(tick);
+      if (!bootOk) autoBoot();
+      if (AUTO.on) { heartbeat(true); routeTick(); }
     });
     setInterval(routeTick, 900);
     // 定时兜底 push: Kavita 的"存进度"并不覆盖所有位置变化 (滚动式 epub 只在
@@ -492,9 +521,12 @@
     }).catch(function (e) {
       // 后端重启/网络抖动时 cfg 读不到 —— 不重试的话这一整页就永远没有钩子
       // (2026-10-24 事故: 页面在 5111 重启窗口加载, 读了整晚一次都没推)。
+      // v0.4.5: 不再限 20 次, 退避封顶 60s, 页面重新可见时立刻再试一次。
       note('auto cfg 读取失败 ' + (e && e.message) + ' (第' + bootTries + '次)');
       heartbeat(true);
-      if (bootTries < 20) setTimeout(autoBoot, 15000 + bootTries * 5000);
+      var backoff = Math.min(60000, 15000 + bootTries * 5000);
+      clearTimeout(autoBoot._t);
+      autoBoot._t = setTimeout(autoBoot, backoff);
     });
   }
 
@@ -525,6 +557,12 @@
         }).then(tick).catch(tick);
         setInterval(tick, 15000);
         setInterval(function () { probe().then(tick).catch(tick); }, 30000);
+        // 回到前台兜底 (钩子没装上时 hookNetwork 里的监听器根本不存在)
+        document.addEventListener('visibilitychange', function () {
+          if (document.visibilityState !== 'visible') return;
+          if (!bootOk) autoBoot();
+          probe().then(tick).catch(tick);
+        });
         autoBoot();
         return;
       }

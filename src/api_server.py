@@ -431,8 +431,22 @@ def api_selfcheck() -> dict:
             hb = HERE / "state" / "last_hb.json"
             if not hb.exists():
                 add("info", "auto_hb",
-                    "还没有前端心跳 (没有浏览器加载过 v0.4.1 钩子)",
+                    "还没有前端心跳 (没有浏览器加载过 v0.4.1+ 钩子)",
                     "打开一次 Kavita 页面; 之后 api.log 里应有 hb 行")
+            else:
+                # 心跳"过期"是最常见的误判源: 用户以为钩子在跑, 其实那一页是
+                # 昨晚的僵尸页 (容器/后端重启过), 一条请求都没发出来。
+                try:
+                    import time as _t
+                    age = _t.time() - hb.stat().st_mtime
+                    if age > 7200:
+                        info = json.loads(hb.read_text("utf-8"))
+                        add("warn", "auto_hb_stale",
+                            f"前端心跳已过期 {int(age // 60)} 分钟 "
+                            f"(最后 v{info.get('ver')} {info.get('path') or '/'})",
+                            "Kavita 页面里强刷一次 (Ctrl+Shift+R) 让钩子重新连上")
+                except Exception:
+                    pass
     except Exception as e:
         add("warn", "mount_dir", str(e))
 
@@ -510,6 +524,26 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers",
                          "Content-Type, X-ZY-Token, Authorization")
         self.send_header("Access-Control-Max-Age", "600")
+        # Chrome 的 Private Network Access: 页面在公网/域名上, 哪怕 CORS 全放开,
+        # 发到 LAN 地址的 fetch 也要服务端显式允许, 否则直接失败 (表现为徽标"离线")。
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _peer(self) -> str:
+        try:
+            return (self.client_address or ("?",))[0]
+        except Exception:
+            return "?"
+
+    def _deny(self, code: int, msg: str) -> None:
+        """拒绝请求, 并**记录到 api.log** —— 之前 403/404 静默, 排查时看不到
+        "浏览器到底有没有连上来"。"""
+        try:
+            log(f"{self.command} {urlparse(self.path).path} -> {code} {msg} "
+                f"from {self._peer()} origin={self.headers.get('Origin') or '-'} "
+                f"ua={(self.headers.get('User-Agent') or '-')[:60]}")
+        except Exception:
+            pass
+        self._send(code, {"ok": False, "err": msg})
 
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -540,11 +574,11 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         fn = ROUTES_GET.get(u.path)
         if fn is None:
-            return self._send(404, {"ok": False, "err": "no route"})
+            return self._deny(404, "no route")
         from urllib.parse import parse_qs
         q = parse_qs(u.query)
         if not self._authorized(q):
-            return self._send(403, {"ok": False, "err": "bad token"})
+            return self._deny(403, "bad token")
         try:
             self._send(200, fn())
         except Exception as e:
@@ -555,11 +589,11 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         fn = ROUTES_POST.get(u.path)
         if fn is None:
-            return self._send(404, {"ok": False, "err": "no route"})
+            return self._deny(404, "no route")
         from urllib.parse import parse_qs
         q = parse_qs(u.query)
         if not self._authorized(q):
-            return self._send(403, {"ok": False, "err": "bad token"})
+            return self._deny(403, "bad token")
         n = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(n) or b"{}")

@@ -122,16 +122,35 @@ start_service() {   # $1=unit $2=额外兜底命令 (空 = 无兜底)
 
 
 # ---- 1. 容器 ---------------------------------------------------------
+# 之前这里只在日志里留一句 "FAIL 容器启动失败", 拿不到 docker 的原始错误,
+# 结果 2026-10-23 23:29 起它每 30s 报一次"未运行", 谁也看不出原因。
+# 现在:
+#   - docker start 的 stderr 一起记下来
+#   - 容器**在跑但 Kavita 打不开**连续 3 次 → docker restart (进程活着但僵死)
+#   - 告警去重: 同一个问题 30 分钟内只记一次, 别再刷 600 行
+touch "$ROOT/state/heal.notice"
+notice_once() {   # $1=key $2=message   ($1 作为去重键; 30 分钟窗口)
+  local key="$1" msg="$2" now prev_ts prev_key
+  now="$(date +%s)"
+  read -r prev_ts prev_key < "$ROOT/state/heal.notice" 2>/dev/null || { prev_ts=0; prev_key=""; }
+  if [ "$prev_key" = "$key" ] && [ "$((now - prev_ts))" -lt 1800 ]; then return 0; fi
+  printf '%s %s\n' "$now" "$key" > "$ROOT/state/heal.notice"
+  log "$msg"
+}
+
 running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo missing)"
 if [ "$running" = "missing" ]; then
-  log "FAIL 容器 $CONTAINER 不存在"
+  notice_once "missing-$CONTAINER" "FAIL 容器 $CONTAINER 不存在"
   problems=$((problems + 1))
 elif [ "$running" != "true" ]; then
-  log "容器 $CONTAINER 未运行, 尝试启动"
-  if docker start "$CONTAINER" >/dev/null 2>&1; then
+  # 只在容器确实停止时才开始尝试 (启动最多等 30s); 失败原因原样落日志
+  notice_once "stopped-$CONTAINER" "容器 $CONTAINER 未运行, 尝试启动"
+  out="$(docker start "$CONTAINER" 2>&1)"
+  if [ $? -eq 0 ]; then
     note_action "start-container"; log "OK 容器已启动"
   else
-    problems=$((problems + 1)); log "FAIL 容器启动失败"
+    problems=$((problems + 1))
+    notice_once "startfail-$CONTAINER" "FAIL 容器启动失败: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
   fi
 fi
 
@@ -143,9 +162,34 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 5
 done
 case "$kv" in
-  200|302|304) : ;;
-  *) problems=$((problems + 1)); log "FAIL Kavita $KAVITA_URL 不可访问 (http=$kv)" ;;
+  200|302|304) echo 0 > "$ROOT/state/heal.kv_fail" ;;
+  *)
+    notice_once "kvdown-$kv" "FAIL Kavita $KAVITA_URL 不可访问 (http=$kv)"
+    fails=$(( $(cat "$ROOT/state/heal.kv_fail" 2>/dev/null || echo 0) + 1 ))
+    echo "$fails" > "$ROOT/state/heal.kv_fail"
+    # 容器在跑但应用三层连续打不开 = 进程僵死 (2026-10-24: Kavita 挂着但没人看,
+    # 早上起来整个服务 000000)。docker restart 是唯一能救的手段。
+    if [ "$running" = "true" ] && [ "$fails" -ge 3 ]; then
+      out="$(docker restart "$CONTAINER" 2>&1)"
+      if [ $? -eq 0 ]; then
+        note_action "restart-container"
+        log "WARN Kavita 连续 $fails 次打不开, 容器已重启"
+        echo 0 > "$ROOT/state/heal.kv_fail"
+      else
+        log "FAIL 容器重启失败: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+      fi
+      for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        kv="$(http_code "$KAVITA_URL/")"
+        case "$kv" in 200|302|304) break ;; esac
+        sleep 5
+      done
+    fi
+    case "$kv" in
+      200|302|304) : ;;   # 重启后活了, 不算故障
+      *) problems=$((problems + 1)) ;;
+    esac ;;
 esac
+
 
 # ---- 3. 前端注入 -----------------------------------------------------
 if [ "$kv" = "200" ] || [ "$kv" = "302" ]; then
