@@ -382,6 +382,17 @@ bind_takeover kavita-zy-api.service "$API_PORT" api_server.py \
 bind_takeover kavita-zy-web.service "$WEB_PORT" web.py \
   "http://127.0.0.1:$WEB_PORT/healthz"
 
+# ---- 5d. 取证脚本 (可选, 只由 cron 的普通用户拉起, 避免 root/claud 双写者) ----
+# 想知道"容器到底被谁删了": touch state/watch-kavita.on, 之后 heal 保证它常驻。
+# 它逐秒扫 /proc + 录 docker events, 谁执行 docker rm/down/prune 会连同
+# pid/ppid/user/PWD 一起落到 state/logs/kavita-watch.log。
+if [ -f "$ROOT/state/watch-kavita.on" ] && [ "$AM_ROOT" = "no" ]; then
+  if ! pgrep -f "deploy/watch-kavita.py" >/dev/null 2>&1; then
+    setsid python3 "$ROOT/deploy/watch-kavita.py" >> "$ROOT/state/logs/kavita-watch.out" 2>&1 < /dev/null &
+    log "OK 取证脚本 watch-kavita 已启动"
+  fi
+fi
+
 # ---- 6. 落状态 -------------------------------------------------------
 ok=true; [ "$problems" -gt 0 ] && ok=false
 printf '{"ts":"%s","ok":%s,"problems":%d,"actions":"%s","kavita_http":"%s"}\n' \
