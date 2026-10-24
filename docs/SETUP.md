@@ -360,3 +360,64 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 进度显示 44% 打开是目录 | 该书还没重排版 → 做第 4 步 |
 | 两侧差值 < 1 个点 | 正常，页粒度导致，不是 bug |
 | **读了一晚上，掌阅 pct 一格不动** | ① `zync.py push --dry-run` 看 pct 有没有 `(页内)` —— 没有就是 `BookScrollId` 丢了；② 看 Kavita 里 `PagesRead` 变没变（没变 = 浏览器没存进度 / 钩子没加载，查 api.log 的 `hb` 行）；③ 页数太少（600 页的大书一页 2.3 万字）→ 按 4.1 用 `ZY_KPAGES_MAX_PAGES=3000` 重建 + `zync.py pull` 重映射 |
+
+## 10. 新书放进库了，Kavita 里刷不出来 / 系列名不对
+
+从掌阅云盘下的书落到 `/books/掌阅/` 之后，Kavita 里看不到或者名字错了，按三层查（**顺序别跳**，第二层只有第一层修好才看得见）：
+
+### 第一层：epub 解析失败（书架里根本不出现）
+
+`logs/kavita*.log` 里搜文件名：
+
+| 日志 | 原因 | 修 |
+|---|---|---|
+| `Epub3NavException: NAV item not found in EPUB manifest` | 声明 `package version="3.0"` 却没有 `properties="nav"` 的 nav 文档（Kavita 的 VersOne.Epub 见 3.0 就强制要 nav）。掌阅个人云 / Kmoe 的漫画 epub 高频 | `python3 tools/fix_epub_nav.py <epub 或目录>`（在 bridge 仓库 `/vol2/1001/zhangyue-bridge/sync`；5012 下载完成后会自动跑一次） |
+| `Epub2NcxException: Incorrect EPUB 2 NCX: content source "xxx" not found in EPUB manifest` | 内部链接指不到 manifest 条目（重排版脚本早期 bug） | 重排版时 `kpages.build_edition` 会自校验，直接重建该 series |
+| `Unable to parse any meaningful information out of file` | 上面两种的兜底报错，同一本书看前一行才知道真因 |
+
+修完让 Kavita 重扫：
+
+```bash
+curl -X POST -H "x-api-key: $KAVITA_API_KEY" \
+     'http://127.0.0.1:5000/api/library/scan?libraryId=1&force=false'
+grep -c Epub3NavException /vol1/1001/APPS/kavita/logs/kavita$(date +%Y%m%d).log
+```
+
+### 第二层：系列分组（能扫到，但名字变成了文件夹名）
+
+Kavita 的 **Book 库**按「文件所在目录」分系列：同一目录里多本同类书会被并成
+**一个系列，系列名 = 目录名**，卷号从文件名里的 `卷01/Vol 1` 之类解析。
+
+实测（2026-10-24）：`/books/掌阅/路邊的藤井_-_卷01.epub` 三卷被并成系列
+**「掌阅」**，卷 1/2/3 —— 在书架里按「路邊的藤井」永远搜不到。
+
+修法：**一本（或一套）一个子目录**，目录名就是想要的系列名：
+
+```
+/books/掌阅/
+  狐的故事.epub                        -> 系列「狐的故事」
+  剑来（1-54册）完结精校版.epub          -> 系列「剑来（1-54册）完结精校版」
+  路邊的藤井/                           -> 系列「路邊的藤井」
+    路邊的藤井 卷01.epub                  -> 卷 1（195 页）
+    路邊的藤井 卷02.epub                  -> 卷 2
+    路邊的藤井 卷03.epub                  -> 卷 3
+```
+
+单文件在根目录时系列名 = 文件名（去掉扩展名），所以单独一本不用建子目录。
+
+### 第三层：进度映射（能打开，但列表里没「掌阅同步」徽标）
+
+新系列不在 `state/sync.sqlite` 的映射表里 → 补映射：
+
+```bash
+cd /vol2/1001/zhangyue-bridge/sync && python3 zync.py link \
+    --series <Kavita seriesId> --zy <掌阅 bookId 或书名关键词>
+python3 zync.py pull --series <seriesId>
+```
+
+要参与进度对齐还得按第 4 步重排版（`apply_edition.py`），否则页粒度太粗。
+
+### 一句话判断链
+
+`日志有没有异常` → `DB 里 Series 表有没有这本书（Nav 是对的但名字是文件夹名）` →
+`有的话系列 id 是多少 → 有没有映射 → 有没有重排版`。
