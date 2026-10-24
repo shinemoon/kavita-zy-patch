@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import html
 import io
 import json
 import re
@@ -73,6 +74,99 @@ def parse_chapter_offset(pos: str) -> tuple[int, int] | None:
         return int(d["chapter_id"]), int(d.get("f3") or 0)
     except (TypeError, ValueError):
         return None
+
+
+_POS_RE = re.compile(r"(\d+_0_0\$##\d+-\d+-\d+-\d+-\d+##\$)")
+_TAG_RE = re.compile(r"<[^>]+>")
+_doc_text_cache: dict[tuple[str, int], bytes | None] = {}
+
+
+def _chapter_raw(epub_path: str, chapter_id: int) -> bytes | None:
+    """原书里第 chapterId 章的字节 (spine[chapterId+1])，带缓存。"""
+    key = (epub_path, chapter_id)
+    if key in _doc_text_cache:
+        return _doc_text_cache[key]
+    raw = None
+    try:
+        import zipfile as _zip
+        idx = zpct.build_doc_index(epub_path, chapter_id + 1)
+        if idx is not None:
+            raw = idx.raw
+    except Exception:
+        raw = None
+    _doc_text_cache[key] = raw
+    return raw
+
+
+def text_of_span(epub_path: str, pos_s: str, pos_e: str = "") -> str:
+    """掌阅位置区间 → 划线正文。
+
+    `downloadDataV2` 拿不到正文时 (2026-10-24 起一直返 status:0 无 res)，
+    用 `getUserDataVer` 的位置 + 原书字节自己切。原文即权威，比下载还准。
+    """
+    a = parse_chapter_offset(pos_s)
+    if a is None:
+        return ""
+    ch, start = a
+    raw = _chapter_raw(epub_path, ch)
+    if not raw:
+        return ""
+    b = parse_chapter_offset(pos_e) if pos_e else None
+    end = b[1] if (b and b[0] == ch) else start
+    lo = max(0, min(start, len(raw)))
+    hi = max(lo, min(end, len(raw)))
+    if hi <= lo:
+        # 零长度选择 (掌阅允许只点一下留标) → 取所在段落开头一段做上下文
+        try:
+            idx = zpct.build_doc_index(epub_path, ch + 1)
+            hit = idx.element_at(lo) if idx else None
+        except Exception:
+            hit = None
+        if not hit:
+            return ""
+        seg = hit[1]
+    else:
+        seg = raw[lo:hi].decode("utf-8", "replace")
+    txt = html.unescape(_TAG_RE.sub("", seg))
+    txt = re.sub(r"<[^>]*$", "", txt)          # element_at 截断会留半截标签
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt[:200]
+
+
+def _split_positions(uniquecheck: str) -> list[str]:
+    """uniquecheck 里嵌的两段位置 (划线) / 一段 (书签)。"""
+    return _POS_RE.findall(uniquecheck or "")
+
+
+def positions_payload(book32: str, epub_path: str) -> dict:
+    """`getUserDataVer` → downloadDataV2 形状的 res (正文从原书切)。
+
+    云端 `downloadDataV2` 现在是坏通道 (只回 status/msg, 无 res)，但
+    `getUserDataVer` 稳定给出：每条的 uniquecheck (含起止字节位置) +
+    marktime + delList。正文由原书按字节切出来，与云端一致。
+    唯一拿不到的是「批注正文」(remark)，留空。
+    """
+    v = data_ver(book32)
+    notes, marks = [], []
+    for it in (v.get("booknotesVerList") or []):
+        uc = str(it.get("uniquecheck") or "")
+        poses = _split_positions(uc)
+        if len(poses) < 2:
+            continue
+        notes.append({"uniquecheck": uc,
+                      "positionstart": poses[0], "positionend": poses[1],
+                      "summary": text_of_span(epub_path, poses[0], poses[1]),
+                      "remark": "", "marktime": int(it.get("marktime") or 0)})
+    for it in (v.get("bookmarksVerList") or []):
+        uc = str(it.get("uniquecheck") or "")
+        poses = _split_positions(uc)
+        if not poses:
+            continue
+        marks.append({"uniquecheck": uc, "markpostion": poses[0],
+                      "marktime": int(it.get("marktime") or 0)})
+    return {"booknotes": notes, "bookmarks": marks,
+            "delList": [str(x) for x in (v.get("delList") or [])],
+            "from_positions": True}
 
 
 def pos_to_global(geo: zpct.BookGeometry, pos: str) -> int | None:
@@ -553,10 +647,22 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
         marks = res.get("bookmarks") or []
         dels = set(res.get("delList") or [])
         if not res:
-            report["empty"].append({"series": link.kavita_series_id,
-                                    "cloud_notes": idx_row.get("notenum"),
-                                    "cloud_marks": idx_row.get("marknum")})
-            continue
+            # downloadDataV2 坏通道兜底: 用 getUserDataVer 的位置 + 原书切正文
+            try:
+                res = positions_payload(book32, epub)
+            except Exception as e:
+                report["errors"].append(f"positions {book32}: {e}")
+                res = {}
+            notes = res.get("booknotes") or []
+            marks = res.get("bookmarks") or []
+            dels = set(res.get("delList") or [])
+            if notes or marks:
+                report.setdefault("via_positions", []).append(link.kavita_series_id)
+            else:
+                report["empty"].append({"series": link.kavita_series_id,
+                                        "cloud_notes": idx_row.get("notenum"),
+                                        "cloud_marks": idx_row.get("marknum")})
+                continue
 
         # 库里是"切片版" → 走 sidecar 页映射; 原书直接进库 (图片书) → 页 = spine 下标
         sc = kpages.load(link.kavita_series_id)
