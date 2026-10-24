@@ -360,6 +360,25 @@ def test_kavita_pagesread_equals_spine_index():
         os.unlink(tmp)
 
 
+def test_toc_labels_volume_and_chapter():
+    """多卷合订本的目录名: depth0 卷 + depth1 章 → "卷名 章名"。
+    掌阅"来源"要用它, 不是文件名 (chapter0152)。"""
+    p = book_path("剑来（1-54册）完结精校版.epub")
+    if not p:
+        print("  SKIP 没有剑来样书")
+        return
+    g = zpct.load_geometry(str(p))
+    assert g.toc, "剑来有 NCX, toc 不该为空"
+    # spine[154] = Text/chapter0152.xhtml, NCX: 剑来14 卷 / 第九章 另一个朱敛
+    lab = g.toc.get(154, "")
+    assert "剑来14" in lab and "第九章" in lab, f"spine[154] 目录名不对: {lab!r}"
+    # 位置在 ch 里 = 落在 spine[ch+1] → 展示用 ch+1 的目录名
+    assert g.toc.get(155, "").startswith("剑来14"), g.toc.get(155)
+    assert "第十章 北俱芦洲无奇怪" in g.toc.get(155, ""), g.toc.get(155)
+    print(f"  OK   toc[154]={g.toc[154]!r}")
+    print(f"  OK   toc[155]={g.toc[155]!r}")
+
+
 if __name__ == "__main__":
     for fn in (test_percent_bit_exact, test_unread_is_zero, test_total_count,
                test_position_roundtrip, test_monotonic, test_f0_is_three,
@@ -367,7 +386,8 @@ if __name__ == "__main__":
                test_percent_roundtrip_through_offset,
                test_solve_recovers_official_chapter_id,
                test_solve_percent_roundtrip, test_solve_monotonic,
-               test_kavita_pagesread_equals_spine_index):
+               test_kavita_pagesread_equals_spine_index,
+               test_toc_labels_volume_and_chapter):
         print(f"{fn.__name__}:")
         fn()
     print("\n全部通过。")

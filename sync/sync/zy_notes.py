@@ -831,13 +831,33 @@ def cloud_versions(book32: str) -> dict[str, dict]:
             "del": {str(x) for x in (row.get("delList") or [])}}
 
 
-def _sig(kind: str, key: str, text: str, remark: str) -> str:
-    """内容指纹: 位置 + 正文 + 批注。变了才重推 (APK 靠本地 DB 的 marktime, 我们没本地副本)。"""
+def _sig(kind: str, key: str, text: str, remark: str, meta: str = "") -> str:
+    """内容指纹: 位置 + 正文 + 批注 (+ 展示用章名)。变了才重推。
+
+    APK 靠本地 DB 的 marktime, 我们没本地副本, 所以自己算指纹; meta 进指纹是为了
+    "章名解析规则变了" 也能触发一次重推 (否则旧条目永远停在 chapter0152 这种文件名)。
+    """
     h = hashlib.sha1()
-    for part in (kind, key, text or "", remark or ""):
+    for part in (kind, key, text or "", remark or "", meta or ""):
         h.update(part.encode("utf-8"))
         h.update(b"\x1f")
     return h.hexdigest()
+
+
+def _chapter_label(geo: zpct.BookGeometry, ch: int) -> str:
+    """chapterId -> 展示用章名。优先目录 ("剑来14：江清月近人 第十章 北俱芦洲无奇怪"),
+    其次文件名。ch+1 是位置所在篇, ch 是"已读完的上一篇" (封面等没有目录名的篇,
+    只能退回文件名)。"""
+    toc = getattr(geo, "toc", None) or {}
+    for idx in (ch + 1, ch):
+        if 0 <= idx < len(geo.spine):
+            lab = toc.get(idx)
+            if lab:
+                return str(lab)
+    for idx in (ch + 1, ch):
+        if 0 <= idx < len(geo.spine):
+            return Path(geo.spine[idx]).stem
+    return ""
 
 
 def _idea_fields(epub: str, geo: zpct.BookGeometry, g: int) -> dict:
@@ -850,12 +870,10 @@ def _idea_fields(epub: str, geo: zpct.BookGeometry, g: int) -> dict:
         return out
     out["chapterId"] = int(ch)          # 0 基, 与 position 的 f2 同源
     out["notesType"] = 2                # APK isPrivate(): 2 = 仅自己可见
-    try:
-        name = geo.spine[int(ch)]
-        out["chaptername"] = Path(name).stem
-    except Exception:
-        pass
-    raw = _doc_raw(epub, int(ch))
+    # 位置落在 spine[ch+1] 里 (percent = Σsizes[0..ch] + f3, f3 是"下一篇"内偏移),
+    # 所以章名要取 ch+1; 目录名优先, 没有目录才退回文件名 (以前的 chapter0152 就是这个)。
+    out["chaptername"] = _chapter_label(geo, int(ch))
+    raw = _doc_raw(epub, int(ch) + 1)
     if not raw:
         return out
     try:
@@ -951,7 +969,8 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 report["skipped"] += 1        # 同书同选区重复标注 -> 一条
                 continue
             remark = (a.get("CommentPlainText") or "").strip()
-            sig = _sig("note", key, text, remark)
+            idea = _idea_fields(epub, geo, g)
+            sig = _sig("note", key, text, remark, str(idea.get("chaptername") or ""))
             row = known.get(("note", key)) or byid.get(("note", int(a.get("Id") or 0)))
             if row is not None and row["source"] == "zy":
                 ann_keys.add(row["zy_key"])   # 保留云端原始 key, 别误判成"Kavita 已删"
@@ -960,17 +979,20 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             if row is not None and (row["sig"] or "") == sig:
                 report["skipped"] += 1        # 内容没变, 不重推
                 continue
-            marktime = int(time.time() * 1000)
+            # 重推沿用原 marktime: 掌阅端"笔记"按它排序, 改元信息不该让旧笔记跳到最前
+            marktime = int(row["marktime"] or 0) if row is not None and row["marktime"] \
+                else int(time.time() * 1000)
             ck = cloud["note"].get(key)
-            if ck is not None and row is not None and ck >= int(row["marktime"] or 0):
-                report["cloud_skip"] += 1     # 云端不比本地旧
+            # 严格大于: 相等 = 云端就是上次我们推的那版, 允许覆盖 (修章名等元信息)
+            if ck is not None and row is not None and ck > int(row["marktime"] or 0):
+                report["cloud_skip"] += 1     # 云端比本地新 (app 上改过)
                 continue
             item = {"uniquecheck": key, "style": 0, "color": DEFAULT_COLOR,
                     "summary": text, "remark": remark,
                     "positionstart": ps, "positionend": pe,
                     "positionstartl": 0, "positionendl": 0,
                     "marktime": marktime}
-            item.update(_idea_fields(epub, geo, g))
+            item.update(idea)
             out_notes.append(item)
             st.append(("note", key, sig, marktime, int(a.get("Id") or 0) or None))
 
@@ -984,7 +1006,13 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             pos = global_to_pos(geo, g)
             key = mark_key(book32, pos)
             mark_keys.add(key)
-            sig = _sig("mark", key, "", "")
+            label = ""
+            try:
+                mch, _moff = geo.locate(g)
+                label = _chapter_label(geo, int(mch))
+            except Exception:
+                label = (b.get("ChapterTitle") or "").strip()
+            sig = _sig("mark", key, "", "", label)
             row = known.get(("bookmark", key)) or byid.get(("bookmark", int(b.get("Id") or 0)))
             if row is not None and row["source"] == "zy":
                 mark_keys.add(row["zy_key"])
@@ -993,13 +1021,14 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             if row is not None and (row["sig"] or "") == sig:
                 report["skipped"] += 1
                 continue
-            marktime = int(time.time() * 1000)
+            marktime = int(row["marktime"] or 0) if row is not None and row["marktime"] \
+                else int(time.time() * 1000)
             ck = cloud["mark"].get(key)
-            if ck is not None and row is not None and ck >= int(row["marktime"] or 0):
+            if ck is not None and row is not None and ck > int(row["marktime"] or 0):
                 report["cloud_skip"] += 1
                 continue
             out_marks.append({"uniquecheck": key,
-                              "marksummary": (b.get("ChapterTitle") or "").strip(),
+                              "marksummary": label or (b.get("ChapterTitle") or "").strip(),
                               "markpostion": pos,
                               "markpercent": round(g / total_bytes, 8),
                               "markstyle": 0, "marktime": marktime})

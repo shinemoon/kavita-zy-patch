@@ -12,7 +12,7 @@ import re
 import bisect
 import struct
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _OPF = re.compile(r"\.opf$", re.I)
@@ -46,6 +46,7 @@ class BookGeometry:
     sizes: list[int]          # 对应字节数
     name: str = ""
     catalog: int = 0          # 引擎目录章数 (catalogCount); 0 = 未知, 退回 spine-1
+    toc: dict = field(default_factory=dict)   # spine 下标 -> 目录显示名 (卷名 + 章名)
 
     @property
     def total_bytes(self) -> int:
@@ -240,6 +241,169 @@ def catalog_count(epub_path: str | Path) -> int:
     return n
 
 
+def _toc_pairs(z: "zipfile.ZipFile", opf: str,
+               manifest: list[tuple[str, str, str]]) -> list[tuple[str, int, str]]:
+    """目录条目 -> [(label, depth, 解析后的 zip 内 href)]。
+
+    epub2 读 NCX (navPoint 嵌套层级 = 卷/章), epub3 退 nav.xhtml (<ol> 嵌套)。
+    层级: depth 0 = 卷, depth >0 = 章 (显示时拼上父级卷名)。
+    """
+    from posixpath import dirname, join, normpath
+    ncx = next((h for (h, mt, _p) in manifest
+                if mt == "application/x-dtbncx+xml" or h.lower().endswith(".ncx")), "")
+    if ncx:
+        path = normpath(join(dirname(opf), ncx))
+        try:
+            raw = z.read(path).decode("utf-8", "replace")
+        except KeyError:
+            raw = ""
+        if raw:
+            out = _walk_ncx(raw, dirname(path))
+            if out:
+                return out
+    nav = next((h for (h, _mt, pr) in manifest if pr and "nav" in pr.split()), "")
+    if nav:
+        path = normpath(join(dirname(opf), nav))
+        try:
+            raw = z.read(path).decode("utf-8", "replace")
+        except KeyError:
+            raw = ""
+        if raw:
+            return _walk_nav(raw, dirname(path))
+    return []
+
+
+def _walk_ncx(raw: str, base: str) -> list[tuple[str, int, str]]:
+    from posixpath import normpath, join, dirname
+    try:
+        from xml.etree import ElementTree as ET
+        root = ET.fromstring(raw)
+    except Exception:
+        return []
+    out: list[tuple[str, int, str]] = []
+
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def walk(node, depth: int):
+        label = ""
+        src = ""
+        for ch in node:
+            t = local(ch.tag)
+            if t == "navLabel":
+                for sub in ch:
+                    if local(sub.tag) == "text" and sub.text:
+                        label = sub.text.strip()
+            elif t == "content":
+                src = (ch.get("src") or "").strip()
+        if src:
+            href = normpath(join(base, src.split("#")[0]))
+            out.append((label, depth, href))
+        for ch in node:
+            if local(ch.tag) == "navPoint":
+                walk(ch, depth + 1)
+
+    for mp in root:
+        if local(mp.tag) != "navMap":
+            continue
+        for np in mp:
+            if local(np.tag) == "navPoint":
+                walk(np, 0)
+    return out
+
+
+def _walk_nav(raw: str, base: str) -> list[tuple[str, int, str]]:
+    """epub3 nav.xhtml: <nav epub:type="toc"><ol><li><a href>…</a><ol>…</ol></li></ol>"""
+    try:
+        from lxml import html as LH
+    except Exception:
+        return []
+    try:
+        doc = LH.fromstring(raw)
+    except Exception:
+        return []
+    from posixpath import normpath, join
+    toc = None
+    for nav in doc.iter("nav"):
+        if (nav.get("{http://www.idpf.org/2007/ops}type") or nav.get("type") or "").lower() == "toc":
+            toc = nav
+            break
+    if toc is None:
+        toc = doc.find(".//nav")
+    if toc is None:
+        return []
+    out: list[tuple[str, int, str]] = []
+
+    def walk(ol, depth: int):
+        for li in ol.findall("li"):
+            a = li.find("a")
+            if a is not None:
+                href = (a.get("href") or "").split("#")[0].strip()
+                if href:
+                    out.append((a.text_content().strip(), depth, normpath(join(base, href))))
+            for sub in li.findall("ol"):
+                walk(sub, depth + 1)
+
+    for ol in toc.iter("ol"):
+        walk(ol, 0)
+        break
+    return out
+
+
+def toc_labels(epub_path: str | Path, order: list[str] | None = None) -> dict:
+    """spine 下标 -> 目录显示名。
+
+    多卷合订本 (剑来 1-54) 的 NCX 是两级: depth0 = "剑来14：江清月近人",
+    depth1 = "第十章 北俱芦洲无奇怪" -> 拼成 "剑来14：江清月近人 第十章 北俱芦洲无奇怪"。
+    单级目录直接用章名。命中不到的篇 (封面/目录页) 不给键。
+    """
+    p = Path(epub_path)
+    order = list(order or [])
+    try:
+        with zipfile.ZipFile(p) as z:
+            opf = next((n for n in z.namelist() if _OPF.search(n)), None)
+            if not opf:
+                return {}
+            raw = z.read(opf).decode("utf-8", "replace")
+            base = opf.rsplit("/", 1)[0] + "/" if "/" in opf else ""
+            items: dict[str, str] = {}
+            manifest: list[tuple[str, str, str]] = []
+            for m in _ITEM.finditer(raw):
+                tag = m.group(0)
+                i, h = _ID.search(tag), _HREF.search(tag)
+                if not (i and h):
+                    continue
+                items[i.group(1)] = base + h.group(1)
+                mt = _MEDIA.search(tag)
+                pr = _PROPS.search(tag)
+                manifest.append((h.group(1), mt.group(1) if mt else "",
+                                 pr.group(1) if pr else ""))
+            if not order:
+                sm = _SPINE.search(raw)
+                order = ([items[r] for r in _IDREF.findall(sm.group(1)) if r in items]
+                         if sm else [])
+            pairs = _toc_pairs(z, opf, manifest)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return {}
+    idx = {h: i for i, h in enumerate(order)}
+    out: dict[int, str] = {}
+    parents: dict[int, str] = {}
+    for label, depth, href in pairs:
+        i = idx.get(href)
+        if i is None:
+            continue
+        if depth <= 0:
+            parents[0] = label
+            out[i] = label
+        else:
+            up = parents.get(depth - 1, "")
+            out[i] = f"{up} {label}".strip() if up else label
+        for d in [d for d in list(parents) if d >= depth]:
+            if d != depth:
+                parents.pop(d, None)
+    return out
+
+
 def load_geometry(epub_path: str | Path, name: str = "") -> BookGeometry:
     """读 epub 的 spine 顺序 + 每篇字节数 (+ 目录章数)。"""
     p = Path(epub_path)
@@ -273,7 +437,12 @@ def load_geometry(epub_path: str | Path, name: str = "") -> BookGeometry:
         catalog = _catalog_from_ncx(z, opf, manifest) or _catalog_from_spine(order)
         if catalog > len(order):
             catalog = 0
-    return BookGeometry(spine=order, sizes=sizes, name=name or p.stem, catalog=catalog)
+    try:
+        toc = toc_labels(p, order)
+    except Exception:
+        toc = {}
+    return BookGeometry(spine=order, sizes=sizes, name=name or p.stem,
+                        catalog=catalog, toc=toc)
 
 
 def parse_position(pos: str) -> dict:
