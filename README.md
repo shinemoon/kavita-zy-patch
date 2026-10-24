@@ -161,7 +161,7 @@ CLI：
 ```sh
 cd /vol2/1001/zhangyue-bridge/sync
 python3 zync.py notes {sync|pull|push} [--series N] [--dry-run]
-python3 zync.py time  {sync|pull|push} [--day D] [--start D --end D] [--dry-run]
+python3 zync.py time  {sync|pull|push|backfill|flush|queue} [--day D] [--start D --end D] [--dry-run]
 python3 tests/test_notes_time.py
 ```
 
@@ -176,18 +176,24 @@ python3 tests/test_notes_time.py
 * **时长读回来是精确的**：`read_report/book?book_id=<MD5>_local` 直接给
   `daybyday_times[].detail[] = {read_day, read_minutes}`（每天每书），
   不再需要按天总量分摊。周级分摊只在取不到逐日数据时兜底（`mode=alloc`）。
-* **时长只能写“当天”**：服务端按收到请求的日期归日，`data` 里的历史日期 key 和
-  `timestamp` 都不生效（传 20261017/20261022/20261023 全落到上传当天，传未来日期静默丢弃）。
-  注意这**不是**客户端不会：APK 的 `ReadTimeInfo` 是每书每天一条、30 天内累计后按日期分组重传，
-  是服务端把历史 key 并进了收到日。所以 Kavita → 掌阅必须当天推；真机飞行模式实验（`notes/05 §2.5`）
-  若能证明服务端其实认 key，就可放开闸门。分钟位图按并集合并 → 重复推幂等。
+* **写入模型照抄 APK（2026-10-24 重做）**：本地队列 `zy_time_queue` = 每 **书 × 每天** 一行、
+  值是那一天的 1440 分钟位图（与 APK `ReadTimeInfo.mData` 同构）。读到新分钟按位并集累加；
+  上传时按日期分组、**一次请求可带多天**；只有 `code==0` 才删行，失败留队重试，超 30 天丢弃。
+  这就是 `od/a.java` 的 `I()` / `q0()`：`enqueue(day)` → `flush()`；
+  `time backfill --start --end` 等价于 APK 离线多天累积后的首次上传。
+  请求形态 `{usr, data, timestamp, sign:""}`（gzip body，签名留空，服务端不校验）。
+* **服务端归账日 = 收到请求那天**（2026-10-24 六次实测，`notes/05 §2.5`）：`data` 里的历史日期 key 与
+  `body.timestamp` 都不影响归属 —— 传 20261016/17/18/20/22/23 全部落到上传当天，传未来日期静默丢弃。
+  所以队列的实际价值是「同一天内失败重试 + 协议保真」；**跨天离线补录会被服务端并入上线那天**，
+  这是服务端行为，客户端无从绕过（除非能签 `sign`，那是 native RSA）。
+  分钟位图按并集合并 → 同一天重复推幂等。
 * **KEY 大小写敏感**：小写 `<md5>_local` 会落到另一个空桶（踩过一次）。
 
 | 数据 | 掌阅 → Kavita | Kavita → 掌阅 |
 |---|---|---|
 | 划线 / 批注 | ✅ | ⚠️ 协议已通，当前账号写接口返 `600001 authority is error`（需重新扫码刷新 zysid） |
 | 书签 | ✅ | 同上 |
-| 阅读时长 | ✅ 精确到每天每书 | ✅ 当天可写（位图，幂等） |
+| 阅读时长 | ✅ 精确到每天每书 | ✅ 队列 + 位图（幂等；历史 key 会被服务端并入上传日） |
 
 ---
 

@@ -20,10 +20,12 @@ APK 依据见 notes/05-notes-time-apk-v2.md §2。要点:
                          "read_percent":0.27,"res":"R","d":"<base64 180B>"}]}
     d = 1440 分钟位图, 位下标 = hour*60+minute-1, **字节内 LSB 优先**
     sign 服务端不校验
-    **只能写"当天"**: data 的日期 key 和 body.timestamp 都不决定归属,
-    实测传 20261017 / 20261022 / 20261023 都落到上传当天; 传 20261025 (未来) 静默丢弃。
-    (APK 其实支持多天重传: ReadTimeInfo 每书每天一条, 30 天内累计后按日期分组上传;
-     所以这条限制在服务端, 不在客户端。详见 notes/05 §2.5 的对照实验。)
+    请求模型完全照抄 APK (od/a.java): 本地队列 = 每 书×每天 一行 (180B 位图),
+    按日分组一次上传, 30 天内失败可重传, 只有 code==0 才删行。见 "Kavita -> 掌阅" 段。
+    **服务端归账日 = 收到请求那天**: data 的日期 key 与 body.timestamp 都不影响归属
+    (2026-10-24 六次实测: 20261016/17/18/20/22/23 全部落到上传当天, 20261025 静默丢弃)。
+    所以队列的价值是"同一天内重试 + 协议保真"; 跨天补录会被并入收到日 —— 服务端行为,
+    客户端无从绕过 (除非能签 sign, 那是 native RSA)。详见 notes/05 §2.5。
     服务端按分钟求并集 -> 同一天重复推幂等。
 
 Kavita 侧: AppUserReadingSession + AppUserReadingSessionActivityData(SeriesId)。
@@ -39,7 +41,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from . import kavita_db, mapping
 from .config import KAVITA_DB, KAVITA_USER_ID, load_zy_auth, zy_query_params
@@ -435,65 +437,193 @@ def _pull_alloc(links: list[mapping.BookLink], start: date, end: date,
 
 
 # --------------------------------------------------------------------------
-# Kavita -> 掌阅
+# Kavita -> 掌阅: 照抄 APK 的推送模型 (od/a.java)
 # --------------------------------------------------------------------------
+#
+# APK 的模型 (apk/jadx/sources/od/a.java, notes/05 §2.5):
+#   * 本地表 ReadTimeInfo = 每 **书 × 每天** 一行
+#       mFormatDate = yyyyMMdd (本地日), mData = base64(180 字节分钟位图)
+#     读到新分钟就按位并集累加 (j0() 数位), 不是每次插新行
+#   * I() 取该书本全部行 → 按 mFormatDate 分组 → data = {"20261017":[...], "20261018":[...]}
+#     **一次请求可以带多个日期** —— 离线多天累积后一起重传
+#   * 30 天 (U = 2592000000ms) 没上传成功的行直接丢弃
+#   * 只有 code==0 才删本地行 (od/a.java:250-262); 失败留着重传
+#   * 触发: 翻页 / 息屏 / 关书 / 切前后台 → q0()
+#   * timestamp 是"现在" (account/d.a: System.currentTimeMillis()), 日期只由 data 的 key 表达
+#
+# 我们照抄:
+#   zy_time_queue(zy_book_id, day, bitmap, read_percent, tries)   ← ReadTimeInfo
+#   enqueue(day)   把 Kavita 会话的分钟并进队列行 (同一天多次 → 位图并集)
+#   flush()        按日分组一次 POST, 成功才删行 (失败留队, tries+1)
+#   backfill(a,b)  离线多天补录 (= APK 重连后首次上传)
+#
+# 服务端实测 (notes/05 §2.5, 2026-10-24 六次): 日期 key 与 body.timestamp **都不影响归账日**,
+# 一律记到"收到请求那天"; 未来日期静默丢弃。所以队列的价值是
+#   ① 同一天内的失败重试  ② 协议保真 (请求形态与 APK 一致)
+# 跨天补录会被服务端并入收到日 —— 服务端行为, 客户端无从绕过 (除非能签 sign, 那是 native RSA)。
 
-def push(day: date, *, dry_run: bool = False,
-         series_ids: list[int] | None = None) -> dict:
-    """把 Kavita 当天的会话时长写进掌阅 (分钟位图)。
+QUEUE_RETENTION_DAYS = 30          # APK od/a.java: U = 2592000000L
+RES_READ = "R"                     # APK Q(1) = "R" (书籍); 听书 L / 大咖 C / 漫画 CT / TTS T
 
-    **只能写当天** (2026-10-24 实测): 服务端按"收到请求的那一天"归日,
-    data 里的历史日期 key 与 body.timestamp 都不影响归属 —— 传 20261017/20261022/20261023
-    的数据全都落到上传当天, 传未来日期 (20261025) 则静默丢弃。
-    (APK 侧 `od/a.I()` 确实会按 mFormatDate 分组上传多天, 30 天内的失败行累计后重传,
-     见 notes/05 §2.5 —— 因此这是服务端行为, 不是客户端不会。) 历史回填在展示层无效,
-    必须当天推; 真机飞行模式实验能最终定性 (notes/05 §2.5 末)。
 
-    服务端按分钟位图求并集 → 同一天重复推同一批分钟不会翻倍 (幂等),
-    可以按小时/按需增量重推。
+def _minutes_bits(link: mapping.BookLink, day: date) -> set[int]:
+    """该映射某天的会话分钟 -> 位图位下标集合。"""
+    spans = sessions_minutes(link.kavita_series_id, day,
+                             link.kavita_chapter_id if link.kavita_chapter_id > 0 else None)
+    bits: set[int] = set()
+    for a, b in spans:
+        cur = a
+        while cur < b:
+            bits.add(bit_index(cur.hour, cur.minute, cur.second))
+            cur += timedelta(minutes=1)
+    return bits
+
+
+def _pct_for_day(link: mapping.BookLink, day: date) -> float:
+    """当天最后一次阅读时的进度 (APK 是"那天的 read_percent", 不是当下的)。
+
+    取当日最后一条会话的 EndPage/TotalPages; 拿不到就退回当前系列进度。
     """
-    report: dict[str, Any] = {"day": day.isoformat(), "books": [], "written": 0,
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    src = sqlite3.connect(f"file:{KAVITA_DB}?mode=ro", uri=True)
+    dst = sqlite3.connect(tmp)
+    src.backup(dst)
+    src.close()
+    try:
+        sql = """SELECT a.EndPage, a.TotalPages
+                   FROM AppUserReadingSession s
+                   JOIN AppUserReadingSessionActivityData a
+                        ON a.AppUserReadingSessionId = s.Id
+                  WHERE a.SeriesId=? AND s.StartTime LIKE ?
+                    AND COALESCE(a.TotalPages,0) > 0 AND COALESCE(a.EndPage,0) > 0"""
+        args: list = [link.kavita_series_id, day.isoformat() + "%"]
+        if link.kavita_chapter_id and link.kavita_chapter_id > 0:
+            sql += " AND a.ChapterId=?"
+            args.append(int(link.kavita_chapter_id))
+        sql += " ORDER BY s.EndTime DESC LIMIT 1"
+        row = dst.execute(sql, args).fetchone()
+    finally:
+        dst.close()
+    if row:
+        end, total = int(row[0] or 0), int(row[1] or 0)
+        if total > 0 and 0 <= end <= total:
+            return round(end / total, 6)
+    return pct_for_series(link.kavita_series_id)
+
+
+def _bitmap_union(b64: str | None, minutes: Iterable[int]) -> tuple[str, int]:
+    """位图并集 (APK j0 的累加语义), 返回 (base64, 置位数)。"""
+    try:
+        buf = bytearray(base64.b64decode(b64)) if b64 else bytearray(BITMAP_BYTES)
+    except Exception:
+        buf = bytearray(BITMAP_BYTES)
+    if len(buf) != BITMAP_BYTES:
+        buf = bytearray(BITMAP_BYTES)
+    for m in minutes:
+        if 0 <= m < BITMAP_BYTES * 8:
+            buf[m >> 3] |= 1 << (m & 7)
+    return base64.b64encode(bytes(buf)).decode(), sum(bin(b).count("1") for b in buf)
+
+
+def queue_info(series_ids: list[int] | None = None) -> list[dict]:
+    c = _state_conn()
+    rows = c.execute("SELECT * FROM zy_time_queue ORDER BY day, zy_book_id").fetchall()
+    c.close()
+    out = []
+    for r in rows:
+        if series_ids and r["kavita_series_id"] not in series_ids:
+            continue
+        out.append({"book": r["zy_book_id"], "day": r["day"],
+                    "series": r["kavita_series_id"], "minutes": r["minutes"],
+                    "tries": r["tries"], "last_try": r["last_try"]})
+    return out
+
+
+def _queue_put(book32: str, day: date, series_id: int, bitmap: str, minutes: int,
+               read_percent: float) -> None:
+    c = _state_conn()
+    c.execute("""INSERT INTO zy_time_queue
+                   (zy_book_id, day, kavita_series_id, bitmap, minutes, read_percent)
+                 VALUES (?,?,?,?,?,?)
+                 ON CONFLICT(zy_book_id, day) DO UPDATE SET
+                   bitmap=excluded.bitmap, minutes=excluded.minutes,
+                   read_percent=excluded.read_percent,
+                   kavita_series_id=excluded.kavita_series_id""",
+              (book32, day.isoformat(), series_id, bitmap, minutes, read_percent))
+    c.commit()
+    c.close()
+
+
+def _queue_del(book32: str, day: str) -> None:
+    c = _state_conn()
+    c.execute("DELETE FROM zy_time_queue WHERE zy_book_id=? AND day=?", (book32, day))
+    c.commit()
+    c.close()
+
+
+def _queue_mark_try(book32: str, day: str) -> None:
+    c = _state_conn()
+    c.execute("""UPDATE zy_time_queue
+                    SET tries = tries + 1, last_try = datetime('now')
+                  WHERE zy_book_id=? AND day=?""", (book32, day))
+    c.commit()
+    c.close()
+
+
+def _queue_drop_old(today: date | None = None) -> int:
+    """丢 >30 天的旧行 (APK I() 里的 fixedTimeStamp - U)。"""
+    today = today or date.today()
+    cut = (today - timedelta(days=QUEUE_RETENTION_DAYS)).isoformat()
+    c = _state_conn()
+    cur = c.execute("DELETE FROM zy_time_queue WHERE day < ?", (cut,))
+    n = cur.rowcount or 0
+    c.commit()
+    c.close()
+    return n
+
+
+def enqueue(day: date, *, series_ids: list[int] | None = None) -> dict:
+    """把 Kavita 某天的会话分钟并进队列 (对应 APK j0 累加, 幂等)。
+
+    同一天重复调用只是位图并集, 不会翻倍。
+    """
+    report: dict[str, Any] = {"day": day.isoformat(), "books": [], "queued": 0,
                               "skipped": 0, "errors": []}
-    if day != date.today():
-        report["errors"].append(
-            f"skip {day}: 掌阅按收到日归日, 只接受上传当天, 见 notes/05 §2.5")
+    if day > date.today():
+        report["errors"].append(f"{day} 是未来日期, 掌阅会静默丢弃, 拒绝入队")
         return report
     links = [l for l in mapping.all_links() if not series_ids or l.kavita_series_id in series_ids]
-    items = []
+    c = _state_conn()
+    rows = {(r["zy_book_id"], r["day"]): r
+            for r in c.execute("SELECT * FROM zy_time_queue").fetchall()}
+    c.close()
     for link in links:
-        spans = sessions_minutes(link.kavita_series_id, day,
-                                 link.kavita_chapter_id if link.kavita_chapter_id > 0 else None)
-        if not spans:
+        bits = _minutes_bits(link, day)
+        if not bits:
             continue
-        minutes = set()
-        for a, b in spans:
-            cur = a
-            while cur < b:
-                minutes.add(bit_index(cur.hour, cur.minute, cur.second))
-                cur += timedelta(minutes=1)
-        if not minutes:
-            continue
-        prev = _state_get(day, kb32(link.zy_book_id))
-        if prev and int(prev["minutes"] or 0) == len(minutes):
+        book32 = kb32(link.zy_book_id)
+        prev = rows.get((book32, day.isoformat()))
+        bitmap, count = _bitmap_union(prev["bitmap"] if prev else None, sorted(bits))
+        if prev and int(prev["minutes"] or 0) == count:
             report["skipped"] += 1
             continue
-        items.append((link, minutes))
-        report["books"].append({"series": link.kavita_series_id, "minutes": len(minutes),
-                                "name": link.zy_book_name})
+        pct = _pct_for_day(link, day)
+        _queue_put(book32, day, link.kavita_series_id, bitmap, count, pct)
+        report["queued"] += 1
+        report["books"].append({"series": link.kavita_series_id,
+                                "name": link.zy_book_name,
+                                "minutes": count,
+                                "added": count - int(prev["minutes"] or 0) if prev else count})
+    return report
 
-    if dry_run or not items:
-        report["written"] = len(items)
-        return report
 
-    data: dict[str, list] = {}
-    for link, minutes in items:
-        data.setdefault(day.strftime("%Y%m%d"), []).append({
-            "bid": 0,                       # 云端数字 bookid 未知, 靠 local_bid (内容 MD5)
-            "local_bid": book_key(link.zy_book_id),   # 大写 MD5_local, 大小写不同会分桶
-            "read_percent": pct_for_series(link.kavita_series_id),
-            "res": "R",
-            "d": bitmap_from_minutes(sorted(minutes)),
-        })
+def _post_report(data: dict) -> dict:
+    """reading_time/report 单次 POST (APK q0() 的形态: gzip body, usr+data+timestamp+sign)。
+
+    data = {"20261024": [{"bid","local_bid","read_percent","res","d"}, ...]}
+    签名 (sign) 由 native RSA 生成, 我们留空 —— 服务端不校验。
+    """
     payload = {"usr": load_zy_auth()["usr"],
                "data": json.dumps(data, ensure_ascii=False),
                "timestamp": str(int(time.time() * 1000)),
@@ -503,22 +633,122 @@ def push(day: date, *, dry_run: bool = False,
     body = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     req = urllib.request.Request(f"{UPLOAD_URL}?{qs}", data=body, method="POST")
     req.add_header("Content-Type", "application/octet-stream")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8", "replace"))
+
+
+def flush(*, dry_run: bool = False) -> dict:
+    """把队列按日分组一次 POST (APK I() + q0()), 成功才删行。"""
+    report: dict[str, Any] = {"days": [], "entries": 0, "cleared": 0,
+                              "kept": 0, "errors": []}
+    _queue_drop_old()
+    c = _state_conn()
+    rows = c.execute("SELECT * FROM zy_time_queue ORDER BY day").fetchall()
+    c.close()
+    if not rows:
+        return report
+    groups: dict[str, list] = {}
+    for r in rows:
+        try:
+            day = date.fromisoformat(r["day"])
+        except ValueError:
+            _queue_del(r["zy_book_id"], r["day"])
+            continue
+        if day > date.today():                     # 未来日期: 服务端丢, 别留着占位
+            _queue_del(r["zy_book_id"], r["day"])
+            continue
+        groups.setdefault(day.strftime("%Y%m%d"), []).append(r)
+    if not groups:
+        return report
+    report["days"] = sorted(groups)
+    report["entries"] = sum(len(v) for v in groups.values())
+    data = {k: [{"bid": 0,
+                 "local_bid": book_key(r["zy_book_id"]),
+                 "read_percent": float(r["read_percent"] or 0.0),
+                 "res": RES_READ,
+                 "d": r["bitmap"]} for r in v]
+            for k, v in groups.items()}
+    if dry_run:
+        report["payload"] = data
+        return report
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-        if raw[:2] == b"\x1f\x8b":
-            raw = gzip.decompress(raw)
-        res = json.loads(raw.decode("utf-8", "replace"))
-        if res.get("code") not in (0, None):
-            report["errors"].append(f"reading_time/report: {res}")
-        else:
-            for link, minutes in items:
-                _state_put(day, kb32(link.zy_book_id), link.kavita_series_id,
-                           len(minutes), "push", None)
-                report["written"] += 1
-    except Exception as e:
+        res = _post_report(data)
+    except Exception as e:                          # 网络/风控: 全部留队
         report["errors"].append(f"reading_time/report: {e}")
+        for v in groups.values():
+            for r in v:
+                _queue_mark_try(r["zy_book_id"], r["day"])
+        report["kept"] = report["entries"]
+        return report
+    if res.get("code") not in (0, None):
+        report["errors"].append(f"reading_time/report: {res}")
+        for v in groups.values():
+            for r in v:
+                _queue_mark_try(r["zy_book_id"], r["day"])
+        report["kept"] = report["entries"]
+        return report
+    for v in groups.values():                       # 只有 code==0 才删 (APK 同规则)
+        for r in v:
+            _queue_del(r["zy_book_id"], r["day"])
+            _state_put(date.fromisoformat(r["day"]), r["zy_book_id"],
+                       r["kavita_series_id"], int(r["minutes"] or 0), "push", None)
+            report["cleared"] += 1
+    report["resp"] = res.get("body")
     return report
+
+
+def push(day: date | None = None, *, dry_run: bool = False,
+         series_ids: list[int] | None = None) -> dict:
+    """入队某天 + flush (APK 的"读的时候顺手传")。
+
+    返回结构兼容旧调用方: day / books / written / skipped / errors (+ queued / flush)。
+    历史日期不再被 today-only 闸门拒绝 —— APK 就是这么发的 (30 天内都传);
+    服务端按收到日归账, 见 notes/05 §2.5。
+    """
+    day = day or date.today()
+    enq = enqueue(day, series_ids=series_ids)
+    report: dict[str, Any] = {"day": day.isoformat(), "books": enq["books"],
+                              "queued": enq["queued"], "skipped": enq["skipped"],
+                              "written": 0, "errors": list(enq["errors"])}
+    if dry_run:
+        report["flush"] = flush(dry_run=True)
+        return report
+    res = flush()
+    report["flush"] = res
+    report["written"] = int(res.get("cleared") or 0)
+    report["errors"].extend(res.get("errors") or [])
+    return report
+
+
+def backfill(start: date, end: date, *, dry_run: bool = False,
+             series_ids: list[int] | None = None) -> dict:
+    """离线多天补录: 逐日入队 → 一次 flush (等价 APK 重连后首次上传)。
+
+    注意: 服务端实测按"收到日"归账, 历史 key 会被并入今天 (notes/05 §2.5)。
+    """
+    out: dict[str, Any] = {"range": [start.isoformat(), end.isoformat()],
+                           "days": [], "queued": 0, "skipped": 0,
+                           "written": 0, "errors": []}
+    cur = start
+    while cur <= end:
+        enq = enqueue(cur, series_ids=series_ids)
+        out["days"].append({"day": cur.isoformat(), "queued": enq["queued"],
+                            "skipped": enq["skipped"]})
+        out["queued"] += enq["queued"]
+        out["skipped"] += enq["skipped"]
+        out["errors"].extend(enq["errors"])
+        cur += timedelta(days=1)
+    if dry_run:
+        out["pending"] = queue_info(series_ids)
+        return out
+    res = flush()
+    out["flush"] = res
+    out["written"] = int(res.get("cleared") or 0)
+    out["errors"].extend(res.get("errors") or [])
+    return out
 
 
 def sync(day: date, *, dry_run: bool = False) -> dict:

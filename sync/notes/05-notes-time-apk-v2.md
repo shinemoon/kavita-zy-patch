@@ -210,9 +210,61 @@ KEY = 自传书: <文件MD5 32hex 大写>_local   商店书: <数字 bookid>
 * 记到"飞行那天" → 服务端认 key, bridge 可以放开 today 闸门补历史
 * 记到"联网那天" → 服务端不认, 只能当天推 (现状实现正确)
 
-**工程现状**: `zy_time.push()` 保持 today-only 闸门 (`push()` 非当天直接报错返回),
-auto 钩子 (8s 去抖) + watchdog 当天多次推 → 保证"读的时候就在当天落账"。
-另: 服务端按分钟位图求并集, 同一批分钟重复推不翻倍 (幂等, 8→15→16 逐次 +1/+7 已验证)。
+**2026-10-24 22:10 复测 (第六~八次, 排除"我们发的报文形态不对")**:
+
+| 试验 | 报文 | 结果 |
+|---|---|---|
+| 单历史 key + 回退 timestamp | key `20261018` + `timestamp` = 10-18 09:11 | 落 **10-24** (+1), 10-18 不变 |
+| 多 key 同请求 | `20261016` + `20261017`, timestamp = now | 落 **10-24** (+2) |
+| 单历史 key (前一天) | key `20261020` | 落 **10-24** (+1), 10-20 仍 0 |
+
+服务端响应 `{"body":{"ts":"<我们发的 timestamp 原样>"},"code":0,"msg":"ok"}` ——
+它只是回显 timestamp, 并没有把它当归账依据。三组都在 `read_report/book` 与账号级
+`reading_statistics.reading_distribution` 两个独立视图上同时核对过 (两个视图同步变化),
+所以不是"报表口径"问题, 是存储就按收到日写了。
+
+剩下唯一没排除的解释: **服务端只在 `sign` 合法时才信客户端的日期** (APK 的 sign 是
+`Security.hash(sortedParams)` = native RSA SHA1, `JNISecurity.hash`, 我们签不出来)。
+若真机飞行模式实验 (§2.5 末) 证明服务端认 key, 那八成就是这个原因。
+
+**工程现状 (2026-10-24 22:4x 起, 改为照抄 APK 的队列模型)** —— 见 §2.6。
+
+---
+
+### 2.6 写入侧实现: 照抄 APK 的队列 (2026-10-24 22:4x, 已落地)
+
+APK 的事实 (`od/a.java`, 逐条对上代码):
+
+| APK | 依据 | 我们的实现 |
+|---|---|---|
+| 本地表 = 每 书×每天 一行, 值是 180B 分钟位图 base64 | `ReadTimeInfo.mFormatDate/mData`, `U()` 里 `new byte[180]` | `zy_time_queue(zy_book_id, day, bitmap, ...)`, 位图同构 |
+| 读到新分钟按位**并集**累加, 不是新插行 | `j0(byte[], from, to)` 数位 + `q()` | `_bitmap_union()` (LSB 优先, 与 `bit_index` 一致) |
+| 上传按 `mFormatDate` 分组, **一个请求可带多天** | `I()` 里 `HashMap<date, List>` → `{"20261017":[...],"20261018":[...]}` | `flush()` 按 day 分组一次性 POST |
+| 只有 `code==0` 才删本地行, 失败留着重传 | `od/a.java:250-262` (`pd.b.t().b(it.next())`) | 成功才 `_queue_del`, 失败 `tries+1` 留队 |
+| 超 30 天未成功直接丢弃 | `U = 2592000000L`, `I()` 里 `fixedTimeStamp - U` | `QUEUE_RETENTION_DAYS = 30`, `_queue_drop_old()` |
+| 触发: 翻页 / 息屏 / 关书 / 切前后台 | `q0()` / `o0()` (od/a.java:844, 1040-1100) | auto-push 钩子 (8s 去抖) → `push()` = `enqueue+flush`; 另外 `time flush` 可手动重试 |
+| `timestamp` = 现在, 日期只由 data key 表达 | `account/d.a` `System.currentTimeMillis()` | 同 |
+| `read_percent` 是"那天的进度" | `ReadTimeInfo.mReadPercent` 当场写 | `_pct_for_day()`: 取当日最后一条会话 `EndPage/TotalPages` |
+| 字段 `{bid, local_bid, read_percent, res, d}` | `I()` 里 5 个 put | 同 (bid=0, res="R") |
+
+CLI:
+
+```sh
+python3 zync.py time push            # 入队今天 + flush (读的时候顺手传)
+python3 zync.py time backfill --start 2026-10-16 --end 2026-10-23   # 离线多天补录
+python3 zync.py time flush           # 只重试队列里的失败行
+python3 zync.py time queue           # 看队列 (day/book/minutes/tries)
+python3 zync.py time push --dry-run  # 看报文: 分组 + 位图, 不发
+```
+
+**实测**: `time push` → 3 本入队 → flush `cleared=3`, 队列空, 服务端 `code:0`;
+`time push --dry-run` 报文与 APK 同构 (180B 位图, 大写 `_local`, `res:"R"`);
+`tests/test_notes_time.py` 新增 8 项 (位图并集/坏 base64/未来日期拒绝/按日分组/成功删行/
+失败留队 tries/异常留队/30 天过期) 全过。
+
+**能力边界 (别误读)**: 队列 ≠ 能补历史。服务端按收到日归账 (§2.5), 所以
+`backfill` 只在"服务端哪天认 key"这件事被推翻后才有展示价值; 现在它只是
+"把离线期间的分钟记进上线那天" —— 和 APK 在同样情况下得到的结果一致。
 
 **探针脚本** (可复跑, 只写 1-2 分钟):
 `scripts/probe-time-key.py` (书 key 形态) / `scripts/probe-time-hist.py` (单日期) /
@@ -229,7 +281,7 @@ auto 钩子 (8s 去抖) + watchdog 当天多次推 → 保证"读的时候就在
 | 书签 | ✅ 自带 markpercent | ✅ 同上, 字段最少 | 最简单的一类 |
 | 批注(想法) | ✅ summary+remark (remark 挂在划线上) | ⚠️ 若 Kavita 注释无对应选区, 只能挂到"划线+remark"形态 | 不造 bookScaleNotes, 统一走 booknotes+remark |
 | 手写笔迹 | ⚠️ base64 笔迹 | ❌ | 不做 |
-| 阅读时长 | ✅ **按天每书精确** (`read_report/book`) | ✅ 当天可写; 历史 key 会被服务端并入"收到日" (§2.5) | 见 §2.3~§2.5 |
+| 阅读时长 | ✅ **按天每书精确** (`read_report/book`) | ✅ APK 式队列 (每书每天位图, 多天分组上传, 失败重传); 历史 key 会被服务端并入"收到日" (§2.5/§2.6) | 见 §2.3~§2.6 |
 | 阅读进度 | ✅ 已做 (readPercent 公式) | ✅ 已做 (push) | — |
 
 **结论: 双向都能做到"分钟"级精度** —— 写(掌阅)用分钟位图; 读(掌阅)用
@@ -248,10 +300,11 @@ T1/T2 的分摊方案降级为"接口取不到该书的逐日数据时的兜底"
   时, 退回周级 `reading_longest_books` 按天总量比例分摊, 并在 report 里标 `mode=alloc`。
 * **兜底 `exact`** — 兜底里若整周只有一本有映射的书, 天总量全归它。
 
-**写方向限制**: 实测**历史日期 key 会被并入"收到请求那天"** (见 §2.5), 所以
-Kavita→掌阅 必须当天跑 (auto 钩子 8s 去抖 + watchdog 当天多次推), 不能事后补。
-APK 本身是支持多天重传的 (§2.5 APK 侧), 因此这条限制在服务端, 不在客户端;
-真机飞行模式实验 (§2.5 末) 若证明服务端其实认 key, 就放开 push 的 today 闸门。
+**写方向**: 客户端已照抄 APK 的队列模型 (§2.6) —— 每书每天一行位图、多天分组上传、
+失败留队重传、30 天过期。这是"协议保真", 不是"能改历史"。
+实测**历史日期 key 会被并入"收到请求那天"** (见 §2.5), 所以离线多天的分钟最终会落在
+重新上线那天; 想落在真正的阅读日, 只能当天就在线推 (auto 钩子 8s 去抖已覆盖)。
+APK 在同样场景下得到的结果与我们一致 —— 限制在服务端, 不在客户端。
 两端口径因此天然不对称, 但都不是估算: 读回来的每天每书数是掌阅自己的原始值。
 
 ---

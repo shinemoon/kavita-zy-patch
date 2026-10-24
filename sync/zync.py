@@ -85,13 +85,19 @@ def cmd_time(args):
     sids = args.series or None
     if args.action == "push":
         out = zy_time.push(day, dry_run=args.dry_run, series_ids=sids)
+    elif args.action == "backfill":              # 离线多天补录 (APK 重连后首次上传)
+        out = zy_time.backfill(start, end, dry_run=args.dry_run, series_ids=sids)
+    elif args.action == "flush":                 # 只刷队列 (重试失败行)
+        out = zy_time.flush(dry_run=args.dry_run)
+    elif args.action == "queue":
+        out = {"pending": zy_time.queue_info(sids)}
     elif args.action == "pull":
         out = zy_time.pull(start, end, dry_run=args.dry_run, series_ids=sids)
     else:
         out = {"pull": zy_time.pull(start, end, dry_run=args.dry_run, series_ids=sids),
                "push": zy_time.push(day, dry_run=args.dry_run, series_ids=sids)}
     print(json.dumps(out, ensure_ascii=False, indent=1))
-    return 0 if not json.dumps(out).count('"errors": [') else 1
+    return 0 if not out.get("errors") else 1
 
 
 def main(argv=None):
@@ -136,7 +142,8 @@ def main(argv=None):
     p_nt.set_defaults(func=cmd_notes)
 
     p_tm = sub.add_parser("time", help="阅读时长 双向同步")
-    p_tm.add_argument("action", choices=("sync", "pull", "push"))
+    p_tm.add_argument("action", choices=("sync", "pull", "push", "backfill",
+                                        "flush", "queue"))
     p_tm.add_argument("--day", default=None, help="push 用: YYYY-MM-DD (默认今天)")
     p_tm.add_argument("--start", default=None, help="pull 用: 起始日")
     p_tm.add_argument("--end", default=None, help="pull 用: 结束日")

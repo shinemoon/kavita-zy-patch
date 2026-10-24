@@ -180,6 +180,18 @@ def _conn() -> sqlite3.Connection:
             updated_utc TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (kind, zy_book_id, zy_key)
         );
+        CREATE TABLE IF NOT EXISTS zy_time_queue (
+            zy_book_id TEXT NOT NULL,          -- 32hex (书身份 = 文件内容 MD5)
+            day TEXT NOT NULL,                 -- 本地日 yyyy-MM-dd
+            kavita_series_id INTEGER NOT NULL,
+            bitmap TEXT NOT NULL,              -- base64(180B 分钟位图), 与 APK mData 同构
+            minutes INTEGER DEFAULT 0,
+            read_percent REAL DEFAULT 0,
+            tries INTEGER DEFAULT 0,
+            first_added TEXT DEFAULT (datetime('now')),
+            last_try TEXT,
+            PRIMARY KEY (zy_book_id, day)
+        );
         CREATE TABLE IF NOT EXISTS zy_time_link (
             day TEXT NOT NULL,
             zy_book_id TEXT NOT NULL,

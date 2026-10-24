@@ -106,10 +106,87 @@ zy_time.book_report = _orig_book_report
 check("book_days 解析 + 补零", _days.get("2026-10-24") == 16 and _days.get("2026-10-01") == 11, _days)
 check("book_days 丢脏数据", len(_days) == 2, _days)
 
-# push 只允许当天 (服务端按上传日归日)
+# --- APK 式推送队列 (zy_time_queue) ---------------------------------------
+import base64
+import tempfile
+from pathlib import Path
+
+_union_b64, _union_n = zy_time._bitmap_union(None, [0, 5])
+check("位图并集 计数", _union_n == 2, _union_n)
+_again, _again_n = zy_time._bitmap_union(_union_b64, [5, 6])
+check("位图并集 幂等/追加", _again_n == 3 and zy_time.minutes_from_bitmap(_again) == [0, 5, 6],
+      zy_time.minutes_from_bitmap(_again))
+check("位图并集 坏 base64 重置", zy_time._bitmap_union("!!!", [1])[1] == 1)
+
+# 用临时 state 库, 不碰真库
+_real_state = zy_notes.STATE_DB
+tmpdir = tempfile.mkdtemp(prefix="zytest-")
+zy_notes.STATE_DB = str(Path(tmpdir) / "state.db")
+
 _today = date.today()
-_r = zy_time.push(_today.replace(day=1) if _today.day > 1 else _today, dry_run=True)
-check("push 非当天被拒", bool(_r["errors"]) and _r["written"] == 0, _r)
+_yday = _today.replace(day=_today.day - 1) if _today.day > 1 else _today
+_r = zy_time.enqueue(_today.replace(year=_today.year + 1), series_ids=[26])
+check("入队 未来日期拒绝", bool(_r["errors"]) and _r["queued"] == 0, _r)
+
+# 直接塞队列行 (绕开 Kavita 会话), 校验 flush 的分组/字段/删行
+bm24 = zy_time.bitmap_from_minutes([600, 601, 602])
+bm23 = zy_time.bitmap_from_minutes([300])
+zy_time._queue_put("6818bfd9c92c8576a0e21ad13cd28cc2", _today, 26, bm24, 3, 0.49)
+zy_time._queue_put("6818bfd9c92c8576a0e21ad13cd28cc2", _yday, 26, bm23, 1, 0.48)
+check("队列 2 行", len(zy_time.queue_info()) == 2, zy_time.queue_info())
+
+_dry = zy_time.flush(dry_run=True)
+_p = _dry.get("payload") or {}
+check("flush 按日分组", sorted(_p) == sorted([_today.strftime("%Y%m%d"), _yday.strftime("%Y%m%d")]),
+      sorted(_p))
+_one = (_p.get(_today.strftime("%Y%m%d")) or [{}])[0]
+check("flush 字段形态", _one.get("bid") == 0 and _one.get("res") == "R"
+      and _one.get("local_bid", "").endswith("_local")
+      and _one.get("local_bid", "").split("_")[0].isupper(), _one)
+
+_posted = {}
+_orig_post = zy_time._post_report
+
+
+def _fake_ok(data):
+    _posted["data"] = data
+    return {"code": 0, "body": {"ts": "1"}}
+
+
+zy_time._post_report = _fake_ok
+_ok = zy_time.flush()
+check("flush 成功清空队列", _ok["cleared"] == 2 and not zy_time.queue_info(), _ok)
+check("flush 一次请求带两天", sorted(_posted["data"]) == sorted(_p), sorted(_posted["data"]))
+
+
+def _fake_bad(data):
+    return {"code": 400001, "msg": "nope"}
+
+
+zy_time._queue_put("6818bfd9c92c8576a0e21ad13cd28cc2", _today, 26, bm24, 3, 0.49)
+zy_time._post_report = _fake_bad
+_bad = zy_time.flush()
+check("flush 失败留队 + tries", _bad["kept"] == 1 and len(zy_time.queue_info()) == 1
+      and zy_time.queue_info()[0]["tries"] == 1, _bad)
+
+
+def _fake_raise(data):
+    raise OSError("network down")
+
+
+zy_time._post_report = _fake_raise
+_exc = zy_time.flush()
+check("flush 异常留队", _exc["kept"] == 1 and len(zy_time.queue_info()) == 1, _exc)
+
+# 30 天保留期
+_old_day = _today.replace(year=_today.year) if False else date(2000, 1, 1)
+zy_time._queue_put("deadbeef" * 4, _old_day, 26, bm23, 1, 0.1)
+check("过期行被清", zy_time._queue_drop_old(_today) >= 1
+      and all(r["day"] != _old_day.isoformat() for r in zy_time.queue_info()))
+
+zy_time._post_report = _orig_post
+zy_notes.STATE_DB = _real_state
+print("清理临时库:", tmpdir)
 
 print("\nFAIL =", FAIL)
 sys.exit(1 if FAIL else 0)
