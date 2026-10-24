@@ -287,7 +287,8 @@ _TIME_GAP = 600.0        # 同一本书 10 分钟内只同步一次时长 (避�
 def _time_sync(kind: str, sid: int, quiet: bool = True) -> dict:
     """顺手做阅读时长同步 (失败不影响进度同步)。
 
-    push: 只写**当天** (掌阅服务端按上传日归日, 见 notes/05 §2.5)
+    push: enqueue(今天) + flush —— 队列里若还有前几天失败的行走 APK 的重试语义一起发
+          (掌阅服务端按"收到日"归账, 见 sync/notes/05 §2.5)
     pull: 最近 7 天的逐书逐日 (read_report/book, 精确)
     """
     import time as _t
