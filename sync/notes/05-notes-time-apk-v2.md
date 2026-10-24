@@ -254,11 +254,13 @@ python3 zync.py time push            # 入队今天 + flush (读的时候顺手�
 python3 zync.py time backfill --start 2026-10-16 --end 2026-10-23   # 离线多天补录
 python3 zync.py time flush           # 只重试队列里的失败行
 python3 zync.py time queue           # 看队列 (day/book/minutes/tries)
-python3 zync.py time push --dry-run  # 看报文: 分组 + 位图, 不发
+python3 zync.py time push --dry-run  # 看今天能入队多少 + 队列里压着什么 (不写库)
+python3 zync.py time flush --dry-run # 看报文 (按日分组 + 位图), 不发
 ```
 
 **实测**: `time push` → 3 本入队 → flush `cleared=3`, 队列空, 服务端 `code:0`;
-`time push --dry-run` 报文与 APK 同构 (180B 位图, 大写 `_local`, `res:"R"`);
+`time flush --dry-run` 报文与 APK 同构 (180B 位图, 大写 `_local`, `res:"R"`);
+`time backfill --start .. --end .. --dry-run` 只算不写 (dry-run 完全不入队);
 `tests/test_notes_time.py` 新增 8 项 (位图并集/坏 base64/未来日期拒绝/按日分组/成功删行/
 失败留队 tries/异常留队/30 天过期) 全过。
 
@@ -348,7 +350,7 @@ zy_time_link(day, zy_book_id, kavita_series_id, minutes, source, mode)
 
 代码: `sync/sync/zy_notes.py` (划线/书签) + `sync/sync/zy_time.py` (时长)
 CLI: `python3 zync.py notes {sync|pull|push} [--series N] [--dry-run]`
-     `python3 zync.py time  {sync|pull|push} [--day D] [--start D --end D] [--dry-run]`
+     `python3 zync.py time  {sync|pull|push|backfill|flush|queue} [--day D] [--start D --end D] [--dry-run]`
 测试: `python3 tests/test_notes_time.py` (20 项全过, 含剑来真实数据往返)
 
 ### 7.1 笔记上传 (Kavita → 掌阅)

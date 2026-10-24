@@ -583,7 +583,8 @@ def _queue_drop_old(today: date | None = None) -> int:
     return n
 
 
-def enqueue(day: date, *, series_ids: list[int] | None = None) -> dict:
+def enqueue(day: date, *, series_ids: list[int] | None = None,
+            dry_run: bool = False) -> dict:
     """把 Kavita 某天的会话分钟并进队列 (对应 APK j0 累加, 幂等)。
 
     同一天重复调用只是位图并集, 不会翻倍。
@@ -609,7 +610,8 @@ def enqueue(day: date, *, series_ids: list[int] | None = None) -> dict:
             report["skipped"] += 1
             continue
         pct = _pct_for_day(link, day)
-        _queue_put(book32, day, link.kavita_series_id, bitmap, count, pct)
+        if not dry_run:
+            _queue_put(book32, day, link.kavita_series_id, bitmap, count, pct)
         report["queued"] += 1
         report["books"].append({"series": link.kavita_series_id,
                                 "name": link.zy_book_name,
@@ -709,12 +711,12 @@ def push(day: date | None = None, *, dry_run: bool = False,
     服务端按收到日归账, 见 notes/05 §2.5。
     """
     day = day or date.today()
-    enq = enqueue(day, series_ids=series_ids)
+    enq = enqueue(day, series_ids=series_ids, dry_run=dry_run)
     report: dict[str, Any] = {"day": day.isoformat(), "books": enq["books"],
                               "queued": enq["queued"], "skipped": enq["skipped"],
                               "written": 0, "errors": list(enq["errors"])}
-    if dry_run:
-        report["flush"] = flush(dry_run=True)
+    if dry_run:                       # 只看: 今天能入队多少 + 队列里还压着什么
+        report["pending"] = queue_info(series_ids)
         return report
     res = flush()
     report["flush"] = res
@@ -734,7 +736,7 @@ def backfill(start: date, end: date, *, dry_run: bool = False,
                            "written": 0, "errors": []}
     cur = start
     while cur <= end:
-        enq = enqueue(cur, series_ids=series_ids)
+        enq = enqueue(cur, series_ids=series_ids, dry_run=dry_run)
         out["days"].append({"day": cur.isoformat(), "queued": enq["queued"],
                             "skipped": enq["skipped"]})
         out["queued"] += enq["queued"]
