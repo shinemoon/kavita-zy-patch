@@ -22,7 +22,7 @@ Kavita SPA (容器 :5000)
   └─ index.html 末尾 <script src="zy-kavita-patch.js">   ← 注入点
         ├─ 入口按钮 → 控制台 :5012
         ├─ 读书钩子 (v0.4.0)  ← 见下节「自动同步」
-        └─ fetch → 补丁后端 (host :5111)
+        └─ fetch → /zy/api/*  (优先 :5012 反代 → :5111; 也可直连 :5111)
                       ├─ /zy/api/status     两侧进度对照
                       ├─ /zy/api/selfcheck  体检 (warning 数据源)
                       ├─ /zy/api/push|pull  调 bridge sync 包 (全库)
@@ -105,7 +105,7 @@ Kavita SPA (容器 :5000)
 | `GET /auto/cfg` 失败（后端正重启/网络抖） | `AUTO.on` 永远 false，**整页从此没有钩子**，且不发心跳（`.catch` 里只记 note） | cfg 失败 → 15~100s 退避重试（最多 20 次）+ **仍然发心跳**（带失败原因），服务端能立刻看到 |
 | 连续翻页不断重置去抖 | 读得快时 push 永远等不到 | 去抖 + **最大等待 30s**：到点先推一次 |
 | Kavita 不是每次位置变化都存进度 | 位置动了但没 push | 书页可见时**每 60s 定时兜底**一次（`tick`，没推进则不落日志） |
-| `http://host:5111` 不可达（HTTPS 页面 / 跨网段 / 手机走域名） | 所有调用静默失败 | 启动时**探测两个 base**：先 `<origin>/zy/api`（需要反代），再 `host:5111`；严格校验 `/health` 返回 `{ok:true,ts}` —— Kavita SPA 对未知路径也返 200 HTML，宽松判定会误判 |
+| `http://host:5111` 不可达（HTTPS 页面 / 跨网段 / 手机走域名 / 路由器没给 5111 做端口映射） | 所有调用静默失败 | 启动时**探测三个 base**：① `<origin>/zy/api`（真反代）② `host:5012/zy/api`（**控制台反代到 5111**，v0.4.6 起）③ `host:5111`（LAN 老路）。严格校验 `/health` 返回 `{ok:true,ts}` —— Kavita SPA 对未知路径也返 200 HTML，宽松判定会误判 |
 
 配套日志：`auto-push` 行现在带 `kv=..% zy=..% why=noop|forward|regress|no-baseline`，
 不再只有 `pushed=0 skipped=1` 这种没法定位的计数。
@@ -144,8 +144,10 @@ pct = (页起点字节 + 页内比例 × 页长) / 全书字节
    此时**刷新一次页面**。加载了但版本号是旧的 = inode 漂移，跑 `deploy/reapply.sh`。
 2. **只在浏览器开着 Kavita 网页时工作**：在掌阅 App 里读，Kavita 不知道；下次打开 Kavita 网页
    （进书 / 详情页）才会 pull 一次。
-3. **`BASE = http://<当前访问的主机名>:5111`**：所以从哪台设备读，那台设备就要能直连 `5111`。
-   走 HTTPS 反代访问 Kavita 会被浏览器按混合内容拦掉（需把 5111 也反代成 https 并改 `src/zy-kavita-patch.js.tmpl` 的 BASE）。
+3. **`BASE` 探测三档**（v0.4.6）：`<origin>/zy/api`（真反代）→ `<host>:5012/zy/api`
+   （控制台进程反代到 5111，**只需要 5012 这一个端口对外**）→ `<host>:5111`（LAN 直连）。
+   从哪台设备读，这台设备至少要能到上面三者之一；`__ZY__.auto().base` 会写出实际用了哪个。
+   走 HTTPS 反代访问 Kavita 时前两档仍可用（5012 也走 https 反代即可），直连 5111 会被混合内容拦掉。
 
 ## 5012 控制台：「Kavita 改造」卡
 

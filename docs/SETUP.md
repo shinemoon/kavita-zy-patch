@@ -30,8 +30,10 @@ setfacl -m u:youruser:rwx /vol1/1001/APPS/kavita   # 目录，WAL 要建 -wal/-s
 | 端口 | 谁 | 说明 |
 |---|---|---|
 | 5000 | Kavita | 页面 |
-| 5111 | 补丁后端 | **浏览器要能直连**（页面里的 fetch 打它，不是反代） |
-| 5012 | 桥接控制台 | 掌阅认证 / 推拉 / **Kavita 改造** |
+| 5012 | 桥接控制台 | 掌阅认证 / 推拉 / **Kavita 改造**；同时反代 `/zy/api/*` → 5111（v0.4.6）。**对外只需要它** |
+| 5111 | 补丁后端 | 只给本机和 5012 用；浏览器**不必**能直连（能直连更快，断开会自动走 5012 反代） |
+
+> 只有一台机器 + 一个公网端口映射时：映射 5000（Kavita）与 5012（控制台兼 API 入口）即可，5111 不用放行。
 
 ---
 
@@ -341,15 +343,15 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 |---|---|
 | 页面没有「掌阅同步」 | 先 **强刷** Ctrl/Cmd+Shift+R（index.html 缓存）；再查自检 `前端资源` / `index 注入` / `前端资产版本` 是否红 → 「注入 / 重打」；F12 控制台看 `__ZY__.ver` 与 `document.getElementById('zy-top-item')` |
 | 顶栏有、左侧抽屉没有 | 正常：手机/窄屏抽屉默认收起，点汉堡菜单才看到；顶栏入口一直都在 |
-| 有导航项，徽标空白/「离线」 | 自检 `补丁后端` 是否红 → 「重启补丁后端」；F12 看 5111 请求 |
+| 有导航项，徽标空白/「离线」 | 自检 `补丁后端` 是否红 → 「重启补丁后端」；F12 看请求打到哪个 base（`__ZY__.auto().base`）。若是 `host:5111` 且被浏览器拒（`ERR_CONNECTION_REFUSED`）= 这台设备到 5111 不通：v0.4.6 起会自动改走 `host:5012/zy/api`，仍不通就查 5012 的端口映射/反代 |
 | 5111 报 `bad token` | `state/token` 与页面里 `?v=` 一起重渲染：重跑 install |
 | 徽标全不显示 | 没映射记录：`selftest.py` 看 `/zy/api/status` 的 rows |
 | 「安装自启」点了报 root | 面板没有免密 sudo → 手跑 `sudo bash deploy/install-autostart.sh`（一次） |
 | 自检红「自愈巡检」 | 点「立即自检」看输出；`state/logs/heal.log` 有失败原因 |
 | 「继续阅读」报错跳回详情页 | 书内链接坏了：重跑 `apply_edition.py --series N`（构建即自校验）；或回滚 `.bak` |
-| **自动 push/pull 像没生效** | 按顺序看三处：① `bash install.sh status` 里 `mode=`；② `state/logs/api.log` 有没有 `hb vX.Y.Z`、里面的 `saves=` 是否随阅读增长（不增长 = 这一页没钩子：强刷 / 后端在重启窗口加载 / 设备连不到 5111）；③ 有没有 `auto-pull` / `auto-push` 行，`auto-push ... why=noop` 是 `push_decision` 主动挡（已对齐），`why=regress` 是掌阅更靠前不回拨，都不是故障 |
+| **自动 push/pull 像没生效** | 按顺序看三处：① `bash install.sh status` 里 `mode=`；② `state/logs/api.log` 有没有 `hb vX.Y.Z`、`base=` 指向哪个地址、里面的 `saves=` 是否随阅读增长（没有 hb = 这一页连不上后端：强刷 / 后端在重启窗口加载 / 设备到 5012+5111 都不通）；③ 有没有 `auto-pull` / `auto-push` 行，`auto-push ... why=noop` 是 `push_decision` 主动挡（已对齐），`why=regress` 是掌阅更靠前不回拨，都不是故障 |
 | 钩子整晚一次没动，但 Kavita 存进度正常 | v0.4.4 修掉的典型：页面在 5111 重启窗口加载 → `/auto/cfg` 失败 → 整页无钩子且不重试。强刷到 `?v=0.4.4` 后自动重试 + 失败也会发心跳，`hb` 行里会写 `auto cfg 读取失败 (第N次)` |
-| 手机/HTTPS 打开 Kavita，自动同步全静默 | 页面调不到 `http://host:5111`（混合内容/跨网段）。要么在反代上加 `/zy/ → 127.0.0.1:5111`（v0.4.4 会自动优先用它），要么用 LAN 内 http 地址 |
+| 手机/HTTPS 打开 Kavita，自动同步全静默 | 页面调不到 `http://host:5111`（混合内容/跨网段/没做映射）。v0.4.6 起会自动改走 `host:5012/zy/api`（由控制台反代到 5111），所以只要 5012 能到就没事；两档都不通才需要在反代上加 `/zy/ → 127.0.0.1:5111`。验证：`node src/verify-domain.mjs http://<你的域名>:5000` |
 | asset 200 但 `__ZY__.ver` 是旧版 | 单文件挂载 inode 漂移：`bash deploy/reapply.sh`（比对 md5 + `docker restart` 重挂） |
 | 页面白屏 / 挂载点是目录 | 重建时 `state/wwwroot/` 里文件不存在 → docker 建成目录。`bash install.sh publish` 后 `docker compose up -d --force-recreate` |
 | 进度显示 44% 打开是目录 | 该书还没重排版 → 做第 4 步 |

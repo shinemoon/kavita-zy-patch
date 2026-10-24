@@ -25,19 +25,21 @@
 
   var TOKEN = '__ZY_TOKEN__';
   var PORT   = __ZY_PORT__;
+  var WEBPORT = __ZY_WEB_PORT__;
   var VER    = '__ZY_VER__';
   var BASE   = 'http://' + location.hostname + ':' + PORT + '/zy/api';
   var BASE_TRIED = 'direct-host-port';
   // 探测顺序:
-  //   1) 同源反代 /zy/api → 后端。HTTPS 页面、跨网段、手机走域名时,
-  //      直连 host:5111 会被混合内容/防火墙挡掉 —— 这是唯一还能通的路径。
-  //   2) 直连 host:5111 (LAN + http 页面的老路)
-  // 探测失败就保持 (2) 当默认, 后面请求自己失败 (会记进 note)。
+  //   1) 同源反代 /zy/api → 后端 (若有 nginx/Kestrel 层反代)
+  //   2) 控制台端口 :WEBPORT/zy/api → 由 5012 反代到 5111 (2026-10-24 新增)
+  //      好处: 只需要一个已映射的端口, 不必给 5111 单独做端口映射/放行。
+  //   3) 直连 host:5111 (LAN + http 页面的老路)
   var BASE_CANDIDATES = [location.origin + '/zy/api'];
   if (location.protocol === 'http:') {
+    BASE_CANDIDATES.push('http://' + location.hostname + ':' + WEBPORT + '/zy/api');
     BASE_CANDIDATES.push('http://' + location.hostname + ':' + PORT + '/zy/api');
   }
-  var CONSOLE = 'http://' + location.hostname + ':__ZY_WEB_PORT__/';
+  var CONSOLE = 'http://' + location.hostname + ':' + WEBPORT + '/';
 
   function _probe(url) {
     return new Promise(function (resolve) {
