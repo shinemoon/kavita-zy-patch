@@ -185,8 +185,129 @@ check("过期行被清", zy_time._queue_drop_old(_today) >= 1
       and all(r["day"] != _old_day.isoformat() for r in zy_time.queue_info()))
 
 zy_time._post_report = _orig_post
+
+# --- push: 照抄 APK 的合并语义 (全 mock, 不联网) --------------------------
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+tmpdir2 = tempfile.mkdtemp(prefix="zy-push-test-")
+zy_notes.STATE_DB = Path(tmpdir2) / "state.sqlite"
+
+BOOK32 = zy_notes.kb32("AB" * 32)          # 32 个 a
+GEO = zpct.BookGeometry(["a.xhtml", "b.xhtml"], [500, 500])
+
+
+class _Link:
+    kavita_series_id = 99
+    zy_book_id = "AB" * 32
+    zy_book_name = "测试书"
+    zy_anchor_chapter_id = 5
+
+
+_orig = {n: getattr(zy_notes, n) for n in (
+    "geometry", "_orig_epub", "_find_in_book", "kavita_annotations",
+    "kavita_bookmarks", "notebooks", "cloud_versions", "upload", "delete_items",
+    "_idea_fields", "_page_start_bytes", "_chapter_id_for")}
+
+_orig_links = zy_notes.mapping.all_links
+zy_notes.mapping.all_links = lambda: [_Link()]
+zy_notes.geometry = lambda link: GEO
+zy_notes._orig_epub = lambda link: "/dev/null"
+zy_notes._idea_fields = lambda *a, **k: {"chapterId": 6, "chaptername": "c"}
+zy_notes._chapter_id_for = lambda link: 4242
+zy_notes.notebooks = lambda: []
+zy_notes._page_start_bytes = lambda link, geo, page: page * 10
+
+_TEXTS = {"第一段要说的话": 600, "第二段要说的话": 800}
+zy_notes._find_in_book = lambda epub, text: _TEXTS.get(text)
+zy_notes.kavita_bookmarks = lambda sid: []
+
+_CLOUD = {"note": {}, "mark": {}, "del": set()}
+zy_notes.cloud_versions = lambda b: _CLOUD
+
+_PUSHED = []
+_DELETED = []
+
+
+def _fake_upload(payload):
+    _PUSHED.append(payload)
+    return {"code": 0, "msg": "ok"}
+
+
+def _fake_delete(book32, keys, type_=2):
+    _DELETED.append((book32, list(keys), type_))
+    return {"status": 0}
+
+
+zy_notes.upload = _fake_upload
+zy_notes.delete_items = _fake_delete
+
+_anns = [{"Id": 1, "SelectedText": "第一段要说的话", "CommentPlainText": "我的批注"},
+         {"Id": 2, "SelectedText": "第二段要说的话", "CommentPlainText": ""}]
+zy_notes.kavita_annotations = lambda sid: list(_anns)
+
+_r1 = zy_notes.push([99])
+check("push 首轮推 2 条", _r1["pushed"] == 2 and len(_PUSHED) == 1, _r1)
+_note0 = (_PUSHED[0].get("booknotes") or [{}])[0]
+_apk_keys = {"uniquecheck", "style", "color", "summary", "remark", "positionstart",
+             "positionend", "positionstartl", "positionendl", "marktime"}
+check("booknotes 字段覆盖 APK 12 项", _apk_keys <= set(_note0), sorted(set(_note0)))
+check("bookbase 字段覆盖 APK 9 项",
+      {"name", "type", "readpostion", "readpercent", "bookid", "updatetime",
+       "deviceName", "marknum", "notenum"} <= set(_PUSHED[0]["bookbase"]),
+      sorted(_PUSHED[0]["bookbase"]))
+
+_r2 = zy_notes.push([99])
+check("push 幂等 (sig 未变不再推)", _r2["pushed"] == 0 and len(_PUSHED) == 1, _r2)
+
+# 内容变了 -> 重推
+_anns[0]["CommentPlainText"] = "改过的批注"
+_r3 = zy_notes.push([99])
+check("push 批注变了重推", _r3["pushed"] == 1 and len(_PUSHED) == 2, _r3)
+_anns[0]["CommentPlainText"] = "我的批注"
+
+# 云端 marktime >= 本地 => 不推 (APK 本地较新者胜)
+_key0 = _note0["uniquecheck"]
+_row0 = zy_notes.link_get("note", BOOK32, _key0)
+_CLOUD["note"] = {_key0: int(_row0["marktime"]) + 10}
+_anns[0]["CommentPlainText"] = "又一个新批注"
+_r4 = zy_notes.push([99])
+check("push 云端更新则不推", _r4["pushed"] == 0 and _r4["cloud_skip"] == 1, _r4)
+_anns[0]["CommentPlainText"] = "我的批注"
+_CLOUD["note"] = {}
+
+# 掌阅来源的不回灌
+zy_notes.link_put("note", BOOK32, "zyorigin" + _key0[:10], series_id=99, chapter_id=4242,
+                  annotation_id=None, marktime=1, source="zy", sig="x")
+_anns_zy = list(_anns)
+zy_notes.kavita_annotations = lambda sid: _anns_zy
+
+# 删除: 只删 kv 来源
+zy_notes.link_put("note", BOOK32, "kvgone" + _key0[:10], series_id=99, chapter_id=4242,
+                  annotation_id=None, marktime=1, source="kv", sig="y")
+_r5 = zy_notes.push([99])
+_deleted_keys = [k for _, ks, _t in _DELETED for k in ks]
+check("push 删除只动 kv 来源", _r5["deleted"] == 1 and ("kvgone" + _key0[:10]) in _deleted_keys,
+      _r5)
+check("push 不删 zy 来源", all(not k.startswith("zyorigin") for k in _deleted_keys), _deleted_keys)
+check("push 划线删除用 type=2", all(t == 2 for _, _, t in _DELETED), _DELETED)
+
+# 书签: 字段对齐 APK BookMark 的 6 键
+zy_notes.kavita_annotations = lambda sid: []
+zy_notes.kavita_bookmarks = lambda sid: [{"Id": 7, "Page": 3, "ChapterTitle": "第三章"}]
+_r6 = zy_notes.push([99])
+_mk = (_PUSHED[-1].get("bookmarks") or [{}])[0]
+check("push 书签推上去", _r6["pushed_marks"] == 1, _r6)
+check("bookmarks 字段覆盖 APK 6 项",
+      {"uniquecheck", "marksummary", "markpostion", "markpercent",
+       "markstyle", "marktime"} <= set(_mk), sorted(set(_mk)))
+
+for _n, _v in _orig.items():
+    setattr(zy_notes, _n, _v)
+zy_notes.mapping.all_links = _orig_links
+
 zy_notes.STATE_DB = _real_state
-print("清理临时库:", tmpdir)
+print("清理临时库:", tmpdir2)
 
 print("\nFAIL =", FAIL)
 sys.exit(1 if FAIL else 0)

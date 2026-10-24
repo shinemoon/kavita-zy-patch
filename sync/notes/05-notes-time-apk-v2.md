@@ -416,3 +416,63 @@ data = {"20261024":[{"bid":0,"local_bid":"<32hex>_local",
 1. 用户在 App 里**重新扫码登录** (刷新 zysid), 然后跑 `zync.py notes push --dry-run` 确认能通
 2. 从真机拉一次 `books` 表 (`/data/data/.../zhangyue.db` 的 bookid ↔ 书名) —— 有了它阅时才能书级归属
 3. 笔记下载再测: 换一个新设备 id, 或在真机上"导出笔记"触发一次服务端增量
+
+---
+
+## 8. 2026-10-25: 推送侧照抄 APK + 自动钩子接上划线
+
+### 8.1 push 现在与 APK 的 6 条完全对齐 (`sync/sync/zy_notes.py`)
+
+| APK 依据 | 我们的实现 |
+|---|---|
+| `hg/m.p()` 先 `getUserDataVer?bookids=` 拉云端版本表 | `cloud_versions(book32)` → `{'note': {uniquecheck: marktime}, 'mark': {...}, 'del': set()}`；取不到当空（退化成全量，靠 sig 幂等） |
+| 云端 marktime >= 本地 marktime → 不上传 | 同（`cloud_skip` 计数进 report） |
+| 仅 `code==0` 才算同步成功 | 只有 `code in (0, None)` 才写 `zy_note_link`，失败留待下次 |
+| `BookHighLight.getJSONObject()` 字段 | `uniquecheck/style/color/summary/remark/positionstart/positionend/positionstartl/positionendl/marktime` + idea: `chapterId/chaptername/paragraphId/paragraphOffset/notesType` |
+| `BookMark.getJSONObject()` 字段 | `uniquecheck/marksummary/markpostion/markpercent/markstyle/marktime`（**本轮新增书签推送**，之前只推划线） |
+| 空数组不发 | 空 `booknotes`/`bookmarks` 键直接省略（APK 同样只 put 非空） |
+
+APK 没有的新增（我们这边补的）：
+* `zy_note_link.sig`（v1 迁移自动加列）—— Kavita 侧批注/正文变了才重推；
+  我们本地没有掌阅那张笔记表，光靠 marktime 认不出"内容改了"。
+* **删除只动 `source='kv'` 的行**。旧实现把"本地登记过但本轮没出现在 Kavita 的 key"全推去删，
+  掌阅自己上传的行也被算了进去（会把用户云端笔记删掉）。这是本轮修的 bug。
+
+### 8.2 自动钩子接上（`kavita-zy-patch/src/api_server.py`）
+
+```
+进书   → auto/pull  → pull_once(进度, only_forward) + _time_sync(pull 7天) + _notes_sync(pull)
+存进度 → auto/push  → push_once(进度) + _time_sync(push 今天) + _notes_sync(push)
+```
+
+节流：时长 10 分钟/本，**划线 30 分钟/本**（下载通道贵且怕风控）。
+
+### 8.3 但读通道仍然被挡（这是当前唯一硬限制）
+
+* `getUserDataVer` **正常**：剑来 17 划线 / 3 书签 / delList 8 条；狐 2 划线。
+* `downloadDataV2` **仍然只回 `{"status":0,"msg":"downloadDataProcessNew finished!"}`，没有 `res`**
+  再测 4 种组合（哨兵 md5 / 32hex / 64hex / 带实际 VerList / md5-of-VerList）全部空。
+  `/downloadData` `/downloadDataV3` `/getUserData` 直接 "无效请求"。
+
+所以 `notes pull` 已经在自动钩子里跑，但只能读回"云端有 N 条"（`report["empty"]`），
+**内容拿不到就写不进 Kavita**。api.log 实样：
+
+```
+auto-pull series=26 kavita 49->49/100 updated=1 skipped=0
+time-pull series=26 written=1 skipped=3 mode={'book': 1}
+notes-pull series=26 pushed=0 marks=0 added=0 updated=0 del=0 skip=0 empty=1
+```
+
+### 8.4 写通道现状
+
+仍然 `600001 authority is error!`（连 `books:[]` 空载荷都拒）。协议已经过真机验证
+（插入 1 条成功 + 删除 1 条成功，用户原有 17 条无损），现在只差账号写权限。
+
+**解锁步骤**：App 里重新扫码登录刷新 `zysid` → `python3 zync.py notes push --dry-run`
+看 `would_push` 数量 → 去掉 `--dry-run` 真推。
+
+### 8.5 测试
+
+`tests/test_notes_time.py` 新增 10 项（全 mock，不联网）：
+首轮推 2 条 / booknotes 12 字段 / bookbase 9 字段 / sig 未变不重推 / 批注变了重推 /
+云端更新则不推 / 删除只动 kv 来源 / 不删 zy 来源 / 划线删除 type=2 / 书签 6 字段。全部 PASS。

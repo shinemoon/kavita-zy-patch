@@ -26,6 +26,7 @@ import gzip
 import hashlib
 import io
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -177,6 +178,7 @@ def _conn() -> sqlite3.Connection:
             kavita_annotation_id INTEGER,      -- AppUserAnnotation.Id / AppUserBookmark.Id
             marktime INTEGER DEFAULT 0,
             source TEXT DEFAULT 'zy',          -- zy | kv
+            sig TEXT DEFAULT '',               -- 内容指纹 (summary+remark+位置), 变了才重推
             updated_utc TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (kind, zy_book_id, zy_key)
         );
@@ -203,6 +205,14 @@ def _conn() -> sqlite3.Connection:
             PRIMARY KEY (day, zy_book_id)
         );
     """)
+    # 迁移: 老库没有 sig 列 (2026-10-25 加, 供"内容变了才重推")
+    cols = {r[1] for r in c.execute("PRAGMA table_info(zy_note_link)")}
+    if "sig" not in cols:
+        try:
+            c.execute("ALTER TABLE zy_note_link ADD COLUMN sig TEXT DEFAULT ''")
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
     return c
 
 
@@ -215,21 +225,22 @@ def link_get(kind: str, book32: str, key: str) -> sqlite3.Row | None:
 
 
 def link_put(kind: str, book32: str, key: str, *, series_id: int, chapter_id: int,
-             annotation_id: int | None, marktime: int = 0, source: str = "zy") -> None:
+             annotation_id: int | None, marktime: int = 0, source: str = "zy",
+             sig: str = "") -> None:
     c = _conn()
     c.execute("""
         INSERT INTO zy_note_link (kind, zy_book_id, zy_key, kavita_series_id,
                                   kavita_chapter_id, kavita_annotation_id, marktime,
-                                  source, updated_utc)
-        VALUES (?,?,?,?,?,?,?,?,datetime('now'))
+                                  source, sig, updated_utc)
+        VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))
         ON CONFLICT(kind, zy_book_id, zy_key) DO UPDATE SET
             kavita_series_id=excluded.kavita_series_id,
             kavita_chapter_id=excluded.kavita_chapter_id,
             kavita_annotation_id=excluded.kavita_annotation_id,
-            marktime=excluded.marktime, source=excluded.source,
+            marktime=excluded.marktime, source=excluded.source, sig=excluded.sig,
             updated_utc=datetime('now')
     """, (kind, book32, key, int(series_id), int(chapter_id),
-          annotation_id, int(marktime or 0), source))
+          annotation_id, int(marktime or 0), source, sig or ""))
     c.commit()
     c.close()
 
@@ -677,10 +688,112 @@ def geometry_by_path(path: str) -> zpct.BookGeometry | None:
     return _geo_path_cache[path]
 
 
+# --------------------------------------------------------------------------
+# 上传侧辅助 (照抄 APK: 云端版本表 / 条目字段 / 内容指纹)
+# --------------------------------------------------------------------------
+
+def cloud_versions(book32: str) -> dict[str, dict]:
+    """`getUserDataVer?bookids=` -> 云端版本表 (APK hg/m.p 的输入)。
+
+    返回 {'note': {uniquecheck: marktime}, 'mark': {...}, 'del': set()}
+    取不到 (网络/风控) 一律当空 —— 退化成"全量推", 由 sig 保证幂等。
+    """
+    try:
+        row = data_ver(book32)
+    except Exception:
+        return {"note": {}, "mark": {}, "del": set()}
+
+    def _pick(name: str) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for it in (row.get(name) or []):
+            if not isinstance(it, dict):
+                continue
+            k = it.get("uniquecheck") or it.get("uniquechek")
+            if not k:
+                continue
+            try:
+                out[str(k)] = int(it.get("marktime") or 0)
+            except (TypeError, ValueError):
+                out[str(k)] = 0
+        return out
+
+    return {"note": _pick("booknotesVerList"), "mark": _pick("bookmarksVerList"),
+            "del": {str(x) for x in (row.get("delList") or [])}}
+
+
+def _sig(kind: str, key: str, text: str, remark: str) -> str:
+    """内容指纹: 位置 + 正文 + 批注。变了才重推 (APK 靠本地 DB 的 marktime, 我们没本地副本)。"""
+    h = hashlib.sha1()
+    for part in (kind, key, text or "", remark or ""):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def _idea_fields(epub: str, geo: zpct.BookGeometry, g: int) -> dict:
+    """APK BookHighLight 的 idea 字段: chapterId / chaptername / paragraphId /
+    paragraphOffset / notesType。缺了只影响掌阅端"想法"卡片展示, 不影响划线本身。"""
+    out: dict[str, Any] = {}
+    try:
+        ch, off = geo.locate(g)
+    except Exception:
+        return out
+    out["chapterId"] = int(ch)          # 0 基, 与 position 的 f2 同源
+    out["notesType"] = 2                # APK isPrivate(): 2 = 仅自己可见
+    try:
+        name = geo.spine[int(ch)]
+        out["chaptername"] = Path(name).stem
+    except Exception:
+        pass
+    raw = _doc_raw(epub, int(ch))
+    if not raw:
+        return out
+    try:
+        di = zpct.DocIndex(raw)
+        xp = di.xpath_of_offset(int(off)) or ""
+        m = re.search(r"/[a-zA-Z]+\[(\d+)\]$", xp)
+        if m:
+            out["paragraphId"] = float(m.group(1))
+            start = di.offset_of_xpath(xp)
+            out["paragraphOffset"] = int(max(0, int(off) - int(start)))
+    except Exception:
+        pass
+    return out
+
+
+def _page_start_bytes(link: mapping.BookLink, geo: zpct.BookGeometry, page: int) -> int | None:
+    """Kavita 页号 -> 原书全局字节偏移 (书签定位用)。
+
+    切片版走 sidecar (页 == 切片页); 原书直接进库的 (图片书) 页号 = spine 下标。
+    """
+    sc = kpages.load(link.kavita_series_id)
+    try:
+        if sc:
+            return int(kpages.bytes_of_page(sc, int(page)))
+        idx = min(max(int(page) - 1, 0), len(geo.spine) - 1)
+        return int(geo.prefix_bytes(idx))
+    except Exception:
+        return None
+
+
 def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
-    """Kavita -> 掌阅: 把 Kavita 里**非掌阅来源**的划线/注释推上去。"""
-    report: dict[str, Any] = {"books": [], "pushed": 0, "skipped": 0,
-                              "deleted": 0, "errors": []}
+    """Kavita -> 掌阅: 划线 / 书签 增量推。照抄 APK hg/m.p() 的合并语义。
+
+    与 APK 对齐的 6 条:
+      1. 先 `getUserDataVer?bookids=` 拿云端版本表 (uniquecheck -> marktime)
+      2. **云端 marktime >= 本地 marktime → 不推** (本地较新者胜)
+      3. 只在 `code==0` 后写本地 link 表 (失败留着重试, 下次仍算"本地较新")
+      4. booknotes 条目字段与 APK `BookHighLight.getJSONObject()` 一致
+         (uniquecheck/style/color/summary/remark/positionstart/positionend/
+          positionstartl/positionendl/marktime + idea: chapterId/chaptername/
+          paragraphId/paragraphOffset/notesType)
+      5. 书签走 APK `BookMark.getJSONObject()` 的 6 个键
+         (uniquecheck/marksummary/markpostion/markpercent/markstyle/marktime)
+      6. 删除走 delMarkOrNote (APK CLOUD_DEL), 且**只删本地登记为 kv 来源**的行 ——
+         绝不动掌阅自己上传的 (旧版会把 source=zy 的行当"已删除"推回云端删掉)
+    """
+    report: dict[str, Any] = {"books": [], "pushed": 0, "pushed_marks": 0, "skipped": 0,
+                              "deleted": 0, "errors": [], "cloud_skip": 0}
     links = [l for l in mapping.all_links() if not series_ids or l.kavita_series_id in series_ids]
     for link in links:
         epub = _orig_epub(link)
@@ -689,10 +802,25 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             report["books"].append({"series": link.kavita_series_id, "skip": "no_geometry"})
             continue
         book32 = kb32(link.zy_book_id)
-        anns = kavita_annotations(link.kavita_series_id)
+        total_bytes = max(1, geo.total_bytes)
+        cloud = cloud_versions(book32)
         known = {(r["kind"], r["zy_key"]): r for r in links_for_series(link.kavita_series_id)}
-        out_notes, st = [], []
-        for a in anns:
+        idx_row = {}
+        try:
+            for row in notebooks():
+                if str(row.get("bookid", "")).lower() == book32:
+                    idx_row = row
+                    break
+        except Exception:
+            pass
+
+        out_notes: list[dict] = []
+        out_marks: list[dict] = []
+        st: list[tuple[str, str, str, int, int | None]] = []   # kind,key,sig,marktime,ann_id
+        ann_keys: set[str] = set()          # Kavita 侧仍然是活的 key (用于判删除)
+
+        # --- 划线
+        for a in kavita_annotations(link.kavita_series_id):
             text = (a.get("SelectedText") or "").strip()
             if not text:
                 report["skipped"] += 1
@@ -704,74 +832,124 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             ps = global_to_pos(geo, g)
             pe = global_to_pos(geo, g + len(text.encode("utf-8")))
             key = note_key(book32, ps, pe)
-            row = known.get(("note", key))
-            marktime = int(time.time() * 1000)
-            if row and row["source"] == "zy":
-                report["skipped"] += 1          # 掌阅自己上传的, 不回灌
+            ann_keys.add(key)
+            if key in {it["uniquecheck"] for it in out_notes}:
+                report["skipped"] += 1        # 同书同选区重复标注 -> 一条
                 continue
-            if row and int(row["marktime"] or 0) >= int(marktime // 1000) * 1000:
+            remark = (a.get("CommentPlainText") or "").strip()
+            sig = _sig("note", key, text, remark)
+            row = known.get(("note", key))
+            if row is not None and row["source"] == "zy":
+                report["skipped"] += 1        # 掌阅自己上传的, 不回灌
+                continue
+            if row is not None and (row["sig"] or "") == sig:
+                report["skipped"] += 1        # 内容没变, 不重推
+                continue
+            marktime = int(time.time() * 1000)
+            ck = cloud["note"].get(key)
+            if ck is not None and row is not None and ck >= int(row["marktime"] or 0):
+                report["cloud_skip"] += 1     # 云端不比本地旧
+                continue
+            item = {"uniquecheck": key, "style": 0, "color": DEFAULT_COLOR,
+                    "summary": text, "remark": remark,
+                    "positionstart": ps, "positionend": pe,
+                    "positionstartl": 0, "positionendl": 0,
+                    "marktime": marktime}
+            item.update(_idea_fields(epub, geo, g))
+            out_notes.append(item)
+            st.append(("note", key, sig, marktime, int(a.get("Id") or 0) or None))
+
+        # --- 书签
+        mark_keys: set[str] = set()
+        for b in kavita_bookmarks(link.kavita_series_id):
+            g = _page_start_bytes(link, geo, int(b.get("Page") or 0))
+            if g is None:
                 report["skipped"] += 1
                 continue
-            out_notes.append({
-                "uniquecheck": key, "style": 0, "color": DEFAULT_COLOR,
-                "summary": text, "remark": (a.get("CommentPlainText") or ""),
-                "positionstart": ps, "positionend": pe,
-                "positionstartl": 0, "positionendl": 0,
-                "marktime": marktime,
-            })
-            st.append((key, a.get("Id"), marktime))
+            pos = global_to_pos(geo, g)
+            key = mark_key(book32, pos)
+            mark_keys.add(key)
+            sig = _sig("mark", key, "", "")
+            row = known.get(("bookmark", key))
+            if row is not None and row["source"] == "zy":
+                report["skipped"] += 1
+                continue
+            if row is not None and (row["sig"] or "") == sig:
+                report["skipped"] += 1
+                continue
+            marktime = int(time.time() * 1000)
+            ck = cloud["mark"].get(key)
+            if ck is not None and row is not None and ck >= int(row["marktime"] or 0):
+                report["cloud_skip"] += 1
+                continue
+            out_marks.append({"uniquecheck": key,
+                              "marksummary": (b.get("ChapterTitle") or "").strip(),
+                              "markpostion": pos,
+                              "markpercent": round(g / total_bytes, 8),
+                              "markstyle": 0, "marktime": marktime})
+            st.append(("bookmark", key, sig, marktime, int(b.get("Id") or 0) or None))
 
-        # --- 本地已登记但 Kavita 里已删除 -> 从云端删
-        alive = {k for k, _ in known.items() if k[0] == "note"}
-        del_keys = [k[1] for k in alive if k[1] not in {s[0] for s in st}]
+        # --- 删除: 只处理 kv 来源 (Kavita 那边已经没有这条了)
+        del_notes = [r["zy_key"] for r in links_for_series(link.kavita_series_id, "note")
+                     if (r["source"] or "") == "kv" and r["zy_key"] not in ann_keys]
+        del_marks = [r["zy_key"] for r in links_for_series(link.kavita_series_id, "bookmark")
+                     if (r["source"] or "") == "kv" and r["zy_key"] not in mark_keys]
 
         if dry_run:
             report["pushed"] += len(out_notes)
-            report["deleted"] += len(del_keys)
+            report["pushed_marks"] += len(out_marks)
+            report["deleted"] += len(del_notes) + len(del_marks)
             report["books"].append({"series": link.kavita_series_id,
-                                    "would_push": len(out_notes), "would_delete": len(del_keys)})
+                                    "would_push": len(out_notes),
+                                    "would_push_marks": len(out_marks),
+                                    "would_delete": len(del_notes) + len(del_marks),
+                                    "cloud_known": {"notes": len(cloud["note"]),
+                                                    "marks": len(cloud["mark"])}})
             continue
-        if out_notes:
-            idx_row = {}
-            try:
-                for row in notebooks():
-                    if str(row.get("bookid", "")).lower() == book32:
-                        idx_row = row
-                        break
-            except Exception:
-                pass
-            payload = {"bookbase": {
+
+        # --- 上传 (一本书一个 payload; 空数组按 APK 习惯省略)
+        if out_notes or out_marks:
+            payload: dict[str, Any] = {"bookbase": {
                 "name": idx_row.get("name") or link.zy_book_name,
                 "type": int(idx_row.get("type") or 5),
                 "readpostion": idx_row.get("readpostion") or "",
                 "readpercent": idx_row.get("readpercent") or 0,
-                "bookid": book32, "updatetime": int(time.time() * 1000),
+                "bookid": book32,
+                "updatetime": int(time.time() * 1000),
                 "deviceName": "KavitaBridge",
-                "marknum": int(idx_row.get("marknum") or 0),
-                "notenum": int(idx_row.get("notenum") or 0) + len(out_notes)},
-                "booknotes": out_notes, "bookmarks": [], "bookScaleNotes": [], "delList": []}
+                "marknum": int(idx_row.get("marknum") or 0) + len(out_marks),
+                "notenum": int(idx_row.get("notenum") or 0) + len(out_notes)}}
+            if out_marks:
+                payload["bookmarks"] = out_marks
+            if out_notes:
+                payload["booknotes"] = out_notes
             try:
                 res = upload(payload)
                 if res.get("code") not in (0, None):
                     report["errors"].append(f"upload {book32}: {res}")
                 else:
-                    for key, ann_id, mt in st:
-                        link_put("note", book32, key, series_id=link.kavita_series_id,
-                                 chapter_id=_chapter_id_for(link), annotation_id=ann_id,
-                                 marktime=mt, source="kv")
+                    for kind, key, sig, mt, ann_id in st:
+                        link_put(kind, book32, key, series_id=link.kavita_series_id,
+                                 chapter_id=_chapter_id_for(link),
+                                 annotation_id=ann_id, marktime=mt, source="kv", sig=sig)
                     report["pushed"] += len(out_notes)
+                    report["pushed_marks"] += len(out_marks)
             except Exception as e:
                 report["errors"].append(f"upload {book32}: {e}")
-        if del_keys:
+        # --- 删除 (delMarkOrNote: 划线 type=2 / 书签 type=1)
+        for keys, kind, type_ in ((del_notes, "note", 2), (del_marks, "bookmark", 1)):
+            if not keys:
+                continue
             try:
-                delete_items(book32, del_keys, type_=2)
-                for k in del_keys:
-                    link_delete("note", book32, k)
-                report["deleted"] += len(del_keys)
+                delete_items(book32, keys, type_=type_)
+                for k in keys:
+                    link_delete(kind, book32, k)
+                report["deleted"] += len(keys)
             except Exception as e:
                 report["errors"].append(f"delMarkOrNote {book32}: {e}")
         report["books"].append({"series": link.kavita_series_id,
-                                "pushed": len(out_notes), "deleted": len(del_keys)})
+                                "pushed": len(out_notes), "pushed_marks": len(out_marks),
+                                "deleted": len(del_notes) + len(del_marks)})
     return report
 
 
