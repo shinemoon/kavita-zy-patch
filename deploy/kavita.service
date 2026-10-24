@@ -1,24 +1,39 @@
 [Unit]
-Description=Kavita (docker compose, system-level)
+Description=Kavita (docker compose, system-level, self-healing)
+Documentation=https://wiki.kavitareader.com
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+# 容器反复起不来时不放弃 (2026-10-24 起用, Type=simple 的 restart 循环必须关掉这个限制,
+# 否则 5 次失败后 systemd 永久放弃, 又回到"只能人工 restart"的老路)
+StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+# ---------------------------------------------------------------------------
+# 为什么是 Type=simple + docker wait 而不是 oneshot + RemainAfterExit:
+#
+#   oneshot 只在 ExecStart 那一刻起容器, 之后容器被谁停掉/删掉 systemd 都不知道。
+#   2026-10-23/24 的多次掉线 (01:40 停 8 小时, 12:39 停 2.5 小时) 都是这样
+#   —— 容器被 `docker compose down` 删掉或 `docker stop` 停掉, 单元停在
+#   active (exited) 状态, 看起来"正常", 实际服务没了。
+#
+#   Type=simple + `docker wait` 让 systemd 的 main 进程一直挂到容器退出。
+#   容器以任何方式消失 (stop / rm / 崩溃 / compose down) → wait 返回 → 主进程退出
+#   → Restart=always 10 秒后重跑 ExecStart → `compose up -d` 把容器重新拉起来
+#   (容器被删了就重建)。这才是真正的秒级自愈, 不再依赖 heal 的 1~3 分钟巡检。
+# ---------------------------------------------------------------------------
+Type=simple
 WorkingDirectory=/vol1/1001/APPS/kavita
-ExecStart=/usr/bin/docker compose up -d
-# 关键: 用 stop 而不是 down。
-# down 会把容器**删掉** —— 一旦 ExecStart 那次 up 失败 (端口未释放 / 挂载源不可用 /
-# 超过 TimeoutStartSec 被 kill), keep 下来的是"容器不存在", `docker start` 永远报
-# No such container, systemd 也不会重试 (oneshot + RemainAfterExit), 只能人工
-# systemctl restart。2026-10-24 12:39 就是这么掉的, 停了 2.5 小时。
-# stop 只停不删, 任何一次没起来的 start 都能被 heal 用 docker start / compose up 救回。
-ExecStop=/usr/bin/docker compose stop
+ExecStart=/bin/bash -c '/usr/bin/docker compose up -d --remove-orphans && exec /usr/bin/docker wait kavita'
+# 停容器用 stop, 绝不用 down (down 会删容器, 见 install-system-unit.sh 注释)
+# 顺便把"谁触发了 ExecStop"写进 trace, 便于定位外部 stop 来源 (journald 对 claud 不可读)
+ExecStop=/bin/bash -c 'printf "%s ExecStop pid=%s pstree=%s\n" "$(date -Is)" "$$" "$(ps -o args= -p $PPID 2>/dev/null | tr "\n" " ")" >> /vol2/1001/kavita-zy-patch/state/logs/kavita-stop-trace.log; /usr/bin/docker compose stop'
 ExecReload=/usr/bin/docker compose restart
-TimeoutStartSec=300
+Restart=always
+RestartSec=10
 TimeoutStopSec=120
+# stop 时只给主进程发信号, 由 ExecStop 去停容器, 避免把 docker CLI 一起打断
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

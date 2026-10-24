@@ -10,6 +10,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -55,10 +56,15 @@ def proc_scan():
                         raw = f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
                 except Exception:
                     continue
-                if "docker" not in raw and "compose" not in raw:
-                    continue
+                # 2026-10-24: 除 docker 命令外, 也抓 systemctl / 进程终止工具。
+                # kavita.service 的 ExecStop 会执行 compose stop/down, 所以外部
+                # `systemctl stop|restart kavita` 是容器消失的头号嫌疑。
                 low = f" {raw} "
-                if any(k in low for k in bad):
+                is_docker = ("docker" in raw or "compose" in raw) and any(k in low for k in bad)
+                is_systemctl = any(k in raw for k in ("systemctl", "service ")) and "kavita" in raw \
+                    and any(k in low for k in (" stop", " restart", " try-restart", " reload", " disable"))
+                is_term = bool(re.match(r"^\s*(sudo\s+)?(p?)kill\b", raw))
+                if is_docker or is_systemctl or is_term:
                     info = sh(f"ps -o pid,ppid,user,etimes,args= -p {pid} 2>/dev/null; "
                               f"cat /proc/{pid}/environ 2>/dev/null | tr '\\0' '\\n' | grep -E '^(PWD|DOCKER_HOST)=' ")
                     log(WATCH, f"命中可疑 docker 命令 pid={pid}: {raw[:200]}\n{info.strip()}")
@@ -95,6 +101,40 @@ def state():
     return out.strip()
 
 
+# ---- 秒级自愈 ------------------------------------------------------------
+# 2026-10-24: 容器一天里被停/删三次 (01:40 停 8 小时, 12:39 停 2.5 小时),
+# 每次都要人工 systemctl restart。heal.sh 的 cron 粒度是 1 分钟, 这里做到 5 秒级:
+# 容器一消失就先取证快照, 再按同一套路径 (compose up -d / docker start) 拉回。
+HEAL_ENABLED = os.environ.get("ZY_WATCH_HEAL", "1") != "0"
+_last_heal = 0.0
+
+
+def unit_inactive():
+    """kavita.service 被人为 stop 时不要自作主张 (跟 heal.sh 同一道闸)。"""
+    return sh("systemctl is-active kavita.service 2>/dev/null").strip() == "inactive"
+
+
+def recover(kind):
+    global _last_heal
+    now = time.time()
+    if now - _last_heal < 60:
+        return
+    _last_heal = now
+    if unit_inactive():
+        log(WATCH, "kavita.service 处于 inactive (人为停止), 跳过自愈")
+        return
+    if kind == "missing":
+        out = sh(f"cd {COMPOSE_DIR} && docker compose up -d 2>&1", timeout=180)
+        log(WATCH, f"自愈(compose 重建) -> {out.strip()[:300]}")
+    else:
+        out = sh(f"docker start {CONTAINER} 2>&1", timeout=180)
+        log(WATCH, f"自愈(docker start) -> {out.strip()[:300]}")
+        if "No such" in out or "Error" in out:
+            out = sh(f"cd {COMPOSE_DIR} && docker compose up -d 2>&1", timeout=180)
+            log(WATCH, f"自愈(回退 compose 重建) -> {out.strip()[:300]}")
+
+
+
 def snapshot(reason):
     """容器消失/状态突变时, 把可能相关的现场全抓下来。"""
     log(WATCH, f"---- 现场快照 ({reason}) ----")
@@ -113,7 +153,8 @@ def main():
     prev = None
     while True:
         cur = state()
-        if cur != prev:
+        changed = cur != prev
+        if changed:
             if prev is not None:
                 log(WATCH, f"状态变化 {prev!r} -> {cur!r}")
                 if "No such object" in cur or "No such" in cur:
@@ -121,6 +162,11 @@ def main():
                 elif "exited" in cur or "created" in cur:
                     snapshot("容器停止")
             prev = cur
+        if HEAL_ENABLED:
+            if "No such" in cur:
+                recover("missing")
+            elif "exited" in cur or "created" in cur or "dead" in cur:
+                recover("stopped")
         time.sleep(5)
 
 
