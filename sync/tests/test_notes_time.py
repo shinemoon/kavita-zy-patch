@@ -311,6 +311,35 @@ check("bookmarks 字段覆盖 APK 6 项",
       {"uniquecheck", "marksummary", "markpostion", "markpercent",
        "markstyle", "marktime"} <= set(_mk), sorted(set(_mk)))
 
+# URL 拼装: path 自带查询串 (如 /uploadData?isCheck=1) 时必须用 & 续接,
+# 否则拼成 "...?isCheck=1?usr=..&zysid=.." -> usr/zysid 全丢 -> 600001 authority is error
+_urls = []
+_orig_urlopen = zy_notes.urllib.request.urlopen
+
+
+class _FakeResp:
+    def read(self):
+        return b'{"code":0}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_urlopen(req, timeout=0):
+    _urls.append(req.full_url)
+    return _FakeResp()
+
+
+zy_notes.urllib.request.urlopen = _fake_urlopen
+try:
+    zy_notes._call("/uploadData?isCheck=1", {"usr": "u", "books": []})
+finally:
+    zy_notes.urllib.request.urlopen = _orig_urlopen
+check("uploadData URL 用 & 续接 (不出现双问号)", bool(_urls) and "?isCheck=1&" in _urls[0], _urls)
+
 for _n, _v in _orig.items():
     setattr(zy_notes, _n, _v)
 zy_notes.mapping.all_links = _orig_links

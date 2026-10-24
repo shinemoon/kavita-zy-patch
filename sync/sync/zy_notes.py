@@ -193,7 +193,11 @@ def _call(path: str, body: dict | None = None, extra: dict | None = None,
     data = None
     if body is not None:
         data = gzip.compress(json.dumps(body, ensure_ascii=False).encode("utf-8"))
-    req = urllib.request.Request(f"{NOTE_BASE}{path}?{qs}", data=data,
+    # path 自己可能带查询串 (如 "/uploadData?isCheck=1"), 这时必须用 & 续接,
+    # 否则拼出 "...?isCheck=1?usr=..." -> 服务端只看到 isCheck="1?usr=...",
+    # usr/zysid 全丢 -> 一律回 600001 authority is error (2026-10-24 踩过)
+    sep = "&" if "?" in path else "?"
+    req = urllib.request.Request(f"{NOTE_BASE}{path}{sep}{qs}", data=data,
                                  method="POST" if data else "GET")
     if data:
         req.add_header("Content-Type", "application/octet-stream")
