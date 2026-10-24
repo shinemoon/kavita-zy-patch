@@ -21,7 +21,9 @@ APK 依据见 notes/05-notes-time-apk-v2.md §2。要点:
     d = 1440 分钟位图, 位下标 = hour*60+minute-1, **字节内 LSB 优先**
     sign 服务端不校验
     **只能写"当天"**: data 的日期 key 和 body.timestamp 都不决定归属,
-    实测传 20261020/20261021 都落到上传当天 -> 历史回填协议层不可能。
+    实测传 20261017 / 20261022 / 20261023 都落到上传当天; 传 20261025 (未来) 静默丢弃。
+    (APK 其实支持多天重传: ReadTimeInfo 每书每天一条, 30 天内累计后按日期分组上传;
+     所以这条限制在服务端, 不在客户端。详见 notes/05 §2.5 的对照实验。)
     服务端按分钟求并集 -> 同一天重复推幂等。
 
 Kavita 侧: AppUserReadingSession + AppUserReadingSessionActivityData(SeriesId)。
@@ -441,8 +443,11 @@ def push(day: date, *, dry_run: bool = False,
     """把 Kavita 当天的会话时长写进掌阅 (分钟位图)。
 
     **只能写当天** (2026-10-24 实测): 服务端按"收到请求的那一天"归日,
-    data 里的日期 key 与 body.timestamp 都不影响归属 —— 传 20261020/20261021
-    的数据全都落到上传当天。所以历史回填在协议层就不可能, 必须当天推。
+    data 里的历史日期 key 与 body.timestamp 都不影响归属 —— 传 20261017/20261022/20261023
+    的数据全都落到上传当天, 传未来日期 (20261025) 则静默丢弃。
+    (APK 侧 `od/a.I()` 确实会按 mFormatDate 分组上传多天, 30 天内的失败行累计后重传,
+     见 notes/05 §2.5 —— 因此这是服务端行为, 不是客户端不会。) 历史回填在展示层无效,
+    必须当天推; 真机飞行模式实验能最终定性 (notes/05 §2.5 末)。
 
     服务端按分钟位图求并集 → 同一天重复推同一批分钟不会翻倍 (幂等),
     可以按小时/按需增量重推。
@@ -451,7 +456,7 @@ def push(day: date, *, dry_run: bool = False,
                               "skipped": 0, "errors": []}
     if day != date.today():
         report["errors"].append(
-            f"skip {day}: 掌阅只接受上传当天 (服务端按收到日归日), 见 notes/05 §2.4")
+            f"skip {day}: 掌阅按收到日归日, 只接受上传当天, 见 notes/05 §2.5")
         return report
     links = [l for l in mapping.all_links() if not series_ids or l.kavita_series_id in series_ids]
     items = []
