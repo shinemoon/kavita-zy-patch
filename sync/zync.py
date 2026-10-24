@@ -76,17 +76,22 @@ def cmd_notes(args):
 
 
 def cmd_time(args):
-    from datetime import date
+    from datetime import date, timedelta
     from sync import zy_time
+    today = date.today()
+    day = date.fromisoformat(args.day) if args.day else today
+    start = date.fromisoformat(args.start) if args.start else today - timedelta(days=6)
+    end = date.fromisoformat(args.end) if args.end else today
+    sids = args.series or None
     if args.action == "push":
-        out = zy_time.push(date.fromisoformat(args.day), dry_run=args.dry_run)
+        out = zy_time.push(day, dry_run=args.dry_run, series_ids=sids)
     elif args.action == "pull":
-        out = zy_time.pull(date.fromisoformat(args.start), date.fromisoformat(args.end),
-                           dry_run=args.dry_run)
+        out = zy_time.pull(start, end, dry_run=args.dry_run, series_ids=sids)
     else:
-        out = zy_time.sync(date.fromisoformat(args.day), dry_run=args.dry_run)
+        out = {"pull": zy_time.pull(start, end, dry_run=args.dry_run, series_ids=sids),
+               "push": zy_time.push(day, dry_run=args.dry_run, series_ids=sids)}
     print(json.dumps(out, ensure_ascii=False, indent=1))
-    return 0 if not out.get("errors") else 1
+    return 0 if not json.dumps(out).count('"errors": [') else 1
 
 
 def main(argv=None):
@@ -135,6 +140,8 @@ def main(argv=None):
     p_tm.add_argument("--day", default=None, help="push 用: YYYY-MM-DD (默认今天)")
     p_tm.add_argument("--start", default=None, help="pull 用: 起始日")
     p_tm.add_argument("--end", default=None, help="pull 用: 结束日")
+    p_tm.add_argument("--series", type=int, action="append", default=[],
+                      help="只处理这些 Kavita series id (可多次)")
     p_tm.add_argument("--dry-run", action="store_true")
     p_tm.set_defaults(func=cmd_time)
 
