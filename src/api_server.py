@@ -283,6 +283,9 @@ def api_auto_hb(body: dict) -> dict:
 _TIME_LAST: dict[tuple[str, int], float] = {}
 _TIME_GAP = 600.0        # 同一本书 10 分钟内只同步一次时长 (避免每次存进度都打接口)
 
+_NOTES_LAST: dict[tuple[str, int], float] = {}
+_NOTES_GAP = 1800.0      # 划线/书签 30 分钟一本 (下载通道贵, 且怕风控)
+
 
 def _time_sync(kind: str, sid: int, quiet: bool = True) -> dict:
     """顺手做阅读时长同步 (失败不影响进度同步)。
@@ -318,6 +321,41 @@ def _time_sync(kind: str, sid: int, quiet: bool = True) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def _notes_sync(kind: str, sid: int, quiet: bool = True) -> dict:
+    """顺手做划线/书签同步 (失败不影响进度同步)。
+
+    pull: 掌阅 -> Kavita (getUserNotebooks + downloadDataV2 + 位置映射写 AppUserAnnotation)
+    push: Kavita -> 掌阅 (照抄 APK: getUserDataVer 增量 + 本地较新者胜)
+    节流: pull 30 分钟 / push 15 分钟一本 (下载/上传都不便宜, 且怕风控)
+    """
+    import time as _t
+    key = (kind, sid)
+    now = _t.monotonic()
+    if now - _NOTES_LAST.get(key, 0.0) < _NOTES_GAP:
+        return {"skipped": "throttled"}
+    p = str(Path(BRIDGE_ROOT) / "sync")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    try:
+        from sync import zy_notes                     # noqa: E402
+        res = (zy_notes.pull if kind == "pull" else zy_notes.push)([sid])
+        touched = (res.get("added") or 0) + (res.get("updated") or 0) + \
+                  (res.get("pushed") or 0) + (res.get("pushed_marks") or 0) + \
+                  (res.get("deleted") or 0)
+        if (not quiet) or touched or res.get("errors") or res.get("empty"):
+            log(f"notes-{kind} series={sid} pushed={res.get('pushed') or 0} "
+                f"marks={res.get('pushed_marks') or 0} added={res.get('added') or 0} "
+                f"updated={res.get('updated') or 0} del={res.get('deleted') or 0} "
+                f"skip={res.get('skipped') or 0} empty={len(res.get('empty') or [])}"
+                + (f" errors={res.get('errors')}" if res.get("errors") else ""))
+        _NOTES_LAST[key] = now
+        return res
+    except Exception as e:
+        _NOTES_LAST[key] = now
+        log(f"notes-{kind} series={sid} fail: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def api_auto_pull(body: dict) -> dict:
     """掌阅 → Kavita, 单本。
 
@@ -345,9 +383,10 @@ def api_auto_pull(body: dict) -> dict:
     log(f"auto-pull series={sid} kavita {before}->{after}/{total} "
         f"updated={res.get('updated')} skipped={res.get('skipped')}")
     time_res = _time_sync("pull", sid)
+    notes_res = _notes_sync("pull", sid)
     return {"ok": True, "series_id": sid, "changed": changed,
             "pages_read": after, "pages": total,
-            "before": before, "detail": res, "time": time_res}
+            "before": before, "detail": res, "time": time_res, "notes": notes_res}
 
 
 def api_auto_push(body: dict) -> dict:
@@ -377,7 +416,9 @@ def api_auto_push(body: dict) -> dict:
             + (" (tick)" if quiet else "")
             + _push_brief(res))
     time_res = _time_sync("push", sid, quiet)
-    return {"ok": True, "series_id": sid, "detail": res, "time": time_res}
+    notes_res = _notes_sync("push", sid, quiet)
+    return {"ok": True, "series_id": sid, "detail": res, "time": time_res,
+            "notes": notes_res}
 
 
 def _push_brief(res: dict) -> str:
