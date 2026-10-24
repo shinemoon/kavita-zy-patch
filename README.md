@@ -193,6 +193,62 @@ sudo bash /vol2/1001/kavita-zy-patch/deploy/uninstall-autostart.sh
 > 面板没有免密 sudo 时，「装自启 (systemd)」会失败并把命令原样回显；
 > 「装自启 (免 root)」不需要 root，点了就生效。
 
+## 容器没了 / kavita 服务"老是掉"（2026-10-24）
+
+现象：Kavita 突然打不开，`systemctl status kavita` 还是 `active (exited)`，
+heal 日志每 30s 一句 `FAIL 容器启动失败: ... No such container: kavita`，
+只能自己 `sudo systemctl restart kavita.service` 才回来。
+
+链条（从 Kavita 自己的 `config/logs/kavita*.log` 逐次对出来的）：
+
+1. 容器收到**优雅 SIGTERM**（日志写 `Application is shutting down...`）——
+   也就是有人 `docker stop` / `docker compose down`，不是崩溃、不是 OOM。
+2. 容器随后被**删除**。`kavita.service` 的 `ExecStop` 原来是 `docker compose down`，
+   而它是 `Type=oneshot` + `RemainAfterExit=yes`：只要那次 `ExecStart`（`compose up -d`）
+   没成功（端口没释放 / 挂载源不可用 / 超 `TimeoutStartSec` 被 kill），
+   留下的就是"容器不存在"，systemd **不会再试**。
+3. 老 heal 只会 `docker start`，对已删容器永远 `No such container`，
+   所以一掉就是几小时（实测 01:40→09:49、12:39→15:05 两段）。
+
+现在的处理：
+
+| 改了什么 | 效果 |
+|---|---|
+| `deploy/heal.sh`：容器不存在 → `docker compose up -d` 重建 | 最多 ~1 分钟自愈（cron 每分钟）；实测 `compose down` 后 heal 20s 内健康 |
+| heal 判定改用 `ctr_state()`（`docker ps -a` 查存在性） | 老写法 `inspect ... \|\| echo missing` 会拼出 `"\nmissing"`，永远判不出"不存在" |
+| `kavita.service`：`ExecStop=docker compose stop`（不再 `down`） | `systemctl stop/restart kavita` 不再删容器，失败的 up 也能被 `docker start` 救 |
+| `kavita.service` 里的人为 stop 闸门 | `systemctl stop kavita` 后 heal **不会**又把容器拉起来 |
+| `deploy/watch-kavita.py` 取证 | 逐秒扫 `/proc` + 录 `docker events`，谁执行 `docker rm/down/prune` 会连 pid/ppid/user/PWD 一起落到 `state/logs/kavita-watch.log` |
+
+unit 文件换成新的（**需要 root**）：
+
+```bash
+sudo bash /vol1/1001/APPS/kavita/install-system-unit.sh    # 会备份旧 unit
+```
+
+装好之后 `systemctl restart kavita` 最多只会让容器"停"，不会让它"消失"；
+真消失了，heal 也会在一分钟内按 compose 重建（容器数据在 `/vol1/1001/APPS/kavita`
+卷里，重建不动数据）。
+
+取证脚本（可选，常驻更省事）：
+
+```bash
+cd /vol2/1001/kavita-zy-patch
+setsid python3 deploy/watch-kavita.py > state/logs/kavita-watch.out 2>&1 < /dev/null &
+tail -f state/logs/kavita-watch.log     # 状态突变 + 可疑 docker 命令 + 现场快照
+tail -f state/logs/kavita-events.log    # die/destroy 事件流 (带 exitCode/signal)
+```
+
+## 端口：只需要暴露 5000 和 5012
+
+前端补丁探测顺序是 **① 同源 `/zy/api`**（需要 nginx 之类反代，Kavita 自己没有）
+→ **② `http://<同一个 host>:5012/zy/api`**（5012 会反代到 5111）→ ③ 直连 `:5111`。
+
+所以公网只要放行 **5000（Kavita 本体）+ 5012（控制台/API 反代）** 就够了，
+`5111` 是内网后端，不需要单独映射；日志里出现的 `:5111` 探测失败不影响功能。
+另外 `location.protocol` 是 `https:` 时只会走 ① —— 若哪天上了 https 域名，
+要么给 5012 也套 TLS，要么加同源反代。
+
 ## 常用命令
 
 ```bash

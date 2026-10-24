@@ -138,10 +138,58 @@ notice_once() {   # $1=key $2=message   ($1 作为去重键; 30 分钟窗口)
   log "$msg"
 }
 
-running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo missing)"
-if [ "$running" = "missing" ]; then
-  notice_once "missing-$CONTAINER" "FAIL 容器 $CONTAINER 不存在"
-  problems=$((problems + 1))
+recreate_container() {   # 容器被删时唯一的复原手段
+  local out
+  out="$(cd "${COMPOSE_DIR:-/vol1/1001/APPS/kavita}" && docker compose up -d 2>&1)"
+  if [ $? -eq 0 ]; then
+    log "OK 容器已按 compose 重建"
+    note_action "recreate-container"
+    return 0
+  fi
+  notice_once "recreatefail-$CONTAINER" \
+    "FAIL 容器重建失败: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+  return 1
+}
+
+# 容器状态: missing / true / false
+# 注意别写 inspect ... || echo missing —— 对象不存在时 inspect 会先吐一个空行,
+# 拼出来是 "\nmissing", 跟 "missing" 永远不相等 (2026-10-24 踩过, 导致
+# "容器被删" 一直被当成 "容器停止", 只会 docker start 然后失败)。
+ctr_state() {
+  local names out
+  names="$(docker ps -a --filter "name=^${CONTAINER}$" --format '{{.Names}}' 2>/dev/null)"
+  [ -z "$names" ] && { echo missing; return; }
+  out="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | tr -d '[:space:]')"
+  echo "${out:-false}"
+}
+
+# kavita.service 被人为 stop 时 (inactive), 不要自作主张把容器拉回来。
+# 故障态下 unit 是 active(exited), 所以这道闸不会影响真正的自愈。
+ctr_allowed=yes
+if unit_exists kavita.service; then
+  case "$(systemctl is-active kavita.service 2>/dev/null)" in
+    inactive)
+      ctr_allowed=no
+      notice_once "ctr-skip" "kavita.service 处于 inactive (人为停止), 跳过容器恢复" ;;
+  esac
+fi
+
+running="$(ctr_state)"
+if [ "$ctr_allowed" = "no" ]; then
+  :   # 容器这块不动, 也不计入故障
+elif [ "$running" = "missing" ]; then
+  # 2026-10-24: 容器多次被**删掉** (12:40 那次持续 2.5 小时), 而这里以前只记一句
+  # "不存在" 就返回 → 用户只能手动 systemctl restart。
+  # docker start 救不了已删容器, 必须 compose up 重建。
+  log "WARN 容器 $CONTAINER 不存在, 按 compose 重建"
+  if recreate_container; then
+    for _ in 1 2 3 4 5 6; do
+      [ "$(ctr_state)" = "true" ] && break
+      sleep 5
+    done
+    running="$(ctr_state)"
+  fi
+  [ "$running" = "true" ] || problems=$((problems + 1))
 elif [ "$running" != "true" ]; then
   # 只在容器确实停止时才开始尝试 (启动最多等 30s); 失败原因原样落日志
   notice_once "stopped-$CONTAINER" "容器 $CONTAINER 未运行, 尝试启动"
@@ -149,8 +197,14 @@ elif [ "$running" != "true" ]; then
   if [ $? -eq 0 ]; then
     note_action "start-container"; log "OK 容器已启动"
   else
-    problems=$((problems + 1))
+    # 极端情况: 容器停在 "marked for removal" 之类状态, start 也失败 → 重建一次
     notice_once "startfail-$CONTAINER" "FAIL 容器启动失败: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+    if recreate_container; then
+      running="$(ctr_state)"
+      [ "$running" = "true" ] || problems=$((problems + 1))
+    else
+      problems=$((problems + 1))
+    fi
   fi
 fi
 

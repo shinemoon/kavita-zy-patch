@@ -1,0 +1,24 @@
+[Unit]
+Description=Kavita (docker compose, system-level)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/vol1/1001/APPS/kavita
+ExecStart=/usr/bin/docker compose up -d
+# 关键: 用 stop 而不是 down。
+# down 会把容器**删掉** —— 一旦 ExecStart 那次 up 失败 (端口未释放 / 挂载源不可用 /
+# 超过 TimeoutStartSec 被 kill), keep 下来的是"容器不存在", `docker start` 永远报
+# No such container, systemd 也不会重试 (oneshot + RemainAfterExit), 只能人工
+# systemctl restart。2026-10-24 12:39 就是这么掉的, 停了 2.5 小时。
+# stop 只停不删, 任何一次没起来的 start 都能被 heal 用 docker start / compose up 救回。
+ExecStop=/usr/bin/docker compose stop
+ExecReload=/usr/bin/docker compose restart
+TimeoutStartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

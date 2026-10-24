@@ -135,7 +135,8 @@ systemd 版是三个 unit：`kavita-zy-api`（5111）、`kavita-zy-web`（5012�
 
 **自愈做什么**（`deploy/heal.sh`，幂等，每次跑一遍）：
 
-1. 容器没跑 → `docker start`
+1. 容器**不存在** → `docker compose up -d` 重建（`docker start` 救不了已删容器）；
+   容器存在但停着 → `docker start`
 2. Kavita 打不开 → 最多等 60s，超时记异常
 3. `zy-kavita-patch.js` 404 或 index 里没注入 → 自动 `deploy/reapply.sh` **重打补丁**
 4. 5111 健康检查失败 → 起 unit（没装 unit 就 `ctl.sh start`）
@@ -348,6 +349,8 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 徽标全不显示 | 没映射记录：`selftest.py` 看 `/zy/api/status` 的 rows |
 | 「安装自启」点了报 root | 面板没有免密 sudo → 手跑 `sudo bash deploy/install-autostart.sh`（一次） |
 | 自检红「自愈巡检」 | 点「立即自检」看输出；`state/logs/heal.log` 有失败原因 |
+| **Kavita 打不开，`kavita.service` 却是 active (exited)，日志刷 `No such container`** | 容器被删了（不是停了）。先 `bash deploy/heal.sh` 手跑一次 → 它现在会 `docker compose up -d` 重建；根治见 README「容器没了」一节：`sudo bash /vol1/1001/APPS/kavita/install-system-unit.sh`（ExecStop 从 down 改 stop，停服务不再删容器） |
+| 想知道到底是谁删的容器 | `deploy/watch-kavita.py` 常驻：`state/logs/kavita-watch.log` 记录状态突变 + 可疑 docker 命令（pid/ppid/user/PWD）+ 现场快照，`kavita-events.log` 记 die/destroy 及 exitCode |
 | 「继续阅读」报错跳回详情页 | 书内链接坏了：重跑 `apply_edition.py --series N`（构建即自校验）；或回滚 `.bak` |
 | **自动 push/pull 像没生效** | 按顺序看三处：① `bash install.sh status` 里 `mode=`；② `state/logs/api.log` 有没有 `hb vX.Y.Z`、`base=` 指向哪个地址、里面的 `saves=` 是否随阅读增长（没有 hb = 这一页连不上后端：强刷 / 后端在重启窗口加载 / 设备到 5012+5111 都不通）；③ 有没有 `auto-pull` / `auto-push` 行，`auto-push ... why=noop` 是 `push_decision` 主动挡（已对齐），`why=regress` 是掌阅更靠前不回拨，都不是故障 |
 | 钩子整晚一次没动，但 Kavita 存进度正常 | v0.4.4 修掉的典型：页面在 5111 重启窗口加载 → `/auto/cfg` 失败 → 整页无钩子且不重试。强刷到 `?v=0.4.4` 后自动重试 + 失败也会发心跳，`hb` 行里会写 `auto cfg 读取失败 (第N次)` |
