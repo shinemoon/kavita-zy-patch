@@ -294,6 +294,27 @@ python3 /vol2/1001/kavita-zy-patch/src/selftest.py
 
 ---
 
+## 5.5 阅读样式增强（行间距等，v0.4.7）
+
+5012 →「阅读样式增强 (Kavita)」卡：
+
+1. 勾 **启用**，拖 **行间距** 滑块（1.00–2.50），松手 0.7s 自动保存；
+2. 想加别的排版规则：下拉选预设（段间距 / 字间距 / 首行缩进 / 两端对齐 / 正文字号）
+   → **添加规则** → 改「选择器」和声明（如 `margin: 0.85em 0`）→ **保存并应用**；
+3. 不要的规则点 **删除**（立即保存）；**恢复默认** 回到只有一条行间距 1.8。
+
+生效方式：`zy-kavita-patch.js` 每 60s 拉一次 `/zy/api/reader-css`，version 变了就重写
+`<style id="zy-reader-css">`。**不用刷新页面、不用重启容器。**
+
+- 落盘：`/vol2/1001/kavita-zy-patch/state/reader_css.json`
+- 选择器写在 Kavita 阅读器正文里：`.book-content`（`p / div / li / blockquote / td`
+  默认都带上），不需要 Angular 的 `::ng-deep`
+- 自检：Kavita 页面 F12 → `__ZY__.readerCss()` → `{ver, on, bytes, node}`
+- 没生效先看 `__ZY__.ver` 是不是 `0.4.7`（旧版前端没有这段逻辑 → 强刷）
+- 回滚：控制台取消「启用」（保留规则但不注入），或删掉 `state/reader_css.json`
+
+---
+
 ## 6. 日常
 
 | 场景 | 动作 |
@@ -368,6 +389,7 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 4 | 库文件重排 | `/fs/1001/ftp/dav/Books/` 里的 epub 被替换 + `state/kpages/*.json` | 不会 | `state/backup/*.epub.bak-*` 覆盖回 + 重扫 |
 | 5 | 映射表 | `/vol2/1001/zhangyue-bridge/state/sync.sqlite`（`book_link`） | 不会 | 删行 |
 | 6 | compose 两行挂载 | `/vol1/1001/APPS/kavita/docker-compose.yml` | — | 删掉那两行（备份 `docker-compose.yml.bak-20261023`） |
+| 7 | 阅读样式（行间距等 CSS） | `state/reader_css.json` + 前端注入 `<style>` | 不会 | 控制台取消「启用」，或删 json |
 
 **Kavita 的代码和镜像一行没改。** 第 1 项只写它自己的静态目录，第 3 项是 SQL，
 第 4 项是它本来就该扫的书库文件。
@@ -397,6 +419,7 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 两侧差值 < 1 个点 | 正常，页粒度导致，不是 bug |
 | **读了一晚上，掌阅 pct 一格不动** | ① `zync.py push --dry-run` 看 pct 有没有 `(页内)` —— 没有就是 `BookScrollId` 丢了；② 看 Kavita 里 `PagesRead` 变没变（没变 = 浏览器没存进度 / 钩子没加载，查 api.log 的 `hb` 行）；③ 页数太少（600 页的大书一页 2.3 万字）→ 按 4.1 用 `ZY_KPAGES_MAX_PAGES=3000` 重建 + `zync.py pull` 重映射 |
 | **Kavita 百分比比掌阅 App 少零点几个点** | App 的进度写在 `getUserNotebooks`，跟 `getProgress` 是两套存储（2026-10-26 起 pull 两套都读，取靠前者）。先跑 `zync.py pull --dry-run` 看 `pct` 是否已等于 App 读数；剩下的差是 `PagesRead/Pages` 的页粒度量化（见 4.1） |
+| **行间距调了没变化** | ① `__ZY__.ver` 是否 `0.4.7`（旧前端没这段逻辑 → 强刷）；② `__ZY__.readerCss()` 的 `node:false` = 没注入（「启用」没勾 / 规则被删空）；③ 等 60s（前端轮询周期）；④ `curl -s "http://127.0.0.1:5111/zy/api/reader-css?token=$(cat state/token)"` 看 css 是否有内容 |
 
 ## 10. 新书放进库了，Kavita 里刷不出来 / 系列名不对
 

@@ -352,12 +352,12 @@ reload_if_stale kavita-zy-api.service \
   "$BRIDGE_ROOT/sync/sync/kpages.py" "$BRIDGE_ROOT/sync/sync/mapping.py" \
   "$BRIDGE_ROOT/sync/sync/kavita_db.py" "$BRIDGE_ROOT/sync/sync/epubprep.py" \
   "$BRIDGE_ROOT/sync/sync/zpct.py" "$BRIDGE_ROOT/sync/sync/zy_time.py" \
-  "$BRIDGE_ROOT/sync/sync/zy_notes.py"
+  "$BRIDGE_ROOT/sync/sync/zy_notes.py" "$BRIDGE_ROOT/sync/sync/reader_css.py"
 reload_if_stale kavita-zy-web.service \
   "$BRIDGE_ROOT/sync/web.py" "$BRIDGE_ROOT/sync/sync/sync.py" \
   "$BRIDGE_ROOT/sync/sync/kpages.py" "$BRIDGE_ROOT/sync/sync/cloud_books.py" \
   "$BRIDGE_ROOT/sync/sync/kavita_db.py" "$BRIDGE_ROOT/sync/sync/epubprep.py" \
-  "$BRIDGE_ROOT/sync/sync/zpct.py"
+  "$BRIDGE_ROOT/sync/sync/zpct.py" "$BRIDGE_ROOT/sync/sync/reader_css.py"
 
 # ---- 5c. 双写者纠偏 (只有 root 能做) ---------------------------------
 # 端口活着但服务不是 systemd 起的那份 = 上一代脚本留下的孤儿。此时 unit 会

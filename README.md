@@ -28,6 +28,7 @@ Kavita SPA (容器 :5000)
                       ├─ /zy/api/push|pull  调 bridge sync 包 (全库)
                       ├─ /zy/api/auto/pull|push  单本 (读书钩子用)
                       ├─ /zy/api/auto/hb   前端心跳 (证明钩子真在跑)
+                      ├─ /zy/api/reader-css 阅读样式 (行间距等) → 注入 <style>
                       └─ /zy/api/link       建映射
                             └─ /vol2/1001/zhangyue-bridge/sync
                                   ├─ sync/kavita_db.py  直读写 kavita.db
@@ -163,6 +164,33 @@ pct = (页起点字节 + 页内比例 × 页长) / 全书字节
 - 折叠区：**自愈日志**（`state/logs/heal.log` 尾部 60 行）
 
 **新装一台 Kavita 的完整步骤：见 [`docs/SETUP.md`](docs/SETUP.md)。**
+
+## 阅读样式增强 (v0.4.7)
+
+5012 里同一页还有一张 **「阅读样式增强 (Kavita)」** 卡：在 Kavita 原有排版上叠一层
+CSS（目前最常用的是**行间距**），保存后 `zy-kavita-patch.js` 拉下来注入
+`<style id="zy-reader-css">` —— **不碰 Kavita 文件，不重启容器，Kavita 页面 60 秒内自动生效**。
+
+- 规则可**增 / 改 / 删**（控制台里就是条目列表），保存时 version 自增，前端靠它决定重注入
+- 滑块「行间距」直接改 `line-height`（1.00 – 2.50），松手 0.7s 自动保存
+- 「快速添加」下拉给的是常用预设：行间距 / 段间距 / 字间距 / 首行缩进 / 两端对齐 / 正文字号
+- 配置落盘 `state/reader_css.json`（补丁仓内，跟补丁后端共用一份）
+  ```json
+  {"enabled": true, "version": 11,
+   "items": [{"id": "line-height", "name": "行间距", "enabled": true,
+              "selector": ".book-content, .book-content p, .book-content div",
+              "decls": {"line-height": "1.8"}, "important": true}]}
+  ```
+- 渲染规则：`selector { prop: value !important; }` —— `!important` 是为了压过 epub 自带的
+  行内 `line-height`（作者样式表的 important 声明优先级高于行内普通声明）
+- 默认选择器覆盖 `.book-content` 下 `p / div / li / blockquote / td`：只写 `.book-content`
+  会被 epub 自带的 `p { line-height }` 盖掉
+- 文件坏了 / 规则全删 → 前端只是不注入（不报错，阅读器回原样）
+- 排查：Kavita 页面 F12 执行 `__ZY__.readerCss()` 看 `{ver, on, bytes, node}`
+  —— `node:false` = 没注入（配置关着或规则为空）；`ver` 小 = 前端还没轮到轮询
+
+Kavita 阅读器的正文容器就是 `.book-content`（取自 `book-reader.component.scss` 的
+`::ng-deep .book-content`），所以选择器不用带 Angular 的 `::ng-deep`。
 
 ## 自启动 + 自愈
 

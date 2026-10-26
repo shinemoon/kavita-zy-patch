@@ -356,6 +356,27 @@ def _notes_sync(kind: str, sid: int, quiet: bool = True) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def api_reader_css() -> dict:
+    """阅读样式增强: 把 5012 里配的规则渲染成 CSS, 给前端注入。
+
+    弱依赖: 读不到 (bridge 未装 / 文件损坏) 也返 200 + 空 css, 前端只是不注入,
+    不该让整个补丁功能因此报错。
+    """
+    p = str(Path(BRIDGE_ROOT) / "sync")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    try:
+        from sync import reader_css                   # noqa: E402
+        conf = reader_css.load()
+        return {"ok": True, "enabled": bool(conf.get("enabled")),
+                "version": conf.get("version"), "updated": conf.get("updated"),
+                "css": reader_css.render_css(conf)}
+    except Exception as e:
+        log(f"reader-css fail: {e}")
+        return {"ok": True, "enabled": False, "version": 0, "css": "",
+                "warn": str(e)}
+
+
 def api_auto_pull(body: dict) -> dict:
     """掌阅 → Kavita, 单本。
 
@@ -579,6 +600,7 @@ ROUTES_GET = {
     "/zy/api/health": lambda: {"ok": True, "ts": __import__("time").time()},
     "/zy/api/selfcheck": api_selfcheck,
     "/zy/api/auto/cfg": api_auto_cfg,
+    "/zy/api/reader-css": api_reader_css,
 }
 ROUTES_POST = {
     "/zy/api/push": lambda b: api_push(bool(b.get("dry_run"))),

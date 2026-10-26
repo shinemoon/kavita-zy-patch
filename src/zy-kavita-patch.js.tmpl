@@ -100,6 +100,31 @@
       });
   }
 
+  // ---- 阅读样式增强 (v0.4.7) -------------------------------------------
+  // 5012 控制台「阅读样式增强」里配的规则 (行间距等) 由 /zy/api/reader-css
+  // 渲染成 CSS, 这里注入 <style id="zy-reader-css">。
+  // version 变了才重写; 保存后最迟 60s 生效 —— 不碰 Kavita 文件, 不重启容器。
+  var RS = { ver: null, on: null, css: '', at: 0, err: '' };
+  function applyReaderCss() {
+    return fetch(BASE + '/reader-css', { headers: { 'X-ZY-Token': TOKEN } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || j.ok === false) return;
+        if (j.version === RS.ver && !!j.enabled === RS.on) return;
+        RS.ver = j.version; RS.on = !!j.enabled; RS.at = Date.now(); RS.err = '';
+        var node = document.getElementById('zy-reader-css');
+        var css = j.enabled ? (j.css || '') : '';
+        RS.css = css;
+        if (!css) {
+          if (node && node.parentNode) node.parentNode.removeChild(node);
+          return;
+        }
+        if (!node) { node = el('style'); node.id = 'zy-reader-css'; document.head.appendChild(node); }
+        node.textContent = css;
+      })
+      .catch(function (e) { RS.err = (e && e.message) || 'fetch'; });
+  }
+
   // ---- 样式 (一次性注入) ---------------------------------------------
   var CSS = [
     '#zy-top-item{display:flex;align-items:center;}',
@@ -511,6 +536,7 @@
     bootTries++;
     resolveBase().then(function () {
       note('base ' + BASE);
+      applyReaderCss();
       return api('/auto/cfg');
     }).then(function (j) {
       AUTO.on = !!j.enabled;
@@ -559,10 +585,12 @@
         }).then(tick).catch(tick);
         setInterval(tick, 15000);
         setInterval(function () { probe().then(tick).catch(tick); }, 30000);
+        setInterval(applyReaderCss, 60000);
         // 回到前台兜底 (钩子没装上时 hookNetwork 里的监听器根本不存在)
         document.addEventListener('visibilitychange', function () {
           if (document.visibilityState !== 'visible') return;
           if (!bootOk) autoBoot();
+          applyReaderCss();
           probe().then(tick).catch(tick);
         });
         autoBoot();
@@ -586,6 +614,12 @@
                base: BASE_TRIED, boot: bootTries, ok: bootOk,
                saves: saveCount, pushes: pushCount, log: autoLog.slice() };
     },
-    pull: pullSeries, push: pushNow
+    pull: pullSeries, push: pushNow,
+    readerCss: function () {
+      return { ver: RS.ver, on: RS.on, bytes: (RS.css || '').length,
+               err: RS.err, at: RS.at, jsVer: VER,
+               node: !!document.getElementById('zy-reader-css') };
+    },
+    applyReaderCss: applyReaderCss
   };
 })();
