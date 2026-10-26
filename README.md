@@ -2,6 +2,11 @@
 
 在 Kavita 里植入掌阅（iReader）书架的进度管理功能。
 
+> **三方整体架构**（Kavita / 掌阅桥接 / echopaper·纸间，端口、同步通道、已知边界）
+> 见 `zhangyue-bridge` 仓的 `docs/architecture.md`（本机 `/vol2/1001/zhangyue-bridge/docs/architecture.md`，
+> 或 `/vol2/1001/Exchange/draft/kavita-zhangyue-echopaper-architecture.md`）。
+> 本仓负责前端注入 + 5111 后端 + 5012 控制台的部署与自愈；5012 的业务代码在 `zhangyue-bridge/sync/web.py`。
+
 ## 两个入口 (v0.3.0)
 
 补丁**只做导航**, 不做业务 UI。业务全在 5012 控制台 (认证二维码 / 推拉 / 日志 / 改造)。
