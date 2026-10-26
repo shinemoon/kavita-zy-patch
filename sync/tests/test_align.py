@@ -181,11 +181,17 @@ def test_total_count_prefers_app_value():
 
 
 def test_push_meta_only_when_pct_unchanged():
-    """进度一致但 totalCount 不同: 允许写一次 (meta), 回退仍然挡住。"""
-    ok, why = push_decision(0.11795, False, 0.11739, False, 195, meta_stale=True)
+    """进度一致但 totalCount 不同: 允许写一次 (meta), 回退仍然挡住。
+
+    2026-10-26 改: 以前"半页容差内"就允许 meta 写 —— 那等于允许小幅回拨
+    (狐 50.33% 被写成 50.22%)。现在 meta 写要求 new_pct >= cur_pct。
+    """
+    ok, why = push_decision(0.11739, False, 0.11739, False, 195, meta_stale=True)
     assert ok and why == "meta"
-    ok, why = push_decision(0.11795, False, 0.11739, False, 195)
+    ok, why = push_decision(0.11739, False, 0.11739, False, 195)
     assert not ok and why == "noop"
+    ok, why = push_decision(0.11795, False, 0.11739, False, 195, meta_stale=True)
+    assert not ok, why          # 小幅落后也不写 (不许回拨)
     ok, why = push_decision(0.5, False, 0.1, False, 195, meta_stale=True)
     assert not ok and why.startswith("regress")
 
@@ -324,6 +330,60 @@ def test_migrate_v1_single_pk_becomes_series_level():
         assert len(mapping.all_links()) == 2
     finally:
         restore()
+
+
+# ---- 掌阅 bookId 双 key / chapterId 口径 (2026-10-26) --------------------
+
+def test_app_book_keys_writes_both_local_keys():
+    """本地导入书的 App key = 32 hex 大写 (文件 MD5), 64 hex 只是云书架 id。
+
+    2026-10-26 实测: 只写 64 hex 时 App (读 32 hex) 永远看不到 → "push 了没变"。
+    """
+    from sync.sync import app_book_keys
+    bid = "70776a64c32c1c065dab241f3e9f133a55c7d8b38c5c6fbc79271e87e00e9526"
+    keys = app_book_keys(bid)
+    assert keys == ["70776A64C32C1C065DAB241F3E9F133A", bid], keys
+    # 已经是 32 hex / 数字 id / 空 → 不加派生 key
+    assert app_book_keys("70776A64C32C1C065DAB241F3E9F133A") == \
+        ["70776A64C32C1C065DAB241F3E9F133A"]
+    assert app_book_keys("1379") == ["1379"]
+    assert app_book_keys("") == []
+
+
+def test_catalog_chapter_excludes_front_matter():
+    """App 的 chapterId 是**目录项下标**, 比 spine-1 少 front 篇。
+
+    实证: 剑来 spine 590 / catalog 588 → App ch=157 而位置 pre=159;
+    藤井卷03 spine 193 / catalog 192 → App ch=189 而 pre=190。
+    """
+    from sync.sync import _catalog_chapter
+
+    class G:
+        catalog = 588
+        sizes = [1000] * 590
+    assert _catalog_chapter(G(), 158) == 157      # 剑来型 (front=2)
+    assert _catalog_chapter(G(), 0) == 0
+
+    class G1:
+        catalog = 192
+        sizes = [1000] * 193
+    assert _catalog_chapter(G1(), 189) == 189     # 藤井卷03 型 (front=1)
+
+    class G0:                                     # 没 NCX / catalog 未知 → 原样
+        catalog = 0
+        sizes = [1000] * 5
+    assert _catalog_chapter(G0(), 3) == 3
+    assert _catalog_chapter(None, 3) == 3
+
+
+def test_push_meta_never_rewinds():
+    """修元信息也不许把进度往回拨 (半页容差内也不例外)。"""
+    ok, why = push_decision(0.5033, False, 0.5022, False, 100, meta_stale=True)
+    assert not ok, why
+    ok, why = push_decision(0.27999589, False, 0.27999589, False, 3000, meta_stale=True)
+    assert ok and why == "meta"
+    ok, why = push_decision(0.2795, False, 0.2800, False, 3000, meta_stale=True)
+    assert ok and why == "forward"
 
 
 if __name__ == "__main__":

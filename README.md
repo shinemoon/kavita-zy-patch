@@ -229,7 +229,33 @@ python3 tests/test_notes_time.py
 | 书签 | ✅ | ✅ 同上 |
 | 阅读时长 | ✅ 精确到每天每书 | ✅ 队列 + 位图（幂等；历史 key 会被服务端并入上传日） |
 
-### 进度有两套存储（2026-10-26 发现）
+### 进度记录的 bookId 双 key（2026-10-26 晚，修正上面那段）
+
+上一段说的"两套存储"其实只是**表面现象**：`getUserNotebooks` 只是把 App 自己
+写的那条记录换个接口暴露出来，而且**只列有笔记的书**。真正的根因是
+**云端按 bookId 存了多份互不同步的进度记录**：
+
+| key | 谁在用 |
+|---|---|
+| `32 hex 大写`（文件内容 MD5） | **App**（`BookHolder.mLocalBookFileMd5`，`kd/e.java:o()` / `q6()`） |
+| `64 hex 大写`（MD5+MD5(path)） | 云书架 `book_id` —— 我们以前只写这条 |
+
+实测（剑来，19:08）：往 64 写 → 32 不变；往 32 写 → 32 变。**App 读 32**，
+所以以前所有 push 都写进了 App 看不见的那份，验证时读回自己写的 64 又"自证成功"。
+
+* `push`：`app_book_keys()` → 同时写 `[32up, 64up]`
+* `pull`：两条都读，取最靠前的那份（无笔记的书也拿得到 App 真实进度）
+* `chapterId`：App 用的是**目录项下标**（`getCatalogCount()`，不含封面/制作信息），
+  我们以前写 `spine-1`，只在 front=1 的书上碰巧对 → `_catalog_chapter()` 修正
+  （剑来 spine 590 / catalog 588，App 记 157 而位置 pre=159）
+* `push_decision(meta_stale)`：修元信息不再允许半页级回拨
+
+细节与证据见 `sync/notes/06-progress-key-and-chapterid.md`。
+
+⚠️ App 侧仍然只在**书架刷新**时拉一次进度（每会话每本一次），开书跳转还要求
+`core.comparePosition(本地, 云端) < 0`。所以改完进度要下拉刷新书架 / 重开 App。
+
+### 上午那版解释（保留作对照）
 
 掌阅云端把「读到哪」写两个地方，**更新节奏不同**：
 

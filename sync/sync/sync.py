@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -109,6 +110,66 @@ def _zy_notebook_progress(force: bool = False) -> dict[str, tuple[float | None, 
         out[bid] = (pct if ok else None, row.get("readpostion") or None, ts)
     _NB_CACHE.update(ts=now, data=out)
     return out
+
+
+_HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def app_book_keys(zy_book_id: str) -> list[str]:
+    """掌阅 App 侧真正读写进度用的 bookId 列表 (顺序: App 优先)。
+
+    2026-10-26 实测 (这是"push 了手机没变"的真正原因):
+
+      * App 拉进度 (`kd/e.java:o()`, `q6()`) 用的是
+        `BookHolder.mLocalBookFileMd5` = `core.getFileMD5(file).toUpperCase()`
+        —— **32 hex 大写 = 文件内容 MD5**
+      * 云书架给的是 64 hex (= MD5 + MD5(path)), 我们以前只往这条写
+      * 这两条在服务端是**两份独立记录**, 互不同步:
+        我们写 64 后 App 读 32 仍是它自己的旧值, 所以永远"没对上"
+
+    所以本地导入书必须同时写 32 和 64: 32 给 App 看, 64 保留云书架视图
+    (以及历史记录)。非 64 hex 的 id (商店书数字 id 等) 原样返回。
+    """
+    bid = (zy_book_id or "").strip()
+    if not bid:
+        return []
+    keys = [bid]
+    if _HEX64_RE.match(bid):
+        k32 = bid[:32].upper()
+        if k32 not in keys:
+            keys.insert(0, k32)
+    return keys
+
+
+def _canonical_bid(bid: str) -> str:
+    return (bid or "").strip().upper()
+
+
+def _catalog_chapter(geo, spine_chapter: int) -> int:
+    """spine 章号 (= locate 给的 chapterId) -> App 的 catalog 章号。
+
+    App 的 `chapterId` 是**目录项下标**: `BookItem.mChapterCount =
+    core.getCatalogCount()`, 目录项 = 目录清单 (不含封面/制作信息这些
+    前置文档)。而 readPercent 用的是 "已读完几篇 spine", 两者相差
+    front = len(spine) - catalog_count 篇。
+
+    实证: 剑来 spine 590 / catalog 588 (front=2), App 记录 ch=157 而
+    position pre=159 → 157 = 159 - 2 ✓; 藤井卷03 spine 193 / 192 (front=1)
+    → App ch=189, pre=190 ✓。以前我们一律写 spine-1, 只有 front=1 的书
+    碰巧对, 剑来这种多前置文档的书 chapterId 会多 1。
+    """
+    try:
+        ch = int(spine_chapter)
+    except (TypeError, ValueError):
+        return 0
+    catalog = getattr(geo, "catalog", 0) or 0
+    sizes = getattr(geo, "sizes", None) or []
+    if not catalog or not sizes:
+        return ch
+    front = len(sizes) - int(catalog)
+    if front <= 0:
+        return ch
+    return max(0, ch + 1 - front)
 
 
 def _best_zy_percent(zy_book_id: str, pct_from_progress: float, ok: bool) -> tuple[float, bool, str]:
@@ -366,7 +427,11 @@ def push_decision(cur_pct, cur_done, new_pct, new_done, pages: int, *,
         if new_pct < cur_pct - tol:
             return False, "regress(%.4f<%.4f,pages=%s)" % (new_pct, cur_pct, pages)
         if abs(new_pct - cur_pct) <= tol * 0.5:
-            return (True, "meta") if meta_stale else (False, "noop")
+            # 元信息修一次可以, 但**绝不为修元信息把进度往回拨** —— 掌阅是
+            # 读者眼前那一端, 少 1 页也不该由我们制造。
+            if meta_stale and new_pct >= cur_pct - 1e-6:
+                return True, "meta"
+            return False, "noop"
     return True, "forward"
 
 
@@ -389,24 +454,37 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
     detail: list[dict] = []
     # 掌阅侧当前进度 (防回退闸的基线)。取不到就降级成 no-baseline, 不阻塞推送。
     # bid -> (pct01|None, finished, 掌阅 chapterId, 掌阅 totalCount)
+    # 注意: 32 hex (App 真正读的那条) 与 64 hex (云书架 id) 是**两份独立记录**,
+    # 两边历史值可能不同 → 全部读回来, 取"最靠前"的那份当基线。
     zy_state: dict[str, tuple[float | None, bool, str | None, int | None]] = {}
+    key_owner: dict[str, str] = {}
+    all_keys: list[str] = []
     try:
-        recs = zy_client.get_progress(auth, [l.zy_book_id for l in chosen]) or {}
-        for bid, rec in recs.items():
+        for l in chosen:
+            for k in app_book_keys(l.zy_book_id):
+                key_owner[_canonical_bid(k)] = l.zy_book_id
+                if k not in all_keys:
+                    all_keys.append(k)
+        recs = zy_client.get_progress(auth, all_keys) or {}
+        for key, rec in recs.items():
+            owner = key_owner.get(_canonical_bid(key)) or key_owner.get(_canonical_bid(key[:32])) or _canonical_bid(key)
             rp = (rec or {}).get("readProcess") or {}
             v, ok = _normalize_percent(rp.get("readPercent"))
             # 防回退基线也要看 App 那份 (getUserNotebooks), 否则 App 读到
             # 27.7% 时我们还以为掌阅只到 27.4%, 会把进度往回拨。
-            v, ok, _src = _best_zy_percent(bid, v, ok)
+            v, ok, _src = _best_zy_percent(owner, v, ok)
+            prev = zy_state.get(owner)
+            if prev is not None and prev[0] is not None and (not ok or v <= prev[0] + 1e-12):
+                continue      # 保留更靠前的那条记录 (含它的 chapterId/totalCount)
             try:
                 tc = int(str(rp.get("totalCount")))
             except (TypeError, ValueError):
                 tc = None
-            zy_state[bid] = (v if ok else None,
-                             str(rp.get("readComplete") or "0").strip() == "1",
-                             (str(rp["chapterId"]) if rp.get("chapterId") not in (None, "")
-                              else None),
-                             tc)
+            zy_state[owner] = (v if ok else None,
+                               str(rp.get("readComplete") or "0").strip() == "1",
+                               (str(rp["chapterId"]) if rp.get("chapterId") not in (None, "")
+                                else None),
+                               tc)
     except Exception:
         log.warning("push: 读掌阅当前进度失败, 本轮回退检查降级", exc_info=True)
     # getProgress 里根本没这本书 (从没同步过) 但 App 有记录 → 也当基线
@@ -474,6 +552,10 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
             position = (mapping.state_get(f"zy_position_{p.series_id}")
                         or zpct.build_position(chapter_id, 0))
         complete = "1" if p.finished else "0"
+        # chapterId 字段要用 **目录项下标** (App 口径), 而 readPosition 里用的是
+        # spine 下标。两者相差"前置文档数", 以前混用导致剑来这类多前置文档的
+        # 书记录 chapterId 多 1 (见 _catalog_chapter)。
+        catalog_chapter = _catalog_chapter(geo, chapter_id)
         # 防回退闸: 只有真前进才写掌阅 (掌阅才是读者在用的那一端)
         n_pages = len(pm["pages"]) if pm else (geo.total_count if geo else 100)
         # 元信息写错 (totalCount / chapterId) 但进度一致时也要修一次,
@@ -481,7 +563,7 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
         meta_stale = False
         if cur_total is not None and str(cur_total) != str(total_count):
             meta_stale = True
-        if cur_ch is not None and str(cur_ch) != str(chapter_id):
+        if cur_ch is not None and str(cur_ch) != str(catalog_chapter):
             meta_stale = True
         allow, why = push_decision(cur_pct, cur_done, pct01, complete == "1", n_pages,
                                    allow_rewind=ALLOW_PUSH_REWIND,
@@ -504,22 +586,36 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
                            "chapter": chapter_id, "dry": True, "why": why})
             continue
         try:
-            zy_client.upload_progress(
-                auth,
-                book_id=link.zy_book_id,
-                book_name=link.zy_book_name,
-                chapter_id=chapter_id,
-                percent=f"{pct01:.8f}".rstrip("0").rstrip("."),
-                read_complete=complete,
-                total_count=total_count,
-                read_position=position,
-            )
+            # 32 hex (App 读的那条) + 64 hex (云书架 id) 各写一份 —— 服务端
+            # 是两份独立记录, 只写 64 App 永远看不到 (见 app_book_keys)。
+            ok_keys, errs = [], []
+            for key in app_book_keys(link.zy_book_id):
+                try:
+                    zy_client.upload_progress(
+                        auth,
+                        book_id=key,
+                        book_name=link.zy_book_name,
+                        chapter_id=catalog_chapter,
+                        percent=f"{pct01:.8f}".rstrip("0").rstrip("."),
+                        read_complete=complete,
+                        total_count=total_count,
+                        read_position=position,
+                    )
+                    ok_keys.append(key)
+                except Exception as e:
+                    errs.append(f"{key[:8]}:{e}")
+            if not ok_keys:
+                raise RuntimeError("; ".join(errs) or "no key")
             pushed += 1
             mapping.state_set(f"push_last_{p.series_id}", _now())
             detail.append({"bid": link.zy_book_id, "series": p.series_id,
-                           "chapter": p.chapter_id, "pct": round(pct01, 6), "ok": True})
-            log.info("push OK bid=%s pct01=%s%s", link.zy_book_id, round(pct01, 6),
-                     " (页内)" if refined else "")
+                           "chapter": p.chapter_id, "pct": round(pct01, 6), "ok": True,
+                           "keys": [k[:8] for k in ok_keys]})
+            log.info("push OK bid=%s pct01=%s%s%s", link.zy_book_id, round(pct01, 6),
+                     " (页内)" if refined else "",
+                     ("  keys=" + ",".join(k[:8] for k in ok_keys)) if len(ok_keys) > 1 else "")
+            if errs:
+                log.warning("push 部分 key 失败 bid=%s %s", link.zy_book_id, "; ".join(errs))
             detail[-1]["refined"] = refined
         except Exception as e:
             failed += 1
@@ -548,11 +644,32 @@ def pull_once(auth: dict | None = None, *, dry_run: bool = False,
              if series_ids is None or l.kavita_series_id in series_ids]
     if not links:
         return {"fetched": 0, "updated": 0, "skipped": 0}
-    bids = [l.zy_book_id for l in links]
+    # 32 hex (App 真正读写的记录) 与 64 hex (云书架 id) 是两份独立记录 ——
+    # 两边都有值时取"最靠前"的那份, 否则 App 侧新写的进度会被旧记录盖掉。
+    key_owner: dict[str, str] = {}
+    all_keys: list[str] = []
+    for l in links:
+        for k in app_book_keys(l.zy_book_id):
+            key_owner[_canonical_bid(k)] = l.zy_book_id
+            if k not in all_keys:
+                all_keys.append(k)
     try:
-        zy_rec = zy_client.get_progress(auth, bids)
+        zy_raw = zy_client.get_progress(auth, all_keys) or {}
     except Exception as e:
         log.exception("getProgress fail"); return {"error": str(e)}
+    zy_rec: dict[str, dict] = {}
+    for key, rec in zy_raw.items():
+        owner = key_owner.get(_canonical_bid(key)) or key_owner.get(_canonical_bid(key[:32])) or key
+        rp = (rec or {}).get("readProcess") or {}
+        v, ok = _normalize_percent(rp.get("readPercent"))
+        prev = zy_rec.get(owner)
+        if prev is not None:
+            pv, pok = _normalize_percent((prev.get("readProcess") or {}).get("readPercent"))
+            if pok and ok and v <= pv + 1e-12:
+                continue
+            if pok and not ok:
+                continue
+        zy_rec[owner] = rec
     fetched = len(zy_rec)
     updated = skipped = 0
     detail: list[dict] = []
