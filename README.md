@@ -113,8 +113,8 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 | POST | `/api/run/pull` | 跑 `zync.py pull` |
 | POST | `/api/run/status` | 跑 `zync.py status` |
 | POST | `/api/run/links` | 跑 `zync.py links` |
-| GET | `/api/reader_css` | 阅读样式配置 (规则列表 + 渲染后的 css + 预设) |
-| POST | `/api/reader_css` | `{op: save\|reset\|toggle\|delete\|line_height}` 改配置 |
+| GET | `/api/reader_css` | 阅读样式配置 (规则列表 + 渲染后的 css + 预设 + 文件侧状态) |
+| POST | `/api/reader_css` | `{op: save\|reset\|toggle\|delete\|line_height\|patch\|unpatch}` 改配置 / 写进 Kavita 文件 |
 | GET | `/healthz` | 存活探针 |
 
 单例锁: 同时只允许一个 CLI (push 要写 `kavita.db`, 并发会打架), 冲突返 409。
@@ -134,6 +134,19 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 - **不改 Kavita 文件、不重启容器**；关掉「启用」立即恢复原排版
 - 逻辑在 `sync/sync/reader_css.py`（补丁后端也 import 这一份，单一来源）
 - 冒烟: `node /vol2/1001/kavita-zy-patch/src/verify-reader-css.mjs`（真开阅读器量 computed line-height）
+
+**文件侧 patch (可选, 2026-10-26)** —— 同一条链路之外还有一条"硬"的:
+
+```
+5012 「Patch 到 Kavita 文件」→ reader_css.patch_to_kavita()
+   → 写进 Kavita index.html <head> (<!-- ZY-READER-CSS-BEGIN --> + <style id="zy-reader-css-file">)
+```
+
+- 不依赖补丁后端/JS; 幂等 (每次先剥自己那段); 挂载模式**就地覆盖**保留 inode
+- 「从文件移除」只删文件侧, 配置与运行时注入不动; 选择记在 `state/reader_css_file.json`,
+  `install.sh publish` 重建 index.html 后按它决定是否恢复
+- 文件侧已 patch 时, 保存/恢复默认会自动同步过去
+- CLI: `python3 sync/reader_css.py {file|patch|unpatch}`
 
 ### 启停
 

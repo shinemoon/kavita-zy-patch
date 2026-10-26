@@ -500,6 +500,27 @@ def _reader_css_get() -> dict:
 def _reader_css_post(body: dict) -> dict:
     rc = _reader_css_mod()
     op = str(body.get("op") or "save")
+    if op == "patch":
+        # 写进 Kavita 的 index.html (文件侧兜底), 同时刷新运行时配置
+        try:
+            res = rc.patch_to_kavita("web")
+        except Exception as e:  # noqa: BLE001
+            out = rc.summary()
+            out["error"] = f"patch 失败: {type(e).__name__}: {e}"
+            return out
+        out = rc.summary()
+        out["patched"] = res
+        return out
+    if op == "unpatch":
+        try:
+            res = rc.unpatch_from_kavita()
+        except Exception as e:  # noqa: BLE001
+            out = rc.summary()
+            out["error"] = f"移除失败: {type(e).__name__}: {e}"
+            return out
+        out = rc.summary()
+        out["unpatched"] = res
+        return out
     if op == "reset":
         conf = rc.default_conf()
     elif op == "toggle":
@@ -517,6 +538,13 @@ def _reader_css_post(body: dict) -> dict:
     out = rc.summary()
     out["saved"] = {"version": saved["version"], "items": len(saved["items"]),
                     "enabled": saved["enabled"]}
+    if bool(body.get("patch")):
+        # 保存并 patch: 一步把文件侧也更新到最新版本
+        try:
+            out["patched"] = rc.patch_to_kavita("web")
+            out["file"] = rc.file_state()
+        except Exception as e:  # noqa: BLE001
+            out["patch_error"] = f"{type(e).__name__}: {e}"
     return out
 
 
@@ -1027,6 +1055,11 @@ details.sec>summary:hover{background:#20242b}
       <button id="b-rs-save">保存并应用</button>
       <button id="b-rs-reset">恢复默认</button>
     </div>
+    <div class="row" style="margin:0 0 8px;align-items:center">
+      <button id="b-rs-patch">Patch 到 Kavita 文件</button>
+      <button id="b-rs-unpatch">从文件移除</button>
+      <span class="meta" id="rs-file" style="margin-left:4px">文件侧: …</span>
+    </div>
     <div id="rs-items"></div>
     <div class="row" style="margin:10px 0 0;align-items:center">
       <select id="rs-preset"></select>
@@ -1035,9 +1068,11 @@ details.sec>summary:hover{background:#20242b}
     </div>
     <pre id="rs-css" class="out" style="max-height:220px;margin-top:8px">—</pre>
     <div class="meta" id="rs-hint" style="margin-top:8px">
-      规则完全由这里管 (增 / 改 / 删)。保存后 <b>Kavita 页面里 60 秒内自动生效</b> ——
-      不重启容器、不改 Kavita 文件。开着的 Kavita 页面按 F12 执行
-      <code>__ZY__.readerCss()</code> 可看当前注入的版本。
+      规则完全由这里管 (增 / 改 / 删)。<b>保存并应用</b> = 存配置 + 运行时注入
+      (开着的 Kavita 页面 60 秒内自动生效, 不重启容器)。<b>Patch 到 Kavita 文件</b> =
+      额外把同一份 CSS 写进 Kavita 的 <code>index.html</code> (兜底, 与 JS/后端无关;
+      index.html 可能被浏览器缓存, 改完请 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷)。
+      开着的 Kavita 页面按 F12 执行 <code>__ZY__.readerCss()</code> 可看运行时注入的版本。
     </div>
   </div>
 </details>
@@ -1249,6 +1284,7 @@ function rsPaint(j){
   $('rs-meta').innerHTML = '规则 <b>' + (j.items||[]).length + '</b> 条 · 版本 <b>v' +
     esc(j.version) + '</b> · 更新 <b>' + esc(j.updated || '—') + '</b>' +
     ' · 落盘 <code>' + esc(j.path || '') + '</code>';
+  rsPaintFile(j);
   const host = $('rs-items');
   host.innerHTML = '';
   (j.items||[]).forEach(it => host.appendChild(rsRow(it)));
@@ -1273,24 +1309,70 @@ async function loadReaderCss(){
   }catch(e){ $('rs-meta').textContent = '加载失败: ' + e.message; }
 }
 
+// 文件侧 (写进 Kavita index.html 那段) 状态
+function rsPaintFile(j){
+  const el = $('rs-file'); if(!el) return;
+  const f = j.file || {};
+  const modeCN = f.mode === 'mount' ? '挂载模式' : '拷贝模式';
+  if(f.error){
+    el.innerHTML = '<span class="lv-ERROR">文件侧读取失败</span> ' + esc(f.error);
+    el.title = '';
+    return;
+  }
+  el.title = f.host || (f.container && f.inner ? f.container + ':' + f.inner : '');
+  if(!f.patched){
+    el.innerHTML = '文件侧 <span class="k">未 patch</span> · ' + esc(modeCN);
+    return;
+  }
+  const stale = f.version != null && Number(f.version) !== Number(j.version);
+  el.innerHTML = '文件侧 <b>已 patch</b> v' + esc(f.version ?? '?') +
+    ' · ' + esc(modeCN) + ' · ' + esc(f.css_bytes || 0) + 'B' +
+    (stale ? ' · <span class="lv-WARN">配置已到 v' + esc(j.version) + '，点 Patch 覆盖</span>' : '');
+}
+
+async function rsOp(op, what){
+  try{
+    const j = await postJson('/api/reader_css', {op: op});
+    if(j.error){ $('rs-file').innerHTML = '<span class="lv-ERROR">' + esc(j.error) + '</span>'; return; }
+    rsPaint(j); openSec('sec-rs');
+    const res = (op === 'patch') ? (j.patched || {}) : (j.unpatched || {});
+    const where = res.where ? (' · ' + res.where) : '';
+    $('rs-file').innerHTML += ' <span style="color:var(--ok)">✓ ' + esc(what) +
+      (res.changed === false ? '（无变化）' : '') + '</span>' +
+      '<br><span class="k">' + esc(where.replace(/^ · /, '')) + '</span>';
+  }catch(e){ $('rs-file').textContent = (what||'操作') + '失败: ' + e.message; }
+}
+
 async function rsSave(what){
   const conf = rsCollect();
   if(!conf.items.length && conf.enabled){ conf.enabled = false; $('rs-en').checked = false; }
+  // 文件侧已经 patch 过 → 保存时顺手同步过去, 免得两边版本分叉
+  const keepPatch = !!(rsConf && rsConf.file && rsConf.file.patched);
   try{
-    const j = await postJson('/api/reader_css', {op:'save', conf: conf});
+    const j = await postJson('/api/reader_css', {op:'save', conf: conf, patch: keepPatch});
     if(j.error){ $('rs-meta').textContent = (what||'保存') + '失败: ' + j.error; return; }
     rsPaint(j);
     openSec('sec-rs');
     $('rs-meta').innerHTML += ' <span style="color:var(--ok)">✓ ' + esc(what||'已保存') +
-      ' → v' + esc(j.version) + '</span>';
+      ' → v' + esc(j.version) + '</span>' +
+      (keepPatch ? (j.patch_error
+        ? ' <span class="lv-ERROR">文件侧同步失败: ' + esc(j.patch_error) + '</span>'
+        : ' <span class="k">(文件侧已同步)</span>') : '');
   }catch(e){ $('rs-meta').textContent = (what||'保存') + '失败: ' + e.message; }
 }
+
+$('b-rs-patch').onclick = ()=>rsOp('patch', '已 patch 到 Kavita 文件');
+$('b-rs-unpatch').onclick = ()=>{
+  if(!confirm('把文件侧那段 CSS 从 Kavita 的 index.html 里删掉?\n(运行时注入不受影响, 配置也保留)')) return;
+  rsOp('unpatch', '已从文件移除');
+};
 
 $('b-rs-save').onclick = ()=>rsSave('已保存');
 $('b-rs-reset').onclick = async ()=>{
   if(!confirm('恢复默认 (只有一条行间距 1.8)?')) return;
+  const keepPatch = !!(rsConf && rsConf.file && rsConf.file.patched);
   try{
-    const j = await postJson('/api/reader_css', {op:'reset'});
+    const j = await postJson('/api/reader_css', {op:'reset', patch: keepPatch});
     rsPaint(j); openSec('sec-rs');
   }catch(e){ $('rs-meta').textContent = '恢复默认失败: ' + e.message; }
 };
