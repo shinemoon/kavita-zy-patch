@@ -321,6 +321,18 @@ grep 'push OK' /vol2/1001/zhangyue-bridge/state/logs/sync.log | tail
 页内精度救不了「页太粗」的显示问题：`PagesRead` 仍然是整页跳，想让它动得快
 就得把 `MAX_PAGES` 调大并重建（见 4.1）。
 
+**掌阅云端有「两套」进度存储（2026-10-26 起 pull 两套都读）**：`getProgress`
+（我们 push 写的 `readProcess`）和 `getUserNotebooks`（**App 自己**写的
+`readpostion` / `readpercent`）更新节奏不同 —— 实测 App 已读到 27.755%、而
+`getProgress` 还停在我们上一次 push 的 27.387%，于是 Kavita 反复 pull 只能看到
+27.4%。现在 `_best_zy_percent()` 取**更靠前**的那份（push 的防回退基线也用同一
+口径，不会把 App 的进度往回拨）。`getUserNotebooks` 只列有笔记的书，其余书自然
+退回 `getProgress`。
+
+所以「Kavita 百分比比 App 少零点几个点」先确认：是不是 App 那份更靠前
+（`zync.py pull --dry-run` 的 `pct` 应等于 App 的读数）。真正的页粒度误差仍存在，
+那是 `PagesRead / Pages` 的量化，见 4.1。
+
 ---
 
 ## 7. Kavita 升级 / 容器重建之后
@@ -384,6 +396,7 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 进度显示 44% 打开是目录 | 该书还没重排版 → 做第 4 步 |
 | 两侧差值 < 1 个点 | 正常，页粒度导致，不是 bug |
 | **读了一晚上，掌阅 pct 一格不动** | ① `zync.py push --dry-run` 看 pct 有没有 `(页内)` —— 没有就是 `BookScrollId` 丢了；② 看 Kavita 里 `PagesRead` 变没变（没变 = 浏览器没存进度 / 钩子没加载，查 api.log 的 `hb` 行）；③ 页数太少（600 页的大书一页 2.3 万字）→ 按 4.1 用 `ZY_KPAGES_MAX_PAGES=3000` 重建 + `zync.py pull` 重映射 |
+| **Kavita 百分比比掌阅 App 少零点几个点** | App 的进度写在 `getUserNotebooks`，跟 `getProgress` 是两套存储（2026-10-26 起 pull 两套都读，取靠前者）。先跑 `zync.py pull --dry-run` 看 `pct` 是否已等于 App 读数；剩下的差是 `PagesRead/Pages` 的页粒度量化（见 4.1） |
 
 ## 10. 新书放进库了，Kavita 里刷不出来 / 系列名不对
 
