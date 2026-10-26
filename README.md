@@ -29,6 +29,7 @@ Kavita SPA (容器 :5000)
                       ├─ /zy/api/auto/pull|push  单本 (读书钩子用)
                       ├─ /zy/api/auto/hb   前端心跳 (证明钩子真在跑)
                       ├─ /zy/api/reader-css 阅读样式 (行间距等) → 注入 <style>
+                      │                    (可选: 5012 一键写进 index.html, v0.4.8)
                       └─ /zy/api/link       建映射
                             └─ /vol2/1001/zhangyue-bridge/sync
                                   ├─ sync/kavita_db.py  直读写 kavita.db
@@ -191,6 +192,38 @@ CSS（目前最常用的是**行间距**），保存后 `zy-kavita-patch.js` 拉
 
 Kavita 阅读器的正文容器就是 `.book-content`（取自 `book-reader.component.scss` 的
 `::ng-deep .book-content`），所以选择器不用带 Angular 的 `::ng-deep`。
+
+### 两条生效路径：运行时注入 vs 写进文件 (v0.4.8)
+
+| 路径 | 怎么做 | 依赖 | 何时用 |
+|---|---|---|---|
+| **运行时注入** (默认) | 前端 60s 轮询后端，注入 `<style id="zy-reader-css">` | 补丁后端活着 + JS 能跑 | 日常调参，改完自己就生效 |
+| **文件侧 patch** | 卡里点「Patch 到 Kavita 文件」，CSS 直接写进 `index.html` | 什么都不依赖 | 想要"浏览器一进来就有"，或后端偶尔不在 |
+
+文件侧细节：
+
+- 写进 `index.html` 的 `<head>` 末尾，用 `<!-- ZY-READER-CSS-BEGIN --> … <!-- ZY-READER-CSS-END -->`
+  包一段 `<style id="zy-reader-css-file">`；**幂等** —— 每次先剥掉自己那段再重写，不会越写越多
+- 挂载模式**就地覆盖**（保留 inode；`os.replace` 换 inode 会让容器里的单文件 bind mount 指着旧名字）
+- 拷贝模式走 `docker cp` 出容器 → 改 → `docker cp` 回去
+- 卡里状态行会写 `文件侧 已 patch v14 · 挂载模式 · 303B`；配置改过但没重新 patch 时会提示
+  「配置已到 v15，点 Patch 覆盖」
+- **保存时自动同步**：文件侧已经 patch 过，点「保存并应用」/「恢复默认」会顺手把文件侧刷到新版本
+- 「从文件移除」= 只删文件侧那段，运行时注入和配置都不受影响。这个选择记在
+  `state/reader_css_file.json`（`{"desired": false}`），`install.sh publish` 重建
+  `index.html` 后**不会**擅自塞回去
+- `index.html` 不带 `Cache-Control`，浏览器可能用缓存那份 → 改完文件侧要
+  <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷才看得到
+- 命令行等价：`python3 sync/sync/reader_css.py {file|patch|unpatch}`（在 bridge 仓跑）
+
+## 通知 (toast) 样式 (v0.4.8)
+
+自动同步成功/被闸门挡时会弹一条右下角提示。2026-10-26 按要求调低调：
+
+- 背景 `rgba(0,0,0,.5)`（原先是接近纯黑的 `.94`）+ 极淡描边 + `backdrop-filter: blur(2px)`
+- 淡入淡出：`opacity 0 → 1`，`transform: translateY(4px) → none`，`transition .3s ease`
+  （原先 .18s + 8px，偏"跳"）
+- 3.5 秒后自动淡出，`pointer-events: none` 不挡点击
 
 ## 自启动 + 自愈
 

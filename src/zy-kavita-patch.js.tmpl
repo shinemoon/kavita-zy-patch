@@ -144,11 +144,13 @@
     '#zy-nav-item.zy-ok .zy-badge{background:rgba(74,198,148,.2);color:#4ac694;}',
     '#zy-nav-item.zy-err .zy-badge{background:rgba(189,54,47,.25);color:#BD362F;}',
     // 自动同步的可见反馈 (只在真的动了位置/推成功时出现, 3.5s 自隐)
+    // 2026-10-26 用户: 稍微低调点 —— 淡入淡出 + 半透明黑底
     '#zy-toast{position:fixed;right:1rem;bottom:1rem;z-index:99999;max-width:22rem;',
-    'background:rgba(20,22,25,.94);color:#e8eaed;border:1px solid rgba(255,255,255,.14);',
-    'border-radius:8px;padding:.6rem .8rem;font-size:.8rem;line-height:1.35;',
-    'box-shadow:0 6px 24px rgba(0,0,0,.35);opacity:0;transform:translateY(8px);',
-    'transition:opacity .18s,transform .18s;pointer-events:none;}',
+    'background:rgba(0,0,0,.5);color:#e8eaed;border:1px solid rgba(255,255,255,.07);',
+    'border-radius:8px;padding:.5rem .75rem;font-size:.78rem;line-height:1.35;',
+    'box-shadow:0 2px 10px rgba(0,0,0,.18);opacity:0;transform:translateY(4px);',
+    'transition:opacity .3s ease,transform .3s ease;pointer-events:none;',
+    'backdrop-filter:blur(2px);}',
     '#zy-toast.on{opacity:1;transform:none;}',
   ].join('');
 

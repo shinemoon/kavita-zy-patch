@@ -147,6 +147,31 @@ verify_index_assets() {
   [ "$bad" = 0 ] || return 1
 }
 
+# 把 5012 里配的阅读样式 (state/reader_css.json) 重新写进 index.html。
+# publish / install 会重建 index.html (从镜像原版 + 注入), 那段 CSS 会被冲掉,
+# 所以每次落地后补一遍。没配过就直接跳过 —— 幂等, 出错不影响主流程。
+apply_reader_css() {
+  local br="${BRIDGE_ROOT:-/vol2/1001/zhangyue-bridge}"
+  [ -d "$br/sync" ] || { echo "跳过阅读样式 (找不到 $br/sync)"; return 0; }
+  local js="${READER_CSS_JSON:-$HERE/state/reader_css.json}"
+  [ -s "$js" ] || { echo "跳过阅读样式 (还没在 5012 里配置过)"; return 0; }
+  python3 - "$br" <<'PY' || echo "WARN 阅读样式写回失败 (不影响补丁本身)"
+import sys
+sys.path.insert(0, sys.argv[1] + "/sync")
+try:
+    from sync import reader_css
+    r = reader_css.reapply_after_publish()
+    if r.get("skipped"):
+        print("阅读样式: 不写回 (%s)" % r["skipped"])
+    else:
+        print("阅读样式: %s v%s -> %s" % ("已写回" if r.get("patched") else "已清空",
+                                         r.get("version"), r.get("where")))
+except Exception as e:
+    print("阅读样式写回异常: %s: %s" % (type(e).__name__, e))
+    sys.exit(1)
+PY
+}
+
 # 把渲染产物落到挂载目录 (宿主侧)。挂载模式下容器立刻能看到。
 publish_host() {
   ensure_token
@@ -189,6 +214,7 @@ publish_host() {
   put_in_place "$BUILD_DIR/index.html.patched" "$WWWROOT_MOUNT_DIR/index.html" \
     || die "写 $WWWROOT_MOUNT_DIR/index.html 失败"
   md5sum "$orig" | awk '{print $1}' > "$WWWROOT_MOUNT_DIR/.image-index.md5"
+  apply_reader_css
   echo "已发布到挂载目录 $WWWROOT_MOUNT_DIR"
   echo "  index.html         $(wc -c < "$WWWROOT_MOUNT_DIR/index.html") bytes"
   echo "  zy-kavita-patch.js $(wc -c < "$WWWROOT_MOUNT_DIR/zy-kavita-patch.js") bytes"
@@ -238,6 +264,7 @@ EOF
   render_index
   docker cp "$BUILD_DIR/zy-kavita-patch.js" "$CONTAINER:${inner}/zy-kavita-patch.js"
   docker cp "$BUILD_DIR/index.html.patched"  "$CONTAINER:${inner}/index.html"
+  apply_reader_css
 
   bash "$HERE/ctl.sh" restart-api >/dev/null 2>&1 || bash "$HERE/ctl.sh" start-api || true
 

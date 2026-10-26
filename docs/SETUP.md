@@ -306,6 +306,20 @@ python3 /vol2/1001/kavita-zy-patch/src/selftest.py
 生效方式：`zy-kavita-patch.js` 每 60s 拉一次 `/zy/api/reader-css`，version 变了就重写
 `<style id="zy-reader-css">`。**不用刷新页面、不用重启容器。**
 
+**可选：写进 Kavita 文件侧**（v0.4.8）—— 卡里两个按钮
+
+| 按钮 | 做什么 |
+|---|---|
+| **Patch 到 Kavita 文件** | 把同一份 CSS 写进 `index.html` 的 `<head>`（`<!-- ZY-READER-CSS-BEGIN -->` 包一段 `<style>`）。不依赖补丁后端/JS；幂等，重复点只报"无变化" |
+| **从文件移除** | 只删文件侧那段，配置和运行时注入都不受影响 |
+
+- 状态行会显示 `文件侧 已 patch v14 · 挂载模式 · 303B`；配置更新但没重新 patch 会提示"配置已到 v15"
+- 文件侧已 patch 时，**保存并应用 / 恢复默认 会自动同步**到文件侧（不用每次手动点 Patch）
+- 「移除」的选择记在 `state/reader_css_file.json`（`{"desired": false}`）——
+  `install.sh publish` 重建 `index.html` 后不会擅自塞回去
+- 改完文件侧要 **强刷**（`index.html` 没 Cache-Control，浏览器可能拿缓存那份）
+- 命令行等价（在 bridge 仓）：`python3 sync/sync/reader_css.py {file|patch|unpatch}`
+
 - 落盘：`/vol2/1001/kavita-zy-patch/state/reader_css.json`
 - 选择器写在 Kavita 阅读器正文里：`.book-content`（`p / div / li / blockquote / td`
   默认都带上），不需要 Angular 的 `::ng-deep`
@@ -389,7 +403,7 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 4 | 库文件重排 | `/fs/1001/ftp/dav/Books/` 里的 epub 被替换 + `state/kpages/*.json` | 不会 | `state/backup/*.epub.bak-*` 覆盖回 + 重扫 |
 | 5 | 映射表 | `/vol2/1001/zhangyue-bridge/state/sync.sqlite`（`book_link`） | 不会 | 删行 |
 | 6 | compose 两行挂载 | `/vol1/1001/APPS/kavita/docker-compose.yml` | — | 删掉那两行（备份 `docker-compose.yml.bak-20261023`） |
-| 7 | 阅读样式（行间距等 CSS） | `state/reader_css.json` + 前端注入 `<style>` | 不会 | 控制台取消「启用」，或删 json |
+| 7 | 阅读样式（行间距等 CSS） | `state/reader_css.json` + 前端注入 `<style>`；可选写进 `index.html`（开关记在 `state/reader_css_file.json`） | 不会 | 控制台取消「启用」/「从文件移除」，或删 json |
 
 **Kavita 的代码和镜像一行没改。** 第 1 项只写它自己的静态目录，第 3 项是 SQL，
 第 4 项是它本来就该扫的书库文件。
