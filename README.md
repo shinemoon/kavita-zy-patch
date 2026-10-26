@@ -114,7 +114,7 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 | POST | `/api/run/status` | 跑 `zync.py status` |
 | POST | `/api/run/links` | 跑 `zync.py links` |
 | GET | `/api/reader_css` | 阅读样式配置 (规则列表 + 渲染后的 css + 预设 + 文件侧状态) |
-| POST | `/api/reader_css` | `{op: save\|reset\|toggle\|delete\|line_height\|theme\|patch\|unpatch}` 改配置 / 切主题 / 写进 Kavita 文件 |
+| POST | `/api/reader_css` | `{op: save\|reset\|toggle\|delete\|line_height\|patch\|unpatch}` 改配置 / 写进 Kavita 文件 |
 | GET | `/healthz` | 存活探针 |
 
 单例锁: 同时只允许一个 CLI (push 要写 `kavita.db`, 并发会打架), 冲突返 409。
@@ -131,11 +131,6 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 
 - 规则 = `{id, name, enabled, selector, decls:{prop:value}, important}`，页面里可**增 / 改 / 删**
 - 渲染 = `selector { prop: value !important; }`（`!important` 用来压 epub 自带的行内 `line-height`）
-- **阅读主题** `"theme": "default" | "feishu" | "console"`（2026-10-26）：三选一皮肤，
-  主题规则渲染在用户规则**之前**，且**一条 `line-height` 都不写** —— 切主题不动行间距。
-  实测 DOM 结构（`.reader-container` / `.book-content.immersive`）见
-  `sync/sync/reader_css.py` 顶部注释；选择器要双写类名才压得住 Kavita 的 `brtheme-white`
-  （它对 `.reader-container` 用了 `background-color: white !important`）
 - **不改 Kavita 文件、不重启容器**；关掉「启用」立即恢复原排版
 - 逻辑在 `sync/sync/reader_css.py`（补丁后端也 import 这一份，单一来源）
 - 冒烟: `node /vol2/1001/kavita-zy-patch/src/verify-reader-css.mjs`（真开阅读器量 computed line-height）
