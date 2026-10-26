@@ -216,34 +216,6 @@ Kavita 阅读器的正文容器就是 `.book-content`（取自 `book-reader.comp
   <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷才看得到
 - 命令行等价：`python3 sync/sync/reader_css.py {file|patch|unpatch}`（在 bridge 仓跑）
 
-### 阅读主题：默认 / 飞书云文档 / 代码 Console (v0.4.10)
-
-卡片顶部多一个 **阅读主题** 下拉，三选一（切换即生效，不需要点保存）：
-
-| 主题 | 长什么样 |
-|---|---|
-| **默认（Kavita 原界面）** | 一个字都不改，只有下面的行间距等规则生效 |
-| **飞书云文档** | 浅灰画布 `#f2f3f5` + 白色纸张卡片（780px 居中、圆角 8px、淡投影），苹方/思源黑，正文 `#1f2329`，链接飞书蓝 `#3370ff`，引用浅灰块 |
-| **代码 Console** | 深色终端底 `#0b0e14` + `#0d1117` 卡片，等宽字体（JetBrains Mono / Menlo / Consolas），正文 `#c9d1d9`，标题绿 `#7ee787` 左侧绿条，链接青 `#58a6ff`，引用灰 |
-
-- **主题只管外观，绝不写 `line-height`** —— 行间距永远由独立那条规则控制，
-  切主题时滑块位置/数值都不动（`tests/test_reader_theme.py` 就是盯这条）
-- 主题规则渲染在用户规则**之前** → 同一属性冲突时用户的规则赢
-- 只存一个字段：`state/reader_css.json` 的 `"theme": "default" | "feishu" | "console"`，
-  非法值自动退回 `default`；老配置没有这个字段也照读（= default）
-- 文件侧 patch 用的是同一份渲染结果，所以切换主题时若文件侧已 patch 会自动同步
-- **为什么选择器要双写类名**（`.book-content.book-content`）：Kavita 的
-  `brtheme-white` 里有两条硬声明
-  ```css
-  .reader-container { color: black !important; background-color: white !important; }
-  .book-content :not(code), .book-content :not(a) { background-color: white; }
-  ```
-  同特异度的 `!important` 谁靠后谁赢，而注入的 `<style>` 在它之前 ——
-  所以选择器抬一级（`.reader-container.reader-container`）才压得住。第一版只写
-  `.reader-container`，深色主题下画布仍是白的，就是栽在这。
-- 手机宽度（430px）实测：卡片满宽、无横向溢出；`clamp()` 控制内边距，不用媒体查询
-  （规则清洗会剥掉 `@`，写不了 `@media`）
-
 ## 通知 (toast): 默认静默, 只有失败才弹 (v0.4.9)
 
 2026-10-26 最终口径：**平时不弹**。自动 pull / push 成功一律只写进 `__ZY__.auto().log`

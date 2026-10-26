@@ -320,24 +320,6 @@ python3 /vol2/1001/kavita-zy-patch/src/selftest.py
 - 改完文件侧要 **强刷**（`index.html` 没 Cache-Control，浏览器可能拿缓存那份）
 - 命令行等价（在 bridge 仓）：`python3 sync/sync/reader_css.py {file|patch|unpatch}`
 
-### 阅读主题三选一（v0.4.10）
-
-卡里第一行的 **阅读主题** 下拉，切换即时保存（不用点保存）：
-
-| 主题 | 效果 |
-|---|---|
-| 默认（Kavita 原界面） | 完全不动 Kavita 的排版/配色，只有你的规则（行间距等）生效 |
-| 飞书云文档 | 浅灰画布 + 白色纸张卡片、苹方/思源黑、正文 `#1f2329`、链接飞书蓝 |
-| 代码 Console | 深色终端底、等宽字体、标题绿 + 左侧绿条、链接青、引用灰 |
-
-- **不影响行间距**：主题里一条 `line-height` 都没有，切主题时滑块数值不动
-- 想"临时回到原界面"：把主题切回 **默认**（规则全保留，只是不套主题皮肤）
-- 文件侧已 patch 的话，切主题会自动把新 CSS 同步写进 `index.html`（仍需强刷）
-- 生效验证：Kavita 页面 F12 → `__ZY__.readerCss().ver` 变了；正文容器的
-  `background-color` / `font-family` 跟着变
-- 已知坑：Kavita 的 `brtheme-white` 会用 `!important` 写白底，我们的选择器因此
-  双写类名（`.book-content.book-content`）抬特异度 —— 改主题时别把它简化成单个类名
-
 - 落盘：`/vol2/1001/kavita-zy-patch/state/reader_css.json`
 - 选择器写在 Kavita 阅读器正文里：`.book-content`（`p / div / li / blockquote / td`
   默认都带上），不需要 Angular 的 `::ng-deep`
