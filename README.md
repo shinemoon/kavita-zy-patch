@@ -113,9 +113,27 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 | POST | `/api/run/pull` | 跑 `zync.py pull` |
 | POST | `/api/run/status` | 跑 `zync.py status` |
 | POST | `/api/run/links` | 跑 `zync.py links` |
+| GET | `/api/reader_css` | 阅读样式配置 (规则列表 + 渲染后的 css + 预设) |
+| POST | `/api/reader_css` | `{op: save\|reset\|toggle\|delete\|line_height}` 改配置 |
 | GET | `/healthz` | 存活探针 |
 
 单例锁: 同时只允许一个 CLI (push 要写 `kavita.db`, 并发会打架), 冲突返 409。
+
+### 阅读样式增强 (2026-10-26)
+
+5012 的「阅读样式增强 (Kavita)」卡管的是 **Kavita 阅读器的排版 CSS**（目前主要是行间距）:
+
+```
+5012 (root) 写 /vol2/1001/kavita-zy-patch/state/reader_css.json
+   → 补丁后端 GET :5111/zy/api/reader-css 渲染成 CSS
+   → 补丁前端 (zy-kavita-patch.js) 60s 轮询, version 变了就注入 <style id="zy-reader-css">
+```
+
+- 规则 = `{id, name, enabled, selector, decls:{prop:value}, important}`，页面里可**增 / 改 / 删**
+- 渲染 = `selector { prop: value !important; }`（`!important` 用来压 epub 自带的行内 `line-height`）
+- **不改 Kavita 文件、不重启容器**；关掉「启用」立即恢复原排版
+- 逻辑在 `sync/sync/reader_css.py`（补丁后端也 import 这一份，单一来源）
+- 冒烟: `node /vol2/1001/kavita-zy-patch/src/verify-reader-css.mjs`（真开阅读器量 computed line-height）
 
 ### 启停
 

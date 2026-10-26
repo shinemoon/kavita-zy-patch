@@ -479,6 +479,47 @@ def _kavita_action(action: str) -> dict:
     return out
 
 
+# ---- 阅读样式增强 (Kavita 阅读排版) ----------------------------------
+#
+# 用户 2026-10-26: 5012 里配行间距等阅读样式, 保存后 patch 到 Kavita。
+# 实现方式是**前端注入**, 不碰 Kavita 文件也不重启容器:
+#   5012 (本进程, root) 写 <PATCH_ROOT>/state/reader_css.json
+#   → 补丁后端 /zy/api/reader-css 渲染成 CSS
+#   → zy-kavita-patch.js 拉取后注入 <style id="zy-reader-css"> (60s 内生效)
+# 规则可增删 (items CRUD), 保存时 version 自增, 前端据此重注入。
+
+def _reader_css_mod():
+    from sync import reader_css as rc
+    return rc
+
+
+def _reader_css_get() -> dict:
+    return _reader_css_mod().summary()
+
+
+def _reader_css_post(body: dict) -> dict:
+    rc = _reader_css_mod()
+    op = str(body.get("op") or "save")
+    if op == "reset":
+        conf = rc.default_conf()
+    elif op == "toggle":
+        conf = rc.load()
+        conf["enabled"] = bool(body.get("enabled"))
+    elif op in ("delete", "del"):
+        conf = rc.load()
+        drop = str(body.get("id") or "")
+        conf["items"] = [i for i in conf["items"] if i["id"] != drop]
+    elif op == "line_height":
+        conf = rc.set_line_height(rc.load(), body.get("value"))
+    else:
+        conf = body.get("conf") if isinstance(body.get("conf"), dict) else body
+    saved = rc.save(conf)
+    out = rc.summary()
+    out["saved"] = {"version": saved["version"], "items": len(saved["items"]),
+                    "enabled": saved["enabled"]}
+    return out
+
+
 # ---- 掌阅认证 (扫码登录) ---------------------------------------------
 #
 # 用户 2026-10-21: 公网面板要能直接刷二维码重新认证, 不再回 PC 站。
@@ -692,6 +733,11 @@ class Handler(BaseHTTPRequestHandler):
             st = _heal_state()
             self._json(200, {"disabled": st["disabled"], "last": st.get("last"),
                              "lines": (st.get("log_tail") or [])[-n:]})
+        elif path == "/api/reader_css":
+            try:
+                self._json(200, _reader_css_get())
+            except Exception as e:  # noqa: BLE001 — 配置读失败不该整页 500
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
         elif path == "/api/auth/qr":
             self._send(200, (_qr_state.get("svg") or "").encode("utf-8"),
                        "image/svg+xml; charset=utf-8")
@@ -762,6 +808,17 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._json(404, {"error": f"unknown cloud action: {act}"})
             except Exception as e:  # noqa: BLE001 — 面板不能因掌阅/文件错误整页挂
+                self._json(502, {"error": f"{type(e).__name__}: {e}"})
+            return
+        if path == "/api/reader_css":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:  # noqa: BLE001
+                body = {}
+            try:
+                self._json(200, _reader_css_post(body))
+            except Exception as e:  # noqa: BLE001
                 self._json(502, {"error": f"{type(e).__name__}: {e}"})
             return
         if path == "/api/kavita/action":
@@ -954,6 +1011,37 @@ details.sec>summary:hover{background:#20242b}
   </div>
 </details>
 
+<details class="sec" id="sec-rs">
+  <summary>阅读样式增强 (Kavita) <span class="pill" id="rs-pill">…</span></summary>
+  <div class="sec-body">
+    <div class="meta" id="rs-meta" style="margin-bottom:8px">加载中…</div>
+    <div class="row" style="margin:0 0 8px;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="rs-en"> 启用
+      </label>
+      <label style="display:flex;align-items:center;gap:6px">
+        行间距
+        <input id="rs-lh" type="range" min="1" max="2.5" step="0.05" style="width:150px">
+        <b id="rs-lh-val">1.80</b>
+      </label>
+      <button id="b-rs-save">保存并应用</button>
+      <button id="b-rs-reset">恢复默认</button>
+    </div>
+    <div id="rs-items"></div>
+    <div class="row" style="margin:10px 0 0;align-items:center">
+      <select id="rs-preset"></select>
+      <button id="b-rs-add">添加规则</button>
+      <button id="b-rs-preview">预览 CSS</button>
+    </div>
+    <pre id="rs-css" class="out" style="max-height:220px;margin-top:8px">—</pre>
+    <div class="meta" id="rs-hint" style="margin-top:8px">
+      规则完全由这里管 (增 / 改 / 删)。保存后 <b>Kavita 页面里 60 秒内自动生效</b> ——
+      不重启容器、不改 Kavita 文件。开着的 Kavita 页面按 F12 执行
+      <code>__ZY__.readerCss()</code> 可看当前注入的版本。
+    </div>
+  </div>
+</details>
+
 <details class="sec" id="sec-log">
   <summary>最近日志</summary>
   <div class="sec-body"><pre id="log"></pre></div>
@@ -1017,7 +1105,7 @@ async function run(cmd){
 }
 $('b-push').onclick = ()=>run('push');
 $('b-pull').onclick = ()=>run('pull');
-$('b-refresh').onclick = ()=>{loadState();loadLog();loadAuth();loadKavita();loadCloud(false);loadCloudLocal();};
+$('b-refresh').onclick = ()=>{loadState();loadLog();loadAuth();loadKavita();loadCloud(false);loadCloudLocal();loadReaderCss();};
 
 // ---- Kavita 改造 -----------------------------------------------------
 async function loadKavita(){
@@ -1104,6 +1192,133 @@ $('b-kv-heal-on').onclick = ()=>kvAct('heal-on', '开自愈');
 $('b-kv-edry').onclick = ()=>kvAct('edition-dry', '重排版 dry-run');
 $('b-kv-edo').onclick = ()=>{ if(confirm('会替换库内 epub 并触发重扫, 继续?')) kvAct('edition-all', '重排版执行'); };
 $('b-kv-self').onclick = ()=>kvAct('selfcheck', '体检');
+
+// ---- 阅读样式增强 (Kavita 行间距等) ----------------------------------
+let rsConf = null;   // 服务端返回的 {enabled, items, presets, css, version}
+function rsParseDecls(s){
+  const out = {};
+  String(s||'').split(/[;\n]/).forEach(part=>{
+    const i = part.indexOf(':');
+    if(i < 0) return;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i+1).replace(/!important/gi, '').trim();
+    if(k && v) out[k] = v;
+  });
+  return out;
+}
+function rsDeclsText(d){ return Object.keys(d||{}).map(k => k+': '+d[k]).join('; '); }
+
+function rsRow(it){
+  const box = document.createElement('div');
+  box.className = 'card rs-item';
+  box.dataset.id = (it && it.id) || '';
+  box.innerHTML =
+    '<div class="row" style="margin:0 0 6px;align-items:center">' +
+      '<label style="display:flex;align-items:center;gap:6px">' +
+        '<input type="checkbox" class="rs-on"> 启用</label>' +
+      '<input class="rs-name" placeholder="规则名" style="width:120px">' +
+      '<input class="rs-sel" placeholder=".book-content p" style="flex:1;min-width:180px">' +
+      '<button class="rs-del">删除</button>' +
+    '</div>' +
+    '<input class="rs-decl" placeholder="line-height: 1.8; letter-spacing: 0.02em" style="width:100%">';
+  box.querySelector('.rs-on').checked = it ? it.enabled !== false : true;
+  box.querySelector('.rs-name').value = it ? (it.name||'') : '';
+  box.querySelector('.rs-sel').value = it ? (it.selector||'') : '';
+  box.querySelector('.rs-decl').value = it ? rsDeclsText(it.decls) : '';
+  box.querySelector('.rs-del').onclick = () => { box.remove(); rsSave('删除规则'); };
+  return box;
+}
+
+function rsCollect(){
+  const items = [...document.querySelectorAll('#rs-items .rs-item')].map(n => ({
+    id: n.dataset.id || '',
+    name: n.querySelector('.rs-name').value,
+    selector: n.querySelector('.rs-sel').value,
+    decls: rsParseDecls(n.querySelector('.rs-decl').value),
+    enabled: n.querySelector('.rs-on').checked,
+    important: true
+  }));
+  return { enabled: $('rs-en').checked, items: items };
+}
+
+function rsPaint(j){
+  rsConf = j;
+  $('rs-en').checked = !!j.enabled;
+  $('rs-pill').textContent = j.enabled ? ('启用 · v' + j.version) : '已关闭';
+  $('rs-pill').className = 'pill ' + (j.enabled ? 'ok' : 'err');
+  $('rs-meta').innerHTML = '规则 <b>' + (j.items||[]).length + '</b> 条 · 版本 <b>v' +
+    esc(j.version) + '</b> · 更新 <b>' + esc(j.updated || '—') + '</b>' +
+    ' · 落盘 <code>' + esc(j.path || '') + '</code>';
+  const host = $('rs-items');
+  host.innerHTML = '';
+  (j.items||[]).forEach(it => host.appendChild(rsRow(it)));
+  const lh = (j.items||[]).find(i => i.id === 'line-height');
+  const v = lh && lh.decls && lh.decls['line-height'] ? parseFloat(lh.decls['line-height']) : 1.8;
+  const val = (isNaN(v) ? 1.8 : v);
+  $('rs-lh').value = val;
+  $('rs-lh-val').textContent = Number(val).toFixed(2);
+  $('rs-css').textContent = j.css || '(当前未启用 / 无规则)';
+  const sel = $('rs-preset');
+  const cur = sel.value;
+  sel.innerHTML = (j.presets||[]).map((p, i) =>
+    '<option value="' + i + '">' + esc(p.name) + '</option>').join('');
+  if(cur) sel.value = cur;
+}
+
+async function loadReaderCss(){
+  try{
+    const r = await fetch('/api/reader_css'); const j = await r.json();
+    if(j.error){ $('rs-meta').textContent = '加载失败: ' + j.error; return; }
+    rsPaint(j);
+  }catch(e){ $('rs-meta').textContent = '加载失败: ' + e.message; }
+}
+
+async function rsSave(what){
+  const conf = rsCollect();
+  if(!conf.items.length && conf.enabled){ conf.enabled = false; $('rs-en').checked = false; }
+  try{
+    const j = await postJson('/api/reader_css', {op:'save', conf: conf});
+    if(j.error){ $('rs-meta').textContent = (what||'保存') + '失败: ' + j.error; return; }
+    rsPaint(j);
+    openSec('sec-rs');
+    $('rs-meta').innerHTML += ' <span style="color:var(--ok)">✓ ' + esc(what||'已保存') +
+      ' → v' + esc(j.version) + '</span>';
+  }catch(e){ $('rs-meta').textContent = (what||'保存') + '失败: ' + e.message; }
+}
+
+$('b-rs-save').onclick = ()=>rsSave('已保存');
+$('b-rs-reset').onclick = async ()=>{
+  if(!confirm('恢复默认 (只有一条行间距 1.8)?')) return;
+  try{
+    const j = await postJson('/api/reader_css', {op:'reset'});
+    rsPaint(j); openSec('sec-rs');
+  }catch(e){ $('rs-meta').textContent = '恢复默认失败: ' + e.message; }
+};
+$('b-rs-add').onclick = ()=>{
+  const p = (rsConf && rsConf.presets || [])[Number($('rs-preset').value) || 0] || {};
+  const box = rsRow({name: p.name || '新规则', selector: p.selector || '', decls: p.decls || {}});
+  $('rs-items').appendChild(box);
+  openSec('sec-rs');
+  box.querySelector('.rs-name').focus();
+};
+$('b-rs-preview').onclick = ()=>{
+  const el = $('rs-css');
+  el.style.display = (el.style.display === 'none') ? '' : 'none';
+};
+let rsLhTimer = null;
+$('rs-lh').oninput = ()=>{
+  const v = Number($('rs-lh').value);
+  $('rs-lh-val').textContent = v.toFixed(2);
+  const row = [...document.querySelectorAll('#rs-items .rs-item')]
+    .find(n => n.dataset.id === 'line-height');
+  const decl = row ? row.querySelector('.rs-decl') : null;
+  if(!decl) return;
+  const d = rsParseDecls(decl.value);
+  d['line-height'] = v.toFixed(2);
+  decl.value = rsDeclsText(d);
+  clearTimeout(rsLhTimer);
+  rsLhTimer = setTimeout(()=>rsSave('行间距已保存'), 700);
+};
 
 // ---- 掌阅认证 --------------------------------------------------------
 let qrTimer = null;
@@ -1390,7 +1605,7 @@ $('b-cl-dir-save').onclick = async ()=>{
 };
 
 loadState(); loadLog(); loadAuth(); loadKavita();
-loadCloud(false); loadCloudLocal();
+loadCloud(false); loadCloudLocal(); loadReaderCss();
 </script></body></html>"""
 
 
