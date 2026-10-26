@@ -532,8 +532,14 @@ def _reader_css_post(body: dict) -> dict:
         conf["items"] = [i for i in conf["items"] if i["id"] != drop]
     elif op == "line_height":
         conf = rc.set_line_height(rc.load(), body.get("value"))
+    elif op == "theme":
+        conf = rc.set_theme(rc.load(), body.get("theme"))
     else:
         conf = body.get("conf") if isinstance(body.get("conf"), dict) else body
+        # 老前端 (或第三方调用) 的 conf 里没有 theme 时不要把它重置成默认
+        if isinstance(conf, dict) and "theme" not in conf:
+            cur = rc.load()
+            conf = dict(conf, theme=cur.get("theme") or rc.DEFAULT_THEME)
     saved = rc.save(conf)
     out = rc.summary()
     out["saved"] = {"version": saved["version"], "items": len(saved["items"]),
@@ -1045,6 +1051,14 @@ details.sec>summary:hover{background:#20242b}
     <div class="meta" id="rs-meta" style="margin-bottom:8px">加载中…</div>
     <div class="row" style="margin:0 0 8px;align-items:center">
       <label style="display:flex;align-items:center;gap:6px">
+        阅读主题
+        <select id="rs-theme"></select>
+      </label>
+      <span id="rs-theme-swatch"></span>
+      <span class="meta" id="rs-theme-desc" style="margin-left:2px">—</span>
+    </div>
+    <div class="row" style="margin:0 0 8px;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px">
         <input type="checkbox" id="rs-en"> 启用
       </label>
       <label style="display:flex;align-items:center;gap:6px">
@@ -1068,7 +1082,9 @@ details.sec>summary:hover{background:#20242b}
     </div>
     <pre id="rs-css" class="out" style="max-height:220px;margin-top:8px">—</pre>
     <div class="meta" id="rs-hint" style="margin-top:8px">
-      规则完全由这里管 (增 / 改 / 删)。<b>保存并应用</b> = 存配置 + 运行时注入
+      <b>阅读主题</b> 三选一 —— 默认 (不动 Kavita 原界面) / 飞书云文档 / 代码 Console,
+      只改字体·配色·纸张留白, <b>不碰行间距</b> (滑块仍然独立生效)。切换即时保存。
+      <br>规则完全由这里管 (增 / 改 / 删)。<b>保存并应用</b> = 存配置 + 运行时注入
       (开着的 Kavita 页面 60 秒内自动生效, 不重启容器)。<b>Patch 到 Kavita 文件</b> =
       额外把同一份 CSS 写进 Kavita 的 <code>index.html</code> (兜底, 与 JS/后端无关;
       index.html 可能被浏览器缓存, 改完请 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷)。
@@ -1273,12 +1289,48 @@ function rsCollect(){
     enabled: n.querySelector('.rs-on').checked,
     important: true
   }));
-  return { enabled: $('rs-en').checked, items: items };
+  return { enabled: $('rs-en').checked, theme: $('rs-theme').value, items: items };
+}
+
+// 主题: 三选一 (默认 / 飞书云文档 / 代码 Console)。切换只动 theme 字段,
+// 行间距等规则 (items) 一个字都不碰, 所以滑块位置不会跳。
+function rsPaintTheme(j){
+  const list = j.themes || [];
+  const cur = j.theme || 'default';
+  $('rs-theme').innerHTML = list.map(t =>
+    '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>').join('');
+  if(list.some(t => t.id === cur)) $('rs-theme').value = cur;
+  const t = list.find(x => x.id === $('rs-theme').value) || {};
+  $('rs-theme-desc').textContent = t.desc || '—';
+  const sw = t.swatch || [];
+  $('rs-theme-swatch').innerHTML = sw.length ? sw.map(function (c) {
+    return '<span style="display:inline-block;width:14px;height:14px;border-radius:3px;' +
+      'margin-left:2px;vertical-align:-3px;border:1px solid rgba(0,0,0,.25);' +
+      'background:' + esc(c) + '"></span>';
+  }).join('') : '';
+}
+
+async function rsApplyTheme(){
+  const id = $('rs-theme').value;
+  const keepPatch = !!(rsConf && rsConf.file && rsConf.file.patched);
+  $('rs-theme-desc').textContent = '切换中…';
+  try{
+    const j = await postJson('/api/reader_css', {op:'theme', theme: id, patch: keepPatch});
+    if(j.error){ $('rs-theme-desc').textContent = '切换失败: ' + j.error; return; }
+    rsPaint(j);
+    openSec('sec-rs');
+    $('rs-meta').innerHTML += ' <span style="color:var(--ok)">✓ 主题 ' + esc(id) +
+      ' → v' + esc(j.version) + '</span>' +
+      (keepPatch ? (j.patch_error
+        ? ' <span class="lv-ERROR">文件侧同步失败: ' + esc(j.patch_error) + '</span>'
+        : ' <span class="k">(文件侧已同步)</span>') : '');
+  }catch(e){ $('rs-theme-desc').textContent = '切换失败: ' + e.message; }
 }
 
 function rsPaint(j){
   rsConf = j;
   $('rs-en').checked = !!j.enabled;
+  rsPaintTheme(j);
   $('rs-pill').textContent = j.enabled ? ('启用 · v' + j.version) : '已关闭';
   $('rs-pill').className = 'pill ' + (j.enabled ? 'ok' : 'err');
   $('rs-meta').innerHTML = '规则 <b>' + (j.items||[]).length + '</b> 条 · 版本 <b>v' +
@@ -1387,6 +1439,7 @@ $('b-rs-preview').onclick = ()=>{
   const el = $('rs-css');
   el.style.display = (el.style.display === 'none') ? '' : 'none';
 };
+$('rs-theme').onchange = rsApplyTheme;
 let rsLhTimer = null;
 $('rs-lh').oninput = ()=>{
   const v = Number($('rs-lh').value);

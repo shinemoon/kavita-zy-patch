@@ -58,6 +58,142 @@ PRESETS = [
 
 _PROP_RE = re.compile(r"^[a-z][a-z-]{1,40}$")
 
+# ---- 阅读主题 (2026-10-26) --------------------------------------------------
+#
+# 用户要的三选一: 默认 (Kavita 原界面, 一个字都不改) / 飞书云文档 / 代码 Console。
+# **主题只动字体/颜色/底色/页边距这一类"外观", 绝不写 line-height** ——
+# 行间距永远由上面那条 line-height 规则独立控制 (主题切换不影响滑块)。
+# 主题规则先渲染, 用户规则后渲染 → 冲突时用户的规则赢。
+#
+# 选择器只用 Kavita 阅读器的真实结构 (实测 DOM, 2026-10-26):
+#   .reader-container           整页底 (实测白底)
+#   .reading-section.immersive  上下 38px padding
+#   .book-container.immersive
+#   .book-content.immersive     正文容器 (实测 840px 宽, 里面是 epub 自带 div/p)
+# epub 自带的内联 font-family 要整片压掉 → 用 `.book-content *` 打 !important
+# (author !important 能压 inline style, 普通声明压不住)。
+_THEME_FONT_FEISHU = ('-apple-system, "PingFang SC", "Noto Sans SC", '
+                      '"Microsoft YaHei", "Helvetica Neue", sans-serif')
+_THEME_FONT_CONSOLE = ('"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, '
+                       'Menlo, Consolas, "Noto Sans Mono CJK SC", monospace')
+
+# Kavita 的主题 CSS (brtheme-white) 里有这几条硬声明, 跟我们同级甚至更晚:
+#   .reader-container { color: black !important; background-color: white !important; }   ← !important
+#   .book-content :not(code), .book-content :not(a) { background-color: white; ... }
+# 所以我们的选择器要**抬一级特异度** (双写类名) 才压得住; 光靠 !important 不够
+# (同级 !important 谁在后面谁赢, 而注入的 <style> 在 brtheme 之前)。
+_K = ".book-content.book-content"          # 特异度 (0,2,0)
+_CANVAS = ".reader-container.reader-container"
+
+THEMES = [
+    {
+        "id": "default",
+        "name": "默认（Kavita 原界面）",
+        "desc": "一个字都不改，只应用下面这些规则（行间距等）",
+        "swatch": ["#1f2020", "#efefef"],
+        "rules": [],
+    },
+    {
+        "id": "feishu",
+        "name": "飞书云文档",
+        "desc": "浅灰画布 + 白色纸张卡片，苹方/思源黑，正文 #1f2329，链接飞书蓝",
+        "swatch": ["#f2f3f5", "#3370ff"],
+        "rules": [
+            {"selector": _CANVAS,
+             "decls": {"background-color": "#f2f3f5"}},
+            {"selector": _K,
+             "decls": {
+                 "background-color": "#ffffff",
+                 "width": "100%",
+                 "max-width": "780px",
+                 "margin": "0 auto",
+                 "padding": "clamp(20px, 4vw, 48px) clamp(16px, 4vw, 52px) 56px",
+                 "border-radius": "8px",
+                 "box-shadow": "0 1px 2px rgba(31,35,41,.06), 0 6px 18px rgba(31,35,41,.06)",
+                 "box-sizing": "border-box",
+             }},
+            {"selector": _K + ", " + _K + " *",
+             "decls": {"font-family": _THEME_FONT_FEISHU}},
+            {"selector": _K + " *",
+             "decls": {"color": "#1f2329", "letter-spacing": "0"}},
+            {"selector": _K + " h1, " + _K + " h2, " + _K + " h3, " + _K + " h4",
+             "decls": {"color": "#1f2329", "font-weight": "600"}},
+            {"selector": _K + " a",
+             "decls": {"color": "#3370ff"}},
+            {"selector": _K + " blockquote",
+             "decls": {"color": "#646a73", "background-color": "#f7f8fa",
+                       "border-left": "3px solid #dee0e3", "margin-left": "0",
+                       "padding": "8px 14px", "border-radius": "0 4px 4px 0"}},
+            {"selector": _K + " hr",
+             "decls": {"border-color": "#dee0e3"}},
+            {"selector": _K + " table, " + _K + " th, " + _K + " td",
+             "decls": {"border-color": "#dee0e3"}},
+            {"selector": _K + " th",
+             "decls": {"background-color": "#f5f6f7"}},
+            {"selector": _K + " img",
+             "decls": {"border-radius": "4px"}},
+            {"selector": _K + " ::selection",
+             "decls": {"background": "rgba(51,112,255,.22)"}},
+        ],
+    },
+    {
+        "id": "console",
+        "name": "代码 Console",
+        "desc": "深色终端底 + 等宽字体，标题绿、链接青、引用灰",
+        "swatch": ["#0b0e14", "#7ee787"],
+        "rules": [
+            {"selector": _CANVAS,
+             "decls": {"background-color": "#0b0e14", "color": "#c9d1d9"}},
+            {"selector": _K,
+             "decls": {
+                 "background-color": "#0d1117",
+                 "width": "100%",
+                 "max-width": "900px",
+                 "margin": "0 auto",
+                 "padding": "28px clamp(14px, 3vw, 36px) 48px",
+                 "border": "1px solid #21262d",
+                 "border-radius": "6px",
+                 "box-shadow": "0 10px 30px rgba(0,0,0,.35)",
+                 "box-sizing": "border-box",
+             }},
+            {"selector": _K + ", " + _K + " *",
+             "decls": {"font-family": _THEME_FONT_CONSOLE}},
+            # epub 常在 div/span 上写死白底 (brtheme 也会补白底), 不压掉就是白块黑字
+            {"selector": _K + " *",
+             "decls": {"color": "#c9d1d9", "background-color": "transparent",
+                       "letter-spacing": "0"}},
+            {"selector": _K + " h1, " + _K + " h2, " + _K + " h3, " + _K + " h4",
+             "decls": {"color": "#7ee787", "border-left": "3px solid #238636",
+                       "padding-left": "10px", "background-color": "transparent"}},
+            {"selector": _K + " a",
+             "decls": {"color": "#58a6ff", "background-color": "transparent"}},
+            {"selector": _K + " blockquote",
+             "decls": {"color": "#8b949e", "border-left": "3px solid #30363d",
+                       "margin-left": "0", "padding-left": "12px",
+                       "background-color": "transparent"}},
+            {"selector": _K + " hr",
+             "decls": {"border-color": "#21262d"}},
+            {"selector": _K + " table, " + _K + " th, " + _K + " td",
+             "decls": {"border-color": "#30363d"}},
+            {"selector": _K + " ::selection",
+             "decls": {"background": "rgba(56,139,253,.35)"}},
+        ],
+    },
+]
+THEME_IDS = [t["id"] for t in THEMES]
+DEFAULT_THEME = "default"
+
+
+def theme_meta() -> list[dict]:
+    """给 5012 前端用 (不含 rules, 省流量)。"""
+    return [{"id": t["id"], "name": t["name"], "desc": t["desc"],
+             "swatch": t.get("swatch") or []} for t in THEMES]
+
+
+def _theme_rules(theme_id) -> list[dict]:
+    t = next((x for x in THEMES if x["id"] == theme_id), None)
+    return list(t["rules"]) if t else []
+
 
 def patch_root() -> Path:
     return Path(os.environ.get("ZY_PATCH_ROOT", "/vol2/1001/kavita-zy-patch"))
@@ -108,6 +244,7 @@ def default_conf() -> dict:
         "version": 1,
         "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "enabled": True,
+        "theme": DEFAULT_THEME,
         "items": [json.loads(json.dumps(i)) for i in DEFAULT_ITEMS],
     }
 
@@ -115,6 +252,9 @@ def default_conf() -> dict:
 def normalize(conf) -> dict:
     """把任意输入收敛成合法配置。坏字段丢掉, 不抛错 (502 不该因为一条脏规则消失)。"""
     conf = conf if isinstance(conf, dict) else {}
+    theme = str(conf.get("theme") or DEFAULT_THEME).strip().lower()
+    if theme not in THEME_IDS:
+        theme = DEFAULT_THEME
     items_in = conf.get("items")
     items_in = items_in if isinstance(items_in, list) else []
     taken: set[str] = set()
@@ -144,6 +284,7 @@ def normalize(conf) -> dict:
         "version": max(1, ver),
         "updated": str(conf.get("updated") or ""),
         "enabled": bool(conf.get("enabled", True)),
+        "theme": theme,
         "items": items,
     }
 
@@ -183,20 +324,40 @@ def save(conf) -> dict:
     return new
 
 
+def _rule_line(selector: str, decls: dict, important: bool = True) -> str:
+    bang = " !important" if important else ""
+    body = " ".join(f"{k}: {v}{bang};" for k, v in decls.items())
+    return f"{selector} {{ {body} }}"
+
+
 def render_css(conf) -> str:
     conf = normalize(conf)
     if not conf["enabled"]:
         return ""
     lines = [CSS_VER_HEADER.format(ver=conf["version"], ts=conf["updated"] or "-")]
+    # 主题先行: 用户规则渲染在后面, 冲突时用户赢 (主题不写 line-height)
+    theme = conf.get("theme") or DEFAULT_THEME
+    for rule in _theme_rules(theme):
+        sel = _clean_selector(rule.get("selector"))
+        decls = _clean_decls(rule.get("decls"))
+        if sel and decls:
+            lines.append(f"/* theme: {theme} */ " + _rule_line(sel, decls))
     for it in conf["items"]:
         if not it["enabled"]:
             continue
-        bang = " !important" if it.get("important", True) else ""
-        body = " ".join(f"{k}: {v}{bang};" for k, v in it["decls"].items())
-        lines.append(f"{it['selector']} {{ {body} }}")
+        lines.append(_rule_line(it["selector"], it["decls"],
+                                it.get("important", True)))
     if len(lines) == 1:
         return ""
     return "\n".join(lines) + "\n"
+
+
+def set_theme(conf, theme) -> dict:
+    """切换阅读主题。只动 theme 字段 —— items (行间距等) 一个字都不碰。"""
+    conf = normalize(conf)
+    t = str(theme or "").strip().lower()
+    conf["theme"] = t if t in THEME_IDS else DEFAULT_THEME
+    return conf
 
 
 def set_line_height(conf, value) -> dict:
@@ -219,6 +380,8 @@ def summary() -> dict:
         "enabled": conf["enabled"],
         "version": conf["version"],
         "updated": conf["updated"],
+        "theme": conf.get("theme") or DEFAULT_THEME,
+        "themes": theme_meta(),
         "items": conf["items"],
         "presets": PRESETS,
         "css": render_css(conf),
