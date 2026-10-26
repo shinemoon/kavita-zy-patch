@@ -837,96 +837,135 @@ td:last-child{text-align:right;white-space:nowrap;color:var(--dim)}
 .auth-ok{color:var(--ok)}.auth-no{color:var(--dim)}.auth-wait{color:var(--acc)}
 .pill{display:inline-block;font-size:12px;padding:1px 8px;border-radius:10px;
   border:1px solid var(--line);color:var(--dim)}
+.pill.ok{color:var(--ok);border-color:#3c4a35}.pill.err{color:var(--err);border-color:#4a3330}
+details.sec{background:#1b1e24;border:1px solid var(--line);border-radius:10px;
+  margin-bottom:12px;overflow:hidden}
+details.sec>summary{list-style:none;cursor:pointer;padding:12px 14px;font-size:14px;
+  font-weight:600;display:flex;align-items:center;gap:8px;user-select:none}
+details.sec>summary::-webkit-details-marker{display:none}
+details.sec>summary::after{content:"›";margin-left:auto;color:var(--dim);font-size:16px;
+  line-height:1;transform:rotate(90deg);transition:transform .15s}
+details.sec[open]>summary::after{transform:rotate(-90deg)}
+details.sec>summary:hover{background:#20242b}
+.sec-body{padding:0 14px 14px}
+.cnt{font-size:12px;color:var(--dim);font-weight:400}
+.divider{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:12px;
+  margin:22px 0 10px}
+.divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--line)}
 </style></head><body>
 <h1>掌阅桥接</h1>
 <div class="sub">Kavita ⇄ 掌阅 · 本地 CLI 驱动</div>
 
-<div class="card" id="auth-card">
-  <h2>掌阅认证 <span class="pill" id="auth-pill">…</span></h2>
-  <div class="meta" id="auth-meta" style="margin-bottom:6px">加载中…</div>
-  <div class="row" style="margin-bottom:0">
-    <button id="b-qr">刷新二维码</button>
-    <button id="b-authchk">检查状态</button>
-  </div>
-  <div id="qr-host"></div>
-</div>
-
-<div class="card" id="kv-card">
-  <h2>Kavita 改造 <span class="pill" id="kv-pill">…</span></h2>
-  <div class="meta" id="kv-meta" style="margin-bottom:8px">加载中…</div>
-  <div id="kv-checks"></div>
-  <div class="row" style="margin:10px 0 0">
-    <button id="b-kv-boot">一键改造 / 新装适配</button>
-    <button id="b-kv-install">注入 / 重打</button>
-    <button id="b-kv-api">重启补丁后端</button>
-  </div>
-  <div class="row" style="margin:8px 0 0">
-    <button id="b-kv-heal">立即自检</button>
-    <button id="b-kv-cron">装自启 (免 root)</button>
-    <button id="b-kv-auto">装自启 (systemd)</button>
-    <button id="b-kv-heal-off">关自愈</button>
-    <button id="b-kv-heal-on">开自愈</button>
-  </div>
-  <div class="row" style="margin:8px 0 0">
-    <button id="b-kv-edry">重排版 dry-run</button>
-    <button id="b-kv-edo">重排版执行</button>
-    <button id="b-kv-self">体检</button>
-    <button id="b-kv-check">重新检测</button>
-  </div>
-  <div class="meta" id="kv-auto" style="margin:10px 0 0">自启状态…</div>
-  <div class="meta" id="kv-heal" style="margin:6px 0 0">自愈状态…</div>
-  <details style="margin-top:8px">
-    <summary class="meta" style="cursor:pointer">自愈日志 (最近 60 行)</summary>
-    <pre id="kv-heal-log" class="out" style="margin-top:6px;max-height:220px">加载中…</pre>
-  </details>
-  <div class="meta" style="margin:10px 0 0">
-    容器重建 (换镜像) 会清掉前端注入 —— 其余两项跟卷走。
-    重排版会替换库内 epub 并重扫, 原书归档在 <code>state/backup/</code>。<br>
-    <b>Kavita 里看不到「掌阅同步」?</b> 先 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷
-    (index.html 被浏览器缓存过就会这样); 入口现在有两个 —— 顶栏右侧图标+文字,
-    和左侧抽屉里的「掌阅同步」。也可以直接开
-    <a id="kv-console-link" href="/" target="_blank">本控制台</a>。
-  </div>
-  <details style="margin-top:8px">
-    <summary class="meta" style="cursor:pointer">参数 (改 <code>patch.conf</code> 后点「注入 / 重打」生效)</summary>
-    <table id="kv-conf" style="margin-top:6px"></table>
-  </details>
-</div>
-
-<div class="card" id="cloud-card">
-  <h2>掌阅个人云书籍 <span class="pill" id="cl-pill">…</span></h2>
-  <div class="meta" id="cl-meta" style="margin-bottom:8px">加载中…</div>
-  <div class="row" style="margin-bottom:8px">
-    <input id="cl-dest" placeholder="/vol2/1001/dav/Books/掌阅" style="flex:1;min-width:220px">
-    <button id="b-cl-dir-save">保存目录</button>
-    <button id="b-cl-refresh">刷新列表</button>
-  </div>
-  <div class="meta" id="cl-dir-hint" style="margin-bottom:8px">下载与搬移都只落在这个目录（可新建子目录）。</div>
-  <div id="cl-list">加载中…</div>
-  <div class="meta" id="cl-jobs" style="margin-top:8px"></div>
-</div>
-
-<div class="card" id="cl-local-card">
-  <h2>已下载到本地</h2>
-  <div id="cl-local" class="meta">加载中…</div>
-</div>
-
-<div class="row">
+<div class="row" style="margin-bottom:10px">
   <button id="b-push">推到掌阅</button>
   <button id="b-pull">从掌阅拉</button>
   <button id="b-refresh">刷新状态</button>
 </div>
-<div class="meta" id="meta">加载中…</div>
-<div id="links"></div>
+<div class="meta" id="meta" style="margin-bottom:12px">加载中…</div>
 
-<div class="card"><h2>最近日志</h2><pre id="log"></pre></div>
-<div class="card"><h2 id="out-h">执行结果</h2><pre id="out">—</pre></div>
+<details class="sec" id="sec-out">
+  <summary><span id="out-h">执行结果</span></summary>
+  <div class="sec-body"><pre id="out">—</pre></div>
+</details>
+
+<details class="sec" id="sec-links">
+  <summary>同步映射 <span class="cnt" id="link-cnt">…</span></summary>
+  <div class="sec-body" id="links"></div>
+</details>
+
+<details class="sec" id="sec-cloud">
+  <summary>掌阅个人云书籍 <span class="pill" id="cl-pill">…</span></summary>
+  <div class="sec-body">
+    <div class="meta" id="cl-meta" style="margin-bottom:8px">加载中…</div>
+    <div class="row" style="margin-bottom:8px">
+      <input id="cl-dest" placeholder="/vol2/1001/dav/Books/掌阅" style="flex:1;min-width:200px">
+      <button id="b-cl-dir-save">保存目录</button>
+      <button id="b-cl-refresh">刷新列表</button>
+    </div>
+    <div class="meta" id="cl-dir-hint" style="margin-bottom:8px">下载与搬移都只落在这个目录（可新建子目录）。</div>
+    <div id="cl-list">加载中…</div>
+    <div class="meta" id="cl-jobs" style="margin-top:8px"></div>
+  </div>
+</details>
+
+<details class="sec" id="sec-local">
+  <summary>已下载到本地 <span class="cnt" id="local-cnt">…</span></summary>
+  <div class="sec-body"><div id="cl-local" class="meta">加载中…</div></div>
+</details>
+
+<div class="divider"><span>初始化 / 维护</span></div>
+
+<details class="sec" id="sec-auth">
+  <summary>掌阅认证 <span class="pill" id="auth-pill">…</span></summary>
+  <div class="sec-body">
+    <div class="meta" id="auth-meta" style="margin-bottom:6px">加载中…</div>
+    <div class="row" style="margin-bottom:0">
+      <button id="b-qr">刷新二维码</button>
+      <button id="b-authchk">检查状态</button>
+    </div>
+    <div id="qr-host"></div>
+  </div>
+</details>
+
+<details class="sec" id="sec-kv">
+  <summary>Kavita 改造 <span class="pill" id="kv-pill">…</span></summary>
+  <div class="sec-body">
+    <div class="meta" id="kv-meta" style="margin-bottom:8px">加载中…</div>
+    <div class="row" style="margin:0 0 6px">
+      <button id="b-kv-check">重新检测</button>
+      <button id="b-kv-heal">立即自检</button>
+      <button id="b-kv-self">体检</button>
+    </div>
+    <div id="kv-checks"></div>
+    <div class="meta" style="margin:12px 0 4px">一次性 / 初始化动作</div>
+    <div class="row" style="margin:0 0 6px">
+      <button id="b-kv-boot">一键改造 / 新装适配</button>
+      <button id="b-kv-install">注入 / 重打</button>
+      <button id="b-kv-api">重启补丁后端</button>
+    </div>
+    <div class="row" style="margin:0 0 6px">
+      <button id="b-kv-cron">装自启 (免 root)</button>
+      <button id="b-kv-auto">装自启 (systemd)</button>
+      <button id="b-kv-heal-off">关自愈</button>
+      <button id="b-kv-heal-on">开自愈</button>
+    </div>
+    <div class="row" style="margin:0 0 6px">
+      <button id="b-kv-edry">重排版 dry-run</button>
+      <button id="b-kv-edo">重排版执行</button>
+    </div>
+    <div class="meta" id="kv-auto" style="margin:10px 0 0">自启状态…</div>
+    <div class="meta" id="kv-heal" style="margin:6px 0 0">自愈状态…</div>
+    <details style="margin-top:8px">
+      <summary class="meta" style="cursor:pointer">自愈日志 (最近 60 行)</summary>
+      <pre id="kv-heal-log" class="out" style="margin-top:6px;max-height:220px">加载中…</pre>
+    </details>
+    <details style="margin-top:8px">
+      <summary class="meta" style="cursor:pointer">参数 (改 <code>patch.conf</code> 后点「注入 / 重打」生效)</summary>
+      <table id="kv-conf" style="margin-top:6px"></table>
+    </details>
+    <div class="meta" style="margin:10px 0 0">
+      容器重建 (换镜像) 会清掉前端注入 —— 其余两项跟卷走。
+      重排版会替换库内 epub 并重扫, 原书归档在 <code>state/backup/</code>。<br>
+      <b>Kavita 里看不到「掌阅同步」?</b> 先 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷
+      (index.html 被浏览器缓存过就会这样); 入口现在有两个 —— 顶栏右侧图标+文字,
+      和左侧抽屉里的「掌阅同步」。也可以直接开
+      <a id="kv-console-link" href="/" target="_blank">本控制台</a>。
+    </div>
+  </div>
+</details>
+
+<details class="sec" id="sec-log">
+  <summary>最近日志</summary>
+  <div class="sec-body"><pre id="log"></pre></div>
+</details>
 
 <script>
 const $ = id => document.getElementById(id);
 let busy = false;
 function setBusy(b){ busy=b; document.querySelectorAll('button').forEach(x=>x.disabled=b); }
 function esc(s){ return String(s??'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function openSec(id){ const el = $(id); if(el && !el.open) el.open = true; }
+function closeSec(id){ const el = $(id); if(el && el.open) el.open = false; }
 
 async function loadState(){
   try{
@@ -949,6 +988,8 @@ async function loadState(){
       '<tr><td>映射更新</td><td>'+esc(l.updated_utc||'—')+'</td></tr>' +
       '</table></div>').join('')
       || '<div class="card k">还没有任何映射。CLI: <code>zync.py link</code></div>';
+    const nLink = (j.links||[]).length;
+    $('link-cnt').textContent = nLink ? (nLink + ' 本') : '还没有';
   }catch(e){ $('meta').textContent = '加载失败: ' + e.message; }
 }
 async function loadLog(){
@@ -961,6 +1002,7 @@ async function loadLog(){
 }
 async function run(cmd){
   if(busy) return; setBusy(true);
+  openSec('sec-out');
   $('out-h').textContent = cmd + ' 执行中…'; $('out').textContent = '…';
   try{
     const r = await fetch('/api/run/'+cmd, {method:'POST'});
@@ -975,7 +1017,7 @@ async function run(cmd){
 }
 $('b-push').onclick = ()=>run('push');
 $('b-pull').onclick = ()=>run('pull');
-$('b-refresh').onclick = ()=>{loadState();loadLog();loadAuth();loadKavita();};
+$('b-refresh').onclick = ()=>{loadState();loadLog();loadAuth();loadKavita();loadCloud(false);loadCloudLocal();};
 
 // ---- Kavita 改造 -----------------------------------------------------
 async function loadKavita(){
@@ -1021,6 +1063,7 @@ async function loadHealLog(){
 }
 async function kvAct(action, label){
   if(busy) return; setBusy(true);
+  openSec('sec-out');
   $('out-h').textContent = label + ' 执行中…'; $('out').textContent = '…';
   try{
     const r = await fetch('/api/kavita/action', {method:'POST',
@@ -1216,7 +1259,8 @@ async function loadCloudLocal(){
     const r = await fetch('/api/cloud/local');
     const j = await r.json();
     const fs = j.files || [];
-    if(!fs.length){ host.innerHTML='<div class="meta">还没有下载过</div>'; return; }
+    if(!fs.length){ host.innerHTML='<div class="meta">还没有下载过</div>'; $('local-cnt').textContent='还没有'; return; }
+    $('local-cnt').textContent = fs.length + ' 个文件';
     host.innerHTML = '<table><thead><tr><th>文件</th><th>大小</th><th>操作</th></tr></thead><tbody>'+
       fs.map(f=>'<tr><td>'+esc(f.name||f.path)+
         '<div class="meta" style="font-size:11px">'+esc(f.source||'')+' · '+esc(f.path)+
