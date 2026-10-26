@@ -190,6 +190,38 @@ def test_push_meta_only_when_pct_unchanged():
     assert not ok and why.startswith("regress")
 
 
+def test_best_percent_prefers_notebooks_when_further():
+    """掌阅两套进度存储: getProgress (我们写) 与 getUserNotebooks (App 写)。
+
+    2026-10-26 剑来实证: App 27.755% / getProgress 27.387% → 必须取前者,
+    否则 pull 反复只看到 27.4%。
+    """
+    import sync.sync as S
+    bid = "70776a64c32c1c065dab241f3e9f133a55c7d8b38c5c6fbc79271e87e00e9526"
+    orig = S._zy_notebook_progress
+    try:
+        S._zy_notebook_progress = lambda force=False: {
+            bid[:32]: (0.2775522, "158_0_0$##3-0-158-35920-0##$", 1792979258634)}
+        pct, ok, src = S._best_zy_percent(bid, 0.27387166, True)
+        assert ok and src == "notebooks" and abs(pct - 0.2775522) < 1e-9
+        # App 那份落后 → 仍用 getProgress
+        S._zy_notebook_progress = lambda force=False: {
+            bid[:32]: (0.10, "10_0_0$##3-0-10-0-0##$", 1)}
+        pct, ok, src = S._best_zy_percent(bid, 0.27387166, True)
+        assert src == "progress" and abs(pct - 0.27387166) < 1e-9
+        # 本地拿的 readPercent 解析失败 → App 那份兜底
+        S._zy_notebook_progress = lambda force=False: {
+            bid[:32]: (0.05, "5_0_0$##3-0-5-0-0##$", 1)}
+        pct, ok, src = S._best_zy_percent(bid, 0.0, False)
+        assert ok and src == "notebooks" and abs(pct - 0.05) < 1e-9
+        # 两套都没有这本书 → 原样返回
+        S._zy_notebook_progress = lambda force=False: {}
+        pct, ok, src = S._best_zy_percent(bid, 0.2, True)
+        assert src == "progress" and abs(pct - 0.2) < 1e-9
+    finally:
+        S._zy_notebook_progress = orig
+
+
 # ---- edition 自检 -------------------------------------------------------
 
 def test_validate_catches_broken_ncx(tmp_path):

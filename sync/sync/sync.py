@@ -67,6 +67,62 @@ def _normalize_percent(raw) -> tuple[float, bool]:
     return min(1.0, v), True
 
 
+_NB_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+def _zy_notebook_progress(force: bool = False) -> dict[str, tuple[float | None, str | None, int]]:
+    """getUserNotebooks 里的 per-book 进度 —— 掌阅有**两套**进度存储。
+
+    1. ``uploadProcess`` / ``getProgress``: 我们 push 写这里, 也是原来 pull
+       唯一读的地方。
+    2. ``getUserNotebooks`` 的 ``readpostion`` / ``readpercent``: **App 自己**
+       写这里 (带 deviceName / updatetime), 有自己的更新节奏。
+
+    实测 2026-10-26 剑来: App 已读到 27.755% (spine 158), 而 getProgress 还
+    停在我们 00:39 push 的 27.387% (spine 155) → 5012 反复 pull 只能看到
+    27.4%, 用户看到的是 App 里的 27.7%。两份取**更靠前**的那份。
+
+    返回 {bookid 前 32 hex 小写: (pct01|None, readpostion|None, updatetime_ms)}
+    """
+    now = time.time()
+    if (not force and _NB_CACHE.get("data") is not None
+            and now - float(_NB_CACHE.get("ts") or 0) < 120):
+        return _NB_CACHE["data"]
+    out: dict[str, tuple[float | None, str | None, int]] = {}
+    try:
+        from . import zy_notes            # 延迟 import: zy_notes 依赖较重
+        rows = zy_notes.notebooks() or []
+    except Exception:
+        log.warning("getUserNotebooks 读取失败, 本轮只看 getProgress", exc_info=True)
+        rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        bid = str(row.get("bookid") or "").strip().lower()[:32]
+        if not bid:
+            continue
+        pct, ok = _normalize_percent(row.get("readpercent"))
+        try:
+            ts = int(row.get("updatetime") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        out[bid] = (pct if ok else None, row.get("readpostion") or None, ts)
+    _NB_CACHE.update(ts=now, data=out)
+    return out
+
+
+def _best_zy_percent(zy_book_id: str, pct_from_progress: float, ok: bool) -> tuple[float, bool, str]:
+    """getProgress 与 getUserNotebooks 两份进度取靠前者。
+
+    返回 (pct01, ok, 来源说明)。App 那份更新时以它为准 —— 读者真实位置在
+    App 本地, 它写的 readpercent/readpostion 才是权威。
+    """
+    nb = _zy_notebook_progress().get(str(zy_book_id or "").strip().lower()[:32])
+    if nb and nb[0] is not None and (not ok or nb[0] > pct_from_progress + 1e-9):
+        return nb[0], True, "notebooks"
+    return pct_from_progress, ok, "progress"
+
+
 def _pagemap_for(link) -> dict | None:
     """取这本书的 kpages sidecar (Kavita 版重排的映射表)。
 
@@ -339,6 +395,9 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
         for bid, rec in recs.items():
             rp = (rec or {}).get("readProcess") or {}
             v, ok = _normalize_percent(rp.get("readPercent"))
+            # 防回退基线也要看 App 那份 (getUserNotebooks), 否则 App 读到
+            # 27.7% 时我们还以为掌阅只到 27.4%, 会把进度往回拨。
+            v, ok, _src = _best_zy_percent(bid, v, ok)
             try:
                 tc = int(str(rp.get("totalCount")))
             except (TypeError, ValueError):
@@ -350,6 +409,17 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
                              tc)
     except Exception:
         log.warning("push: 读掌阅当前进度失败, 本轮回退检查降级", exc_info=True)
+    # getProgress 里根本没这本书 (从没同步过) 但 App 有记录 → 也当基线
+    try:
+        nb_all = _zy_notebook_progress()
+        for l in chosen:
+            if l.zy_book_id in zy_state:
+                continue
+            nb = nb_all.get(str(l.zy_book_id).strip().lower()[:32])
+            if nb and nb[0] is not None:
+                zy_state[l.zy_book_id] = (nb[0], False, None, None)
+    except Exception:
+        log.debug("push: notebooks 基线合并失败", exc_info=True)
     for p in kavita_db.iter_progress():
         if series_ids is not None and p.series_id not in series_ids:
             continue
@@ -493,6 +563,13 @@ def pull_once(auth: dict | None = None, *, dry_run: bool = False,
             continue
         rp = rec["readProcess"]
         pct01, pct_ok = _normalize_percent(rp.get("readPercent"))
+        # App 自己写的那份可能更新 (见 _zy_notebook_progress): 取靠前者,
+        # 否则 App 已读到 27.7% 我们还在拿 27.4% 反复 pull。
+        pct01, pct_ok, pct_src = _best_zy_percent(l.zy_book_id, pct01, pct_ok)
+        if pct_src != "progress":
+            log.info("pull series=%s 用 App 侧进度 %.4f%% (getProgress=%.4f%%)",
+                     l.kavita_series_id, pct01 * 100.0,
+                     (_normalize_percent(rp.get("readPercent"))[0]) * 100.0)
         ch = rp.get("chapterId") or "0"
         pct = pct01 * 100.0
         kavita_chapters = kavita_db.list_chapters(l.kavita_series_id)

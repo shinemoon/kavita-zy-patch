@@ -191,9 +191,38 @@ python3 tests/test_notes_time.py
 
 | 数据 | 掌阅 → Kavita | Kavita → 掌阅 |
 |---|---|---|
-| 划线 / 批注 | ✅ | ⚠️ 协议已通，当前账号写接口返 `600001 authority is error`（需重新扫码刷新 zysid） |
-| 书签 | ✅ | 同上 |
+| 划线 / 批注 | ✅ | ✅（`uploadData` 的 `?` 拼装 bug 2026-10-24 已修，同一个 zysid 就能写）|
+| 书签 | ✅ | ✅ 同上 |
 | 阅读时长 | ✅ 精确到每天每书 | ✅ 队列 + 位图（幂等；历史 key 会被服务端并入上传日） |
+
+### 进度有两套存储（2026-10-26 发现）
+
+掌阅云端把「读到哪」写两个地方，**更新节奏不同**：
+
+| 存储 | 谁写 | 接口 | 原 pull 是否读 |
+|---|---|---|---|
+| `readProcess` | 我们 push（`readingSource=kavita-bridge`）、App 偶尔写 | `getProgress` / `uploadProcess` | ✅ 唯一来源 |
+| `readpostion` / `readpercent` | **App 自己**（带 `deviceName` / `updatetime`） | `getUserNotebooks` | ❌ 漏了 |
+
+实证（剑来，2026-10-26）：
+
+```
+getProgress       readPercent 0.27387166  readPosition 155_0_0$##3-0-155-47953-0##$
+getUserNotebooks  readpercent 0.27755222  readpostion  158_0_0$##3-0-158-35920-0##$   updatetime 更新 32 小时
+```
+
+App 已读到 27.755%（剑来15 第二章），而 5012 反复 pull 只能算出 27.387% →
+Kavita 书架永远 27.4%，用户在 App 里看到 27.7%。
+
+**修法**：`sync._zy_notebook_progress()` + `_best_zy_percent()` —— 两份取**更靠前**的
+那份（App 那份才是读者真实位置，decode 后与 `getProgress` 同一套字节坐标，
+percent 逐位吻合）。用在两处：
+
+* `pull_once` → 决定写进 Kavita 的页号 / 页内 xpath
+* `push_once` 的防回退基线 → 否则 App 读到 27.7% 时我们还以为掌阅只到 27.4%，
+  会把进度往回拨
+
+`getUserNotebooks` 只列**有笔记的书**，其余书自然退回 `getProgress`。
 
 ---
 
