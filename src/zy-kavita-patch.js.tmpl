@@ -143,14 +143,17 @@
     'background:var(--elevation-layer2);color:var(--text-muted-color);}',
     '#zy-nav-item.zy-ok .zy-badge{background:rgba(74,198,148,.2);color:#4ac694;}',
     '#zy-nav-item.zy-err .zy-badge{background:rgba(189,54,47,.25);color:#BD362F;}',
-    // 自动同步的可见反馈 (只在真的动了位置/推成功时出现, 3.5s 自隐)
-    // 2026-10-26 用户: 稍微低调点 —— 淡入淡出 + 半透明黑底
+    // 自动同步的反馈 (默认静默, 只在失败时出现; 3.5s 自隐)
+    // 2026-10-26 用户: 淡入淡出 + 半透明黑底; 平时不要弹, 失败才提示
     '#zy-toast{position:fixed;right:1rem;bottom:1rem;z-index:99999;max-width:22rem;',
     'background:rgba(0,0,0,.5);color:#e8eaed;border:1px solid rgba(255,255,255,.07);',
     'border-radius:8px;padding:.5rem .75rem;font-size:.78rem;line-height:1.35;',
     'box-shadow:0 2px 10px rgba(0,0,0,.18);opacity:0;transform:translateY(4px);',
     'transition:opacity .3s ease,transform .3s ease;pointer-events:none;',
     'backdrop-filter:blur(2px);}',
+    // 失败态: 只加一道暗红描边, 底色仍是半透明黑 (保持低调)
+    '#zy-toast.err{border-color:rgba(189,54,47,.55);color:#f0d9d7;',
+    'box-shadow:0 0 0 1px rgba(189,54,47,.28),0 2px 10px rgba(0,0,0,.18);}',
     '#zy-toast.on{opacity:1;transform:none;}',
   ].join('');
 
@@ -292,16 +295,27 @@
     if (autoLog.length > 24) autoLog.shift();
   }
 
-  // 右下角小提示: 只在真的同步了位置时弹, 否则用户永远不知道钩子在干活
-  function toast(msg) {
+  // 右下角小提示: **默认静默** —— 只有同步失败 / 未推送成功才弹。
+  // 成功的情况一律只进 autoLog (__ZY__.auto() 可查), 不打扰阅读。
+  function toast(msg, kind) {
     try {
       var n = document.getElementById('zy-toast');
       if (!n) { n = el('div'); n.id = 'zy-toast'; document.body.appendChild(n); }
       n.textContent = msg;
+      if (kind === 'err') n.classList.add('err'); else n.classList.remove('err');
       n.classList.add('on');
       clearTimeout(toast._t);
       toast._t = setTimeout(function () { n.classList.remove('on'); }, 3500);
     } catch (e) {}
+  }
+
+  // 同类提示的节流 (regress 一句可能被反复触发, 不该每 30s 弹一次)
+  var toastGap = {};
+  function toastOnce(key, msg, gapSec) {
+    var now = Date.now();
+    if (now - (toastGap[key] || 0) < (gapSec || 600) * 1000) return;
+    toastGap[key] = now;
+    toast(msg, 'err');
   }
 
   // 心跳: 让服务端 api.log 能证明"这个浏览器加载了哪一版钩子"
@@ -343,20 +357,27 @@
     try { sessionStorage.setItem(ck, String(now)); } catch (e) {}
     note('pull #' + sid + ' …');
     apiPost('/auto/pull', { series_id: sid }).then(function (j) {
-      if (!j || j.ok === false) { note('pull #' + sid + ' busy'); return; }
+      if (!j || j.ok === false) {
+        if (j && j.busy) { note('pull #' + sid + ' busy'); return; }
+        note('pull #' + sid + ' FAIL ' + JSON.stringify(j || {}).slice(0, 120));
+        toastOnce('pull' + sid, '从掌阅拉取进度失败' +
+          (j && j.error ? '：' + j.error : '（后端不可用）'));
+        return;
+      }
       if (j.skipped) { note('pull #' + sid + ' ' + j.skipped); return; }
       note('pull #' + sid + ' ' + j.before + '->' + j.pages_read + '/' + j.pages);
       if (!j.changed) note('pull #' + sid + ' 掌阅没有更新');
-      if (j.changed) {
-        toast('已同步掌阅进度 ' + j.before + ' → ' + j.pages_read + '/' + j.pages);
-      }
+      // 成功不弹提示 (v0.4.9 起默认静默)
       if (!j.changed || !allowReload) return;
       var rk = 'zy_reload_' + sid;
       if (Date.now() - (+(sessionStorage.getItem(rk) || 0)) < 10000) return;
       try { sessionStorage.setItem(rk, String(Date.now())); } catch (e) {}
       note('pull #' + sid + ' 位置变了, 重载到掌阅位置');
       setTimeout(function () { location.reload(); }, 120);
-    }).catch(function (e) { note('pull #' + sid + ' ERR ' + e.message); });
+    }).catch(function (e) {
+      note('pull #' + sid + ' ERR ' + e.message);
+      toastOnce('pull' + sid, '从掌阅拉取进度失败：' + e.message);
+    });
   }
 
   function pushNow(sid, quiet) {
@@ -367,27 +388,42 @@
       note('push #' + sid + ' +' + (d.pushed || 0) + ' ~' + (d.skipped || 0) +
            ' !' + (d.failed || 0) + (quiet ? ' (tick)' : ''));
       heartbeat(true);
-      if (d.pushed > 0) {
-        // 带上具体百分比 —— 用户看到数字才知道"真的推了"
-        var p = null;
-        var det = (j && j.detail && j.detail.detail) || [];
-        for (var k = 0; k < det.length; k++) {
-          if (det[k] && det[k].ok && det[k].pct != null) { p = det[k].pct; break; }
-        }
-        toast(p == null ? '进度已推送到掌阅'
-                        : '已推送到掌阅 ' + (p * 100).toFixed(2) + '%');
+      // 成功不弹 (v0.4.9 默认静默); 失败才提示
+      if (!j || j.ok === false) {
+        if (j && j.busy) return;
+        note('push #' + sid + ' FAIL ' + JSON.stringify(j || {}).slice(0, 120));
+        toastOnce('push' + sid, '推送进度到掌阅失败' +
+          (j && j.error ? '：' + j.error : '（后端不可用）'));
+        return;
       }
-      else if (j && j.detail && j.detail.length) {
+      if (d.failed > 0) {
+        var err = '';
+        var det0 = d.detail || [];
+        for (var k0 = 0; k0 < det0.length; k0++) {
+          if (det0[k0] && det0[k0].ok === false) {
+            err = String(det0[k0].error || det0[k0].skipped || '');
+            break;
+          }
+        }
+        toastOnce('pushfail' + sid, '推送进度到掌阅失败' + (err ? '：' + err : ''));
+        return;
+      }
+      if (d.pushed > 0) return;      // 成功 → 静默
+      if (j.detail && j.detail.length) {
         var why = '';
         for (var i = 0; i < j.detail.length; i++) {
           if (j.detail[i] && j.detail[i].skipped) { why = String(j.detail[i].skipped); break; }
         }
         // 只有"回退被挡"值得说一声 —— 用户会以为"推了却没生效"
+        // 节流 10 分钟: 在读时每轮都命中, 每 30s 弹一次太吵
         if (why.indexOf('regress') === 0) {
-          toast('掌阅进度更靠前，本次不回拨（Kavita 落后）');
+          toastOnce('regress' + sid, '掌阅进度更靠前，本次不回拨（Kavita 落后）', 600);
         }
       }
-    }).catch(function (e) { note('push #' + sid + ' ERR ' + e.message); });
+    }).catch(function (e) {
+      note('push #' + sid + ' ERR ' + e.message);
+      toastOnce('push' + sid, '推送进度到掌阅失败：' + e.message);
+    });
   }
 
   // 去抖 + 最大等待: 连续翻页会不断重置计时器, 纯去抖在"读得快"时永远不触发。

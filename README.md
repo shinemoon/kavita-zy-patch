@@ -216,14 +216,24 @@ Kavita 阅读器的正文容器就是 `.book-content`（取自 `book-reader.comp
   <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷才看得到
 - 命令行等价：`python3 sync/sync/reader_css.py {file|patch|unpatch}`（在 bridge 仓跑）
 
-## 通知 (toast) 样式 (v0.4.8)
+## 通知 (toast): 默认静默, 只有失败才弹 (v0.4.9)
 
-自动同步成功/被闸门挡时会弹一条右下角提示。2026-10-26 按要求调低调：
+2026-10-26 最终口径：**平时不弹**。自动 pull / push 成功一律只写进 `__ZY__.auto().log`
+（F12 可查），只有下面三种情况才弹一条右下角提示：
 
-- 背景 `rgba(0,0,0,.5)`（原先是接近纯黑的 `.94`）+ 极淡描边 + `backdrop-filter: blur(2px)`
-- 淡入淡出：`opacity 0 → 1`，`transform: translateY(4px) → none`，`transition .3s ease`
-  （原先 .18s + 8px，偏"跳"）
-- 3.5 秒后自动淡出，`pointer-events: none` 不挡点击
+| 场景 | 文案 |
+|---|---|
+| pull 请求失败（后端不可用 / 抛错） | `从掌阅拉取进度失败：<原因>` |
+| push 请求失败 或 `detail.failed > 0` | `推送进度到掌阅失败：<原因>` |
+| 被回退闸门挡住（`regress`） | `掌阅进度更靠前，本次不回拨（Kavita 落后）` |
+
+- 同一类提示**节流 10 分钟/本**（`toastOnce`），读一整晚最多看到一条
+- 样式仍是低调款：背景 `rgba(0,0,0,.5)`、`transition .3s ease` 淡入淡出、
+  `pointer-events: none`、3.5 秒自动淡出；失败态只多加一道暗红描边
+  （`rgba(189,54,47,.55)`），不换底色
+- 想看完整动作流水：控制台 `__ZY__.auto()`；要临时手动触发 `__ZY__.pull(27)` / `__ZY__.push(27)`
+
+> v0.4.8 曾让"同步成功 / 推送成功"也弹一条。用户反馈太吵 → v0.4.9 取消成功提示。
 
 ## 自启动 + 自愈
 
