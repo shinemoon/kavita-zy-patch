@@ -2,6 +2,9 @@
 
 把掌阅 App「传书到手机」书架里的 EPUB 拉到本地。
 
+> **整体架构**（Kavita ⇄ 掌阅桥接 ⇄ echopaper/纸间，含端口、四条同步通道、自愈、已知边界）
+> 见 [`docs/architecture.md`](docs/architecture.md)。5012 控制台的代码就是本仓 `sync/web.py`。
+
 ## 结论（2026-10-21 实测）
 
 之前判断「`is_local_book: true` = 文件只存本地 App, 云端拿不到」是**错的**。
