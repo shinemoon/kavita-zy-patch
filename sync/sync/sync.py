@@ -31,6 +31,20 @@ log = logging.getLogger("zhangyue-bridge.sync")
 ALLOW_PUSH_REWIND = (os.environ.get("ZY_PUSH_ALLOW_REWIND") or "").strip().lower() in (
     "1", "true", "yes", "on")
 
+# 写进掌阅 readProcess.readingSource 的值。
+#
+#   kavita-bridge (默认) = 我们自己的标记。App 打开书时走 `kd/e.java` 的通用路径:
+#                          只有 core.comparePosition(本地, 云端) < 0 才会跳过去。
+#   web                  = 冒充"掌阅网页版阅读器"。App 会命中
+#                          `BookBrowserFragment.N3()` 的快捷分支, 直接
+#                          `onGotoPercent(readPercent)` 按百分比跳, 不再比位置
+#                          (见 apk/jadx/sources/com/zhangyue/ReadComponent/
+#                           ReadModule/ui/BookBrowserFragment.java:2437)。
+#
+# 只有当"云端值明明对、手机上却不跳"时才用它做 A/B。默认不改。
+PUSH_SOURCE = (os.environ.get("ZY_PUSH_SOURCE") or "kavita-bridge").strip() or "kavita-bridge"
+
+
 
 def _setup_log():
     ensure_dirs()
@@ -600,6 +614,7 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
                         read_complete=complete,
                         total_count=total_count,
                         read_position=position,
+                        source=PUSH_SOURCE,
                     )
                     ok_keys.append(key)
                 except Exception as e:
