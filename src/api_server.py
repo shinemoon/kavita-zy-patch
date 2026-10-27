@@ -53,6 +53,12 @@ AUTH_JSON = Path(BRIDGE_ROOT) / ".auth.json"
 AUTO_SYNC = (_cfg.get("AUTO_SYNC", "1") or "1").strip()
 AUTO_PUSH_DEBOUNCE = int(_cfg.get("AUTO_PUSH_DEBOUNCE", "8") or 8)
 AUTO_PULL_GAP = int(_cfg.get("AUTO_PULL_GAP", "120") or 120)
+# 写进掌阅 readingSource 的值。必须在第一次 import sync 之前设 —— sync 模块
+# 在 import 时读 env。默认 kavita-bridge; "web" 让 App 按百分比跳 (见 patch.conf 注释)。
+_push_source = (_cfg.get("PUSH_SOURCE", "") or "").strip()
+if _push_source:
+    os.environ["ZY_PUSH_SOURCE"] = _push_source
+
 # push / pull 都会读写 kavita.db + 打掌阅 API, 串行化, 不并发。
 _auto_lock = threading.Lock()
 
