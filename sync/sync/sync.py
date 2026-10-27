@@ -608,6 +608,12 @@ def push_once(auth: dict | None = None, *, dry_run: bool = False,
                 raise RuntimeError("; ".join(errs) or "no key")
             pushed += 1
             mapping.state_set(f"push_last_{p.series_id}", _now())
+            # 按 (series, chapter) 也记一份 —— 多卷系列 (藤井) 一个 series 挂多本,
+            # 阅读器角标要显示"当前这本"的上次推送时间, 不能用系列级的。
+            _lk = f"push_last_{p.series_id}_{p.chapter_id}"
+            mapping.state_set(_lk, _now())
+            mapping.state_set(_lk + "_pct", f"{pct01:.8f}")
+
             detail.append({"bid": link.zy_book_id, "series": p.series_id,
                            "chapter": p.chapter_id, "pct": round(pct01, 6), "ok": True,
                            "keys": [k[:8] for k in ok_keys]})
