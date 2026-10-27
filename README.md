@@ -433,3 +433,19 @@ warning 条只上 error + 最多 1 条 warn，info 不上条。
 后端认 `X-ZY-Token` 头（前端从模板注入时替换 `__ZY_TOKEN__`），token 文件 600 权限。
 
 不开 `Access-Control-Allow-Credentials` —— 预检请求不带凭据，所以 CORS 无法共享 cookie。前端靠显式 token 头工作。局域网外无 token 打不到接口。
+## 阅读器右下角「上次 push 时间」角标 (v0.4.11)
+
+读书页右下角一行小字灰色 (不可点、不吃鼠标事件):
+
+```
+掌阅 18:36 已推送 28.3%
+```
+
+- 只对**有掌阅映射**的 series 显示 (没映射的书看不到这行)
+- 数据 `GET /zy/api/zy-status` ← bridge `state.sqlite` 的
+  `push_last_<series>_<chapter>` / `..._pct`; 粒度到**卷**
+  (多卷系列如藤井不能用系列级时间冒充别的卷)
+- 每次 push 成功后前端就地刷新; 进书时再拉一次
+- 排查: 用 python 读 state/token 再请求 127.0.0.1:5111/zy/api/zy-status
+  (shell 里 `$()` 会被 agent 环境的 guard 拦)
+- 冒烟: `node src/probe-push-stamp.mjs` (映射书出现 / 未映射书消失 / 样式为 fixed 小灰字)

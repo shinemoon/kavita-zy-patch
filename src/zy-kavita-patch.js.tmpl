@@ -155,6 +155,13 @@
     '#zy-toast.err{border-color:rgba(189,54,47,.55);color:#f0d9d7;',
     'box-shadow:0 0 0 1px rgba(189,54,47,.28),0 2px 10px rgba(0,0,0,.18);}',
     '#zy-toast.on{opacity:1;transform:none;}',
+    // 阅读器右下角: 上次 push 到掌阅的时间 (v0.4.11)。故意压低存在感 ——
+    // 小字、灰色、不可点、不吃鼠标事件。
+    '#zy-push-stamp{position:fixed;right:.6rem;bottom:.3rem;z-index:9998;',
+    'font-size:.68rem;line-height:1.2;color:rgba(128,134,140,.78);',
+    'pointer-events:none;user-select:none;white-space:nowrap;',
+    'font-variant-numeric:tabular-nums;}',
+    '@media (max-width:600px){#zy-push-stamp{font-size:.62rem;right:.4rem;bottom:.15rem;}}',
   ].join('');
 
   function injectCss() {
@@ -285,8 +292,9 @@
   //   离开书/页面隐藏 → 立刻 flush 未发出的 push
   var AUTO = { on: false, debounce: 8, gap: 120 };
   var READER_RE = /\/library\/\d+\/series\/(\d+)\/book\/\d+/;
+  var BOOK_RE = /\/library\/\d+\/series\/(\d+)\/book\/(\d+)/;
   var SERIES_RE = /\/library\/\d+\/series\/(\d+)(?:\/|$)/;
-  var rt = { reader: null, series: null };
+  var rt = { reader: null, series: null, book: null };
   var pushTimers = {};
   var autoLog = [];
 
@@ -408,7 +416,10 @@
         toastOnce('pushfail' + sid, '推送进度到掌阅失败' + (err ? '：' + err : ''));
         return;
       }
-      if (d.pushed > 0) return;      // 成功 → 静默
+      if (d.pushed > 0) {                 // 成功 → 静默, 只更新右下角角标
+        refreshStamp(sid, rt.reader === sid ? rt.book : null, true);
+        return;
+      }
       if (j.detail && j.detail.length) {
         var why = '';
         for (var i = 0; i < j.detail.length; i++) {
@@ -472,17 +483,94 @@
     });
   }
 
+  // ---- 阅读器右下角角标: 上次 push 到掌阅的时间 (v0.4.11) --------------
+  // 只有"这本书有掌阅映射 + 自动同步开着"时出现。纯展示, 不写任何状态。
+  // 数据来自后端 /zy/api/zy-status 的 push_last_<series>_<chapter> (state.sqlite),
+  // 粒度到卷 —— 多卷系列 (藤井) 不能共用系列级时间。
+  var zst = { at: 0, data: null };
+
+  function stampNode() {
+    var n = document.getElementById('zy-push-stamp');
+    if (!n) {
+      n = el('div');
+      n.id = 'zy-push-stamp';
+      n.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(n);
+    }
+    return n;
+  }
+
+  function stampHide() {
+    var n = document.getElementById('zy-push-stamp');
+    if (n && n.parentNode) n.parentNode.removeChild(n);
+  }
+
+  function fmtStamp(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    var p2 = function (x) { return ('0' + x).slice(-2); };
+    var hm = p2(d.getHours()) + ':' + p2(d.getMinutes());
+    var today = new Date();
+    if (d.toDateString() === today.toDateString()) return hm;
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm;
+  }
+
+  function renderStamp(sid, bookId) {
+    if (!AUTO.on) { stampHide(); return; }
+    var s = zst.data && zst.data.series && zst.data.series[String(sid)];
+    if (!s) { stampHide(); return; }          // 没映射 → 这不是掌阅书
+    var chs = s.chapters || {};
+    var e = chs[String(bookId)] || chs['-1'];
+    if (!e) {
+      // 多卷系列没有卷级记录时不要拿别的卷冒充 —— 宁可显示"尚未推送"
+      var ks = Object.keys(chs);
+      if (ks.length !== 1) { stampHide(); return; }
+      e = chs[ks[0]];
+    }
+    var txt;
+    if (e.last_push_at) {
+      txt = '掌阅 ' + fmtStamp(e.last_push_at) + ' 已推送';
+      if (e.last_push_pct != null) {
+        txt += ' ' + (Math.floor(e.last_push_pct * 1000) / 10).toFixed(1) + '%';
+      }
+    } else {
+      txt = '掌阅 尚未推送';
+    }
+    var n = stampNode();
+    if (n.textContent !== txt) n.textContent = txt;
+    n.title = txt;
+  }
+
+  function refreshStamp(sid, bookId, force) {
+    if (!sid || !AUTO.on) { stampHide(); return; }
+    if (!force && Date.now() - zst.at < 5000) { renderStamp(sid, bookId); return; }
+    zst.at = Date.now();
+    api('/zy-status').then(function (j) {
+      zst.data = j;
+      if (rt.reader) renderStamp(rt.reader, rt.book);
+    }).catch(function () { /* 后端不可用 → 不显示, 静默 */ });
+  }
+
   function routeTick() {
     var p = location.pathname;
     var rm = READER_RE.exec(p);
     var rn = rm ? +rm[1] : null;
+    var bm = BOOK_RE.exec(p);
+    var bn = bm ? +bm[2] : null;
     var sm = SERIES_RE.exec(p);
     var sn = (!rn && sm) ? +sm[1] : null;
 
-    if (rn !== rt.reader) {
+    if (rn !== rt.reader || bn !== rt.book) {
       if (rt.reader) flushPush(false);        // 离开上一本, 尾巴先推掉
       rt.reader = rn;
-      if (rn) pullSeries(rn, true);           // 进书: 取掌阅进度
+      rt.book = bn;
+      if (rn) {
+        pullSeries(rn, true);                 // 进书: 取掌阅进度
+        refreshStamp(rn, bn, true);           // 右下角角标
+      } else {
+        stampHide();
+      }
       heartbeat(true);
     }
     if (sn !== rt.series) {

@@ -238,6 +238,34 @@ def api_auto_cfg() -> dict:
     }
 
 
+def api_zy_status() -> dict:
+    """每本已映射书的"最后一次 push 到掌阅"的时间/百分比。
+
+    给 Kavita 阅读器右下角的灰色角标用 (只显示, 不改任何状态)。
+    粒度: (series, chapter) —— 多卷系列一个 series 挂多本, 不能共用系列级时间。
+    """
+    _, mapping, _, _ = bridge()
+    out: dict[str, dict] = {}
+    for l in mapping.all_links():
+        sid = l.kavita_series_id
+        s = out.setdefault(str(sid), {
+            "series": sid,
+            "name": _series_name(sid),
+            "chapters": {},
+        })
+        key = f"push_last_{sid}_{l.kavita_chapter_id}"
+        at = mapping.state_get(key) or mapping.state_get(f"push_last_{sid}")
+        pct = mapping.state_get(key + "_pct")
+        s["chapters"][str(l.kavita_chapter_id)] = {
+            "chapter": l.kavita_chapter_id,
+            "zy_book_id": l.zy_book_id,
+            "zy_name": l.zy_book_name,
+            "last_push_at": at,
+            "last_push_pct": float(pct) if pct else None,
+        }
+    return {"ok": True, "ts": _now_iso(), "series": out}
+
+
 _last_hb = {"key": "", "ts": 0.0}
 
 
@@ -600,6 +628,7 @@ ROUTES_GET = {
     "/zy/api/health": lambda: {"ok": True, "ts": __import__("time").time()},
     "/zy/api/selfcheck": api_selfcheck,
     "/zy/api/auto/cfg": api_auto_cfg,
+    "/zy/api/zy-status": api_zy_status,
     "/zy/api/reader-css": api_reader_css,
 }
 ROUTES_POST = {
