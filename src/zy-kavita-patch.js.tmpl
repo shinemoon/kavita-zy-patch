@@ -125,6 +125,295 @@
       .catch(function (e) { RS.err = (e && e.message) || 'fetch'; });
   }
 
+  // ---- 关键词高亮 (2026-10-30) -----------------------------------------
+  // 语料 = epub-refiner 导出的 keywords.json (按书自动匹配 / 在 5012 里显式绑定)。
+  // 纯前端滤镜, 两条路:
+  //   默认 highlight: CSS Custom Highlight API (Range + CSS.highlights) —— 一个字符
+  //                  都不改 DOM, Kavita 存的进度/注解 XPath 完全不受影响。
+  //   span (可配):   包 <span class="zy-kw zy-kw-<cat>">, 能做粗体/圆角, 但改 DOM。
+  var KM = { sid: null, ver: null, mode: '', data: null, at: 0, err: '',
+             ranges: 0, spans: 0, words: 0, cats: 0, file: '', hl: [],
+             appliedAt: 0, skipped: '', busy: false, re: null, catOf: null,
+             note: '' };
+
+  function kmEsc(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  // 长词优先排序 + 拉丁词加边界, 避免 "fur coat" 被 "coat" 抢、或者 "Mum"
+  // 命中 "Mummy"(mummy 自己是 alias 时仍能被单独匹配到)。
+  function kmBuild(data) {
+    var all = [];
+    var catOf = {};
+    (data.cats || []).forEach(function (c) {
+      (c.words || []).forEach(function (w) {
+        var low = String(w).toLowerCase();
+        if (!low || catOf[low]) return;
+        catOf[low] = c.id;
+        all.push(String(w));
+      });
+    });
+    all.sort(function (a, b) { return b.length - a.length; });
+    var parts = all.map(function (w) {
+      var pre = /^[0-9A-Za-z]/.test(w) ? '(?<![0-9A-Za-z])' : '';
+      var suf = /[0-9A-Za-z]$/.test(w) ? '(?![0-9A-Za-z])' : '';
+      return pre + kmEsc(w) + suf;
+    });
+    var re = null;
+    try { re = new RegExp(parts.join('|'), 'gi'); } catch (e) { re = null; }
+    KM.catOf = catOf;
+    KM.re = re;
+    KM.words = all.length;
+    return re;
+  }
+
+  function kmCss(data, mode) {
+    var out = ['/* zy-keyword-mark v' + (data.version || 0) + ' */'];
+    (data.cats || []).forEach(function (c) {
+      var st = c.style || {};
+      var decl = [];
+      if (st.bg) decl.push('background-color:' + st.bg);
+      if (st.color) decl.push('color:' + st.color);
+      if (st.underline) decl.push('text-decoration:underline');
+      if (st.shadow) decl.push('text-shadow:' + st.shadow);
+      if (!decl.length) return;
+      if (mode === 'highlight') {
+        out.push('::highlight(zy-kw-' + c.id + '){' + decl.join(';') + ';}');
+      } else {
+        var extra = [];
+        if (st.bold) extra.push('font-weight:600');
+        if (st.italic) extra.push('font-style:italic');
+        if (st.radius) extra.push('border-radius:' + st.radius);
+        if (st.pad) extra.push('padding:' + st.pad);
+        out.push('.zy-kw-' + c.id + '{' + decl.concat(extra).join(';') + ';}');
+      }
+    });
+    if (mode !== 'highlight') out.push('.zy-kw{box-decoration-break:clone;}');
+    return out.length > 1 ? out.join('\n') : '';
+  }
+
+  function kmContainer() {
+    return document.querySelector('.book-content')
+        || document.querySelector('.book-content-container')
+        || document.querySelector('.reader-content');
+  }
+
+  function kmClear() {
+    if (window.CSS && window.CSS.highlights) {
+      KM.hl.forEach(function (n) { try { window.CSS.highlights.delete(n); } catch (e) {} });
+    }
+    KM.hl = [];
+    var sp = document.querySelectorAll('.book-content span.zy-kw, .zy-kw');
+    for (var i = 0; i < sp.length; i++) {
+      var e = sp[i];
+      if (e.parentNode) {
+        e.parentNode.replaceChild(document.createTextNode(e.textContent), e);
+      }
+    }
+    if (sp.length) {
+      var c = kmContainer();
+      if (c) { try { c.normalize(); } catch (e2) {} }
+    }
+    KM.ranges = 0; KM.spans = 0;
+  }
+
+  function kmWalk(root, fn) {
+    var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (n) {
+        if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        var pa = n.parentNode;
+        if (!pa) return NodeFilter.FILTER_REJECT;
+        var tag = (pa.nodeName || '').toLowerCase();
+        if (tag === 'script' || tag === 'style' || tag === 'svg') return NodeFilter.FILTER_REJECT;
+        if (pa.classList && (pa.classList.contains('zy-kw') ||
+            pa.classList.contains('zy-kw-span'))) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    var n;
+    while ((n = w.nextNode())) fn(n);
+  }
+
+  function kmApplyHighlight(data) {
+    var box = kmContainer();
+    if (!box) { KM.skipped = 'no container'; return; }
+    if ((box.textContent || '').length > 400000) { KM.skipped = 'too large'; return; }
+    var per = {};
+    kmWalk(box, function (node) {
+      var txt = node.nodeValue;
+      var re = KM.re;
+      if (!re) return;
+      re.lastIndex = 0;
+      var m;
+      while ((m = re.exec(txt))) {
+        var hit = m[0];
+        if (!hit) { re.lastIndex++; continue; }
+        var cat = KM.catOf[hit.toLowerCase()];
+        if (!cat) continue;
+        var r = document.createRange();
+        r.setStart(node, m.index);
+        r.setEnd(node, m.index + hit.length);
+        (per[cat] = per[cat] || []).push(r);
+      }
+    });
+    if (window.CSS && window.CSS.highlights && typeof Highlight === 'function') {
+      KM.hl.forEach(function (n) { try { window.CSS.highlights.delete(n); } catch (e) {} });
+      KM.hl = [];
+      KM.ranges = 0;
+      Object.keys(per).forEach(function (cat) {
+        var name = 'zy-kw-' + cat;
+        try {
+          var hl = new Highlight();
+          per[cat].forEach(function (r) { hl.add(r); });
+          hl.priority = 1;
+          window.CSS.highlights.set(name, hl);
+          KM.hl.push(name);
+          KM.ranges += per[cat].length;
+        } catch (e) { KM.err = 'hl: ' + ((e && e.message) || e); }
+      });
+    } else {
+      // 老浏览器没有 Custom Highlight API → 就地降级成 span (只此一次提示)
+      KM.note = 'CSS.highlights 不可用, 降级 span';
+      kmApplySpan(data);
+    }
+  }
+
+  function kmApplySpan(data) {
+    var box = kmContainer();
+    if (!box) { KM.skipped = 'no container'; return; }
+    kmClear();
+    var jobs = [];
+    kmWalk(box, function (node) {
+      var txt = node.nodeValue;
+      var re = KM.re;
+      if (!re) return;
+      re.lastIndex = 0;
+      var m, last = 0, frag = null;
+      while ((m = re.exec(txt))) {
+        var hit = m[0];
+        if (!hit) { re.lastIndex++; continue; }
+        var cat = KM.catOf[hit.toLowerCase()];
+        if (!cat) continue;
+        if (!frag) frag = document.createDocumentFragment();
+        if (m.index > last) frag.appendChild(document.createTextNode(txt.slice(last, m.index)));
+        var sp = document.createElement('span');
+        sp.className = 'zy-kw zy-kw-' + cat;
+        sp.textContent = hit;
+        frag.appendChild(sp);
+        last = m.index + hit.length;
+        KM.spans++;
+      }
+      if (frag) {
+        if (last < txt.length) frag.appendChild(document.createTextNode(txt.slice(last)));
+        jobs.push([node, frag]);
+      }
+    });
+    jobs.forEach(function (j) { if (j[0].parentNode) j[0].parentNode.replaceChild(j[1], j[0]); });
+    KM.ranges = KM.spans;
+  }
+
+  function kmInjectCss(data, mode) {
+    var css = kmCss(data, mode);
+    var node = document.getElementById('zy-kw-css');
+    if (!css) {
+      if (node && node.parentNode) node.parentNode.removeChild(node);
+      return;
+    }
+    if (!node) { node = el('style'); node.id = 'zy-kw-css'; document.head.appendChild(node); }
+    node.textContent = css;
+  }
+
+  function kmApply(data) {
+    if (!data || !data.enabled) {
+      kmClear(); KM.cats = 0; KM.words = 0; KM.textLen = 0; KM.appliedAt = 0;
+      return;
+    }
+    KM.busy = true;
+    try {
+      var mode = (data.mode === 'span') ? 'span' : 'highlight';
+      if (mode === 'highlight' && !(window.CSS && window.CSS.highlights && typeof Highlight === 'function')) {
+        mode = 'span';
+      }
+      KM.mode = mode;
+      kmBuild(data);
+      kmInjectCss(data, mode);
+      kmClear();
+      KM.cats = (data.cats || []).length;
+      KM.textLen = kmContentLen();
+      if (mode === 'highlight') kmApplyHighlight(data); else kmApplySpan(data);
+      KM.appliedAt = Date.now();
+      KM.skipped = '';
+    } catch (e) {
+      KM.err = (e && e.message) || String(e);
+    } finally {
+      KM.busy = false;
+    }
+  }
+
+  function kmSync() {
+    var sid = rt.reader || rt.series;
+    if (!sid) {
+      if (KM.sid) { kmClear(); KM.sid = null; KM.data = null; KM.ver = null; KM.cats = 0; KM.words = 0; }
+      return Promise.resolve();
+    }
+    var url = BASE + '/keyword-mark?series=' + sid;
+    return fetch(url, { headers: { 'X-ZY-Token': TOKEN } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || j.ok === false) { KM.err = (j && j.error) || 'bad payload'; return; }
+        KM.err = '';
+        KM.sid = sid;
+        KM.file = j.file || '';
+        var same = (KM.ver === j.version && KM.data && KM.data.mode === j.mode);
+        KM.data = j;
+        KM.ver = j.version;
+        // 配置没变 + 上次真铺上了 → 不用重来。注意"上次铺上"要用命中数判断:
+        // 正文还没渲染时也会 apply 一次 (0 命中), 那种不能算数。
+        if (same && KM.appliedAt && (KM.ranges > 0 || !j.enabled || !j.total)) {
+          kmWatch();
+          return;
+        }
+        kmApplyWhenReady(j);
+      })
+      .catch(function (e) { KM.err = (e && e.message) || 'fetch'; });
+  }
+
+  // 阅读器正文是 Angular 后渲染的: apply 要等 .book-content 有内容,
+  // 否则空走一趟 (0 命中), 之后没人再触发 (旧 bug)。
+  function kmContentLen() {
+    var b = kmContainer();
+    return b ? (b.textContent || '').length : 0;
+  }
+
+  function kmApplyWhenReady(data, tries) {
+    tries = (tries == null) ? 24 : tries;
+    if (kmContentLen() > 200 || tries <= 0) {
+      kmApply(data);
+      kmWatch();
+      return;
+    }
+    setTimeout(function () { kmApplyWhenReady(data, tries - 1); }, 300);
+  }
+
+  // 正文被 Angular 换掉 (翻页/换章) 后要重铺 —— 只在阅读页挂着看
+  var kmMo = null;
+  function kmWatch() {
+    var box = kmContainer();
+    if (!box) return;
+    if (kmMo && kmMo._box === box) return;
+    if (kmMo) { try { kmMo.disconnect(); } catch (e) {} }
+    kmMo = new MutationObserver(function () {
+      if (KM.busy || !KM.data || !KM.data.enabled) return;
+      // 自己包 span 也会触发 mutation, 但正文长度不变 → 用长度挡住自激循环
+      if (kmContentLen() === KM.textLen) return;
+      clearTimeout(kmWatch._t);
+      kmWatch._t = setTimeout(function () { if (!KM.busy) kmApply(KM.data); }, 400);
+    });
+    kmMo._box = box;
+    kmMo.observe(box, { childList: true, subtree: true });
+  }
+
+
   // ---- 样式 (一次性注入) ---------------------------------------------
   var CSS = [
     '#zy-top-item{display:flex;align-items:center;}',
@@ -568,8 +857,12 @@
       if (rn) {
         pullSeries(rn, true);                 // 进书: 取掌阅进度
         refreshStamp(rn, bn, true);           // 右下角角标
+        // 关键词高亮: 等正文渲染完再铺一遍, 并盯住后续换页
+        setTimeout(function () { kmSync().then(kmWatch); }, 700);
       } else {
         stampHide();
+        kmClear();
+        KM.sid = null; KM.data = null; KM.ver = null;
       }
       heartbeat(true);
     }
@@ -712,11 +1005,16 @@
         setInterval(tick, 15000);
         setInterval(function () { probe().then(tick).catch(tick); }, 30000);
         setInterval(applyReaderCss, 60000);
+        setInterval(function () {
+          if (!rt.reader && !rt.series) return;
+          kmSync().then(kmWatch);
+        }, 60000);
         // 回到前台兜底 (钩子没装上时 hookNetwork 里的监听器根本不存在)
         document.addEventListener('visibilitychange', function () {
           if (document.visibilityState !== 'visible') return;
           if (!bootOk) autoBoot();
           applyReaderCss();
+          kmSync().then(kmWatch);
           probe().then(tick).catch(tick);
         });
         autoBoot();
@@ -746,6 +1044,17 @@
                err: RS.err, at: RS.at, jsVer: VER,
                node: !!document.getElementById('zy-reader-css') };
     },
-    applyReaderCss: applyReaderCss
+    applyReaderCss: applyReaderCss,
+    kw: function () {
+      return { ver: KM.ver, sid: KM.sid, mode: KM.mode, on: !!(KM.data && KM.data.enabled),
+               cats: KM.cats, words: KM.words, ranges: KM.ranges, spans: KM.spans,
+               textLen: KM.textLen || 0, contentLen: kmContentLen(),
+               file: KM.file, err: KM.err, note: KM.note, skipped: KM.skipped,
+               at: KM.appliedAt, hl: KM.hl.slice(),
+               hasHighlightApi: !!(window.CSS && window.CSS.highlights && typeof Highlight === 'function'),
+               container: !!kmContainer() };
+    },
+    kwApply: function () { if (KM.data) kmApply(KM.data); },
+    kwSync: kmSync
   };
 })();

@@ -330,6 +330,30 @@ python3 /vol2/1001/kavita-zy-patch/src/selftest.py
 
 ---
 
+## 5.6 关键词高亮（可选，v0.4.14）
+
+把 epub-refiner（5013）抽出来的 `keywords.json` 在阅读时叠到正文上。**纯前端滤镜**，
+不改 Kavita 文件、不改 DOM（默认模式），也不影响进度/注解的 XPath。
+
+1. 先在 5013 生成语料：`/vol2/1001/epub-refiner/exports/*.json`
+2. 5012 →「关键词高亮 (阅读器滤镜)」卡 → 勾 **启用**（默认已开，语料目录已指向 exports）
+3. 在**语料表**里那一行选一本 Kavita 系列（= 显式绑定；不绑就靠书名自动匹配）
+4. 点 **能高亮多少词** 验证：`pick.how = bind / name` + 词数 > 0 才算配上了
+5. **分类样式**：每类可以改背景色 / 文字色 / 下划线 / 是否启用；粗体·斜体只在
+   `span` 模式生效（`::highlight()` 不支持 `font-weight`）
+6. **保存并应用** → 开着的阅读页 60 秒内自动生效
+
+- 落盘：`/vol2/1001/kavita-zy-patch/state/keyword_mark.json`
+- 默认 `mode: highlight`（CSS Custom Highlight API）。**切 `span` 只是多包一层 `<span>`**，
+  想用粗体/圆角/内边距时才需要
+- `stop` 列表挡泛词（默认一串人称/冠词）；`min_len` 挡单字母；`skip_digits` 挡纯数字
+- 自检：Kavita 页面 F12 → `__ZY__.kw()` → 看 `ranges`（实际高亮段数）/ `words`（词表大小）/
+  `file`（用的哪份语料）/ `err`
+- `ranges: 0` 且 `words > 0` = 语料和这本书对不上（语言不同 / 抽错书），不是代码问题
+- 回滚：卡里取消「启用」（保留配置），或删掉 `state/keyword_mark.json`
+
+---
+
 ## 6. 日常
 
 | 场景 | 动作 |

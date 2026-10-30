@@ -225,7 +225,83 @@ Kavita 阅读器的正文容器就是 `.book-content`（取自 `book-reader.comp
   <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强刷才看得到
 - 命令行等价：`python3 sync/sync/reader_css.py {file|patch|unpatch}`（在 bridge 仓跑）
 
-## 通知 (toast): 默认静默, 只有失败才弹 (v0.4.9)
+## 关键词高亮：阅读器里的「中间滤镜层」(v0.4.14)
+
+epub-refiner（5013，`/vol2/1001/epub-refiner`）会给每本书抽出一份
+`keywords.json`（人名 / 地点 / 组织 / 物件 / 事件 / 时间 / 术语 / 作品）。
+这个功能把那堆词**在阅读时**叠到 Kavita 正文上，颜色按分类自定义。
+
+设计上它就是一层**纯前端滤镜**：
+
+```
+5012 (root) 写  <PATCH_ROOT>/state/keyword_mark.json
+  → 补丁后端  GET /zy/api/keyword-mark?series=N   （按书返回词表 + 每类样式）
+  → 前端      zy-kavita-patch.js 在 .book-content 上铺高亮
+```
+
+**不碰 Kavita 文件、不走 Kavita 后端、不重启容器、不改 DOM（默认模式）**。
+配置改完，开着的阅读页 60 秒内自己换新。
+
+### 两种渲染模式
+
+| 模式 | 做法 | 代价 | 支持的自定义 |
+|---|---|---|---|
+| `highlight`（默认） | **CSS Custom Highlight API**：`Range` + `CSS.highlights` + `::highlight(zy-kw-<cat>)` | 需要 Chrome 105+/Safari 17.2+ | 背景色 / 文字色 / 下划线 / text-shadow |
+| `span` | 把命中文字包进 `<span class="zy-kw zy-kw-<cat>">` | **会改 DOM**（Kavita 存的 XPath 一般只到元素级，同级索引不变，但仍属改结构） | 上面全部 + 粗体 / 斜体 / 圆角 / 内边距 |
+
+为什么默认 `highlight`：Kavita 的阅读进度（`lastSeenScrollPartPath` 形如
+`//body/div[1]/p[23]`）和注解/书签都靠 XPath 定位。Custom Highlight API 只画不写，
+一个字符都不动，XPath 永远有效。浏览器没有该 API 时自动降级成 `span`（`__ZY__.kw().note` 会写）。
+
+### 配置（5012「关键词高亮 (阅读器滤镜)」卡）
+
+```json
+{"enabled": true, "version": 4, "mode": "highlight",
+ "dirs": ["/vol2/1001/epub-refiner/exports"],
+ "bind": {"25": "Adrian_Mole_1982_-_The_Secret_Diary_of_A-d5028a.json"},
+ "only": [], "stop": ["it", "him", "the", "..."],
+ "min_len": 2, "skip_digits": true, "max_terms": 6000,
+ "styles": {"person": {"enabled": true, "color": "#1f2329", "bg": "#ffe58f",
+                       "underline": false, "bold": false, "italic": false,
+                       "radius": "", "pad": "", "shadow": ""}}}
+```
+
+- **语料目录**：扫 `*.json`（跳过 `index.json` / `latest.json`），认两种格式 ——
+  epub-refiner 的 `{categories:{id:{name,items:[{term,aliases}]}}}`，
+  以及 epub-translator-skill 的 `{mappings:[{source,target,tags}]}`（tags[0] 当分类）
+- **哪份语料配哪本书**：先看 `bind`（显式绑定，UI 里选系列）；没有再按
+  **书名完全相同 / 子串（较短串 ≥ 一半长）/ 词集合 Jaccard ≥ 0.55** 自动匹配。
+  **同一个作者的另一本不会被硬配**（宁可让人手动绑）——点卡里「能高亮多少词」会显示
+  命中方式和词数，`pick.how = none` 就是没配上
+- **词过滤**：`min_len` 按"字母数字个数"算（`P.` 这种 1 个字母的丢掉）；
+  `skip_digits` 挡纯数字词（`1981` / `13`）；`stop` 挡泛词（默认带一小串人称/冠词，
+  清空 = 不过滤）；`only` 只高亮指定分类；分类样式里 `enabled:false` 等于不下发那类
+- **匹配在浏览器里做**：全部词拼成一个正则（长词优先排序 + 拉丁词加
+  `(?<![0-9A-Za-z])` / `(?![0-9A-Za-z])` 边界），一次遍历正文文本节点。
+  1300 词 / 8.7 万字正文 ≈ 10ms 级别
+- 前端拿到的 payload 只有 `{mode, version, cats:[{id,name,style,words}], total}`，
+  不包含任何路径以外的私密信息
+
+### 覆盖范围与已知边界
+
+- 只处理 `.book-content` 里的**文本节点**，`script/style/svg` 跳过
+- 翻页 / 换章后 Angular 会换掉正文 → `MutationObserver` 用"正文长度变了没"判断要不要重铺
+  （自己包 span 不改变长度，所以不会自激循环）
+- 单页正文超过 40 万字会跳过（防止大书卡顿）
+- `::highlight()` 不支持 `font-weight` / `border-radius` / `padding` —— 想要这些就切 `span` 模式
+- 词表来源是 epub-refiner 的抽取结果，**质量取决于那份 json**；它抽错（比如把 `it` / `him`
+  当"物件"）就是高亮错，`stop` 列表和分类开关是唯一的手动闸
+
+### 排障
+
+- Kavita 页面 F12 → `__ZY__.kw()`：
+  `{ver, sid, mode, on, cats, words, ranges, file, err, hasHighlightApi, textLen}`；
+  `ranges: 0` 而 `words > 0` = 这本书正文里没有命中（多半是语料跟书不是同一本 / 不是同一种语言）
+- `err: "bad payload"` = 后端 500 或没匹配（查 `state/logs/api.log` 里的 `keyword-mark`）
+- `__ZY__.kwApply()` 手动重铺一次（调试配置时不用等 60s）
+- 5012 里「能高亮多少词」走 `/api/keyword_mark/payload?series=N`，跟前端拿到的是同一份数据
+
+
 
 2026-10-26 最终口径：**平时不弹**。自动 pull / push 成功一律只写进 `__ZY__.auto().log`
 （F12 可查），只有下面三种情况才弹一条右下角提示：

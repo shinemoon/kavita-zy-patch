@@ -411,6 +411,32 @@ def api_reader_css() -> dict:
                 "warn": str(e)}
 
 
+def api_keyword_mark(q: dict) -> dict:
+    """阅读器关键词高亮: 按 Kavita 系列返回词表 + 每类样式。
+
+    语料来自 epub-refiner 导出的 keywords.json (目录在 5012 里配)。
+    前端用 CSS Custom Highlight API 上色 —— 只读数据, 不动 DOM/文件/后端。
+    """
+    p = str(Path(BRIDGE_ROOT) / "sync")
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    try:
+        sid = int((q.get("series") or ["0"])[0] or 0)
+    except Exception:
+        sid = 0
+    if sid <= 0:
+        return {"ok": True, "enabled": False, "reason": "no series", "cats": [], "total": 0}
+    try:
+        from sync import keyword_mark as kw       # noqa: E402
+        return kw.build_payload(sid, _series_name(sid))
+    except Exception as e:  # noqa: BLE001 — 高亮挂了不该让阅读器报错
+        log(f"keyword-mark fail series={sid}: {e}")
+        return {"ok": True, "enabled": False, "error": str(e), "cats": [], "total": 0}
+
+
+api_keyword_mark.want_query = True
+
+
 def api_auto_pull(body: dict) -> dict:
     """掌阅 → Kavita, 单本。
 
@@ -636,6 +662,7 @@ ROUTES_GET = {
     "/zy/api/auto/cfg": api_auto_cfg,
     "/zy/api/zy-status": api_zy_status,
     "/zy/api/reader-css": api_reader_css,
+    "/zy/api/keyword-mark": api_keyword_mark,
 }
 ROUTES_POST = {
     "/zy/api/push": lambda b: api_push(bool(b.get("dry_run"))),
@@ -718,7 +745,8 @@ class H(BaseHTTPRequestHandler):
         if not self._authorized(q):
             return self._deny(403, "bad token")
         try:
-            self._send(200, fn())
+            obj = fn(q) if getattr(fn, "want_query", False) else fn()
+            self._send(200, obj)
         except Exception as e:
             log(f"GET {u.path} FAIL {e}\n{traceback.format_exc()}")
             self._send(500, {"ok": False, "err": str(e)})
