@@ -191,6 +191,10 @@ CSS（目前最常用的是**行间距**），保存后 `zy-kavita-patch.js` 拉
   行内 `line-height`（作者样式表的 important 声明优先级高于行内普通声明）
 - 默认选择器覆盖 `.book-content` 下 `p / div / li / blockquote / td`：只写 `.book-content`
   会被 epub 自带的 `p { line-height }` 盖掉
+- **行间距滑块按「声明」找规则，不按 id 找**：用户在 5012 里自己加的规则 id 是
+  从名字派生的（`rule` / `rule-2` / `rule-3`…），按 `id === 'line-height'` 找会失联 ——
+  拖滑块没反应。改成找「decls 里有 line-height 的那条规则」，且**所有**带 line-height 的
+  规则一起改（两条不同值的 line-height 同时生效会互相打架，用户看到的不是他拖的那个值）
 - 文件坏了 / 规则全删 → 前端只是不注入（不报错，阅读器回原样）
 - 排查：Kavita 页面 F12 执行 `__ZY__.readerCss()` 看 `{ver, on, bytes, node}`
   —— `node:false` = 没注入（配置关着或规则为空）；`ver` 小 = 前端还没轮到轮询

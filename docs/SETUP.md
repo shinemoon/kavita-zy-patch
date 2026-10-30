@@ -299,6 +299,7 @@ python3 /vol2/1001/kavita-zy-patch/src/selftest.py
 5012 →「阅读样式增强 (Kavita)」卡：
 
 1. 勾 **启用**，拖 **行间距** 滑块（1.00–2.50），松手 0.7s 自动保存；
+   （滑块自动认领「声明里有 line-height 的那条规则」，你把规则改名或删了也不怕失联）
 2. 想加别的排版规则：下拉选预设（段间距 / 字间距 / 首行缩进 / 两端对齐 / 正文字号）
    → **添加规则** → 改「选择器」和声明（如 `margin: 0.85em 0`）→ **保存并应用**；
 3. 不要的规则点 **删除**（立即保存）；**恢复默认** 回到只有一条行间距 1.8。
@@ -433,7 +434,7 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 | 两侧差值 < 1 个点 | 正常，页粒度导致，不是 bug |
 | **读了一晚上，掌阅 pct 一格不动** | ① `zync.py push --dry-run` 看 pct 有没有 `(页内)` —— 没有就是 `BookScrollId` 丢了；② 看 Kavita 里 `PagesRead` 变没变（没变 = 浏览器没存进度 / 钩子没加载，查 api.log 的 `hb` 行）；③ 页数太少（600 页的大书一页 2.3 万字）→ 按 4.1 用 `ZY_KPAGES_MAX_PAGES=3000` 重建 + `zync.py pull` 重映射 |
 | **Kavita 百分比比掌阅 App 少零点几个点** | App 的进度写在 `getUserNotebooks`，跟 `getProgress` 是两套存储（2026-10-26 起 pull 两套都读，取靠前者）。先跑 `zync.py pull --dry-run` 看 `pct` 是否已等于 App 读数；剩下的差是 `PagesRead/Pages` 的页粒度量化（见 4.1） |
-| **行间距调了没变化** | ① `__ZY__.ver` 是否 `0.4.7`（旧前端没这段逻辑 → 强刷）；② `__ZY__.readerCss()` 的 `node:false` = 没注入（「启用」没勾 / 规则被删空）；③ 等 60s（前端轮询周期）；④ `curl -s "http://127.0.0.1:5111/zy/api/reader-css?token=$(cat state/token)"` 看 css 是否有内容 |
+| **行间距调了没变化** | ⓪ 确认那条规则 decls 里真的有 `line-height`（滑块只认带 line-height 的规则）；① `__ZY__.ver` 是否 `0.4.7`（旧前端没这段逻辑 → 强刷）；② `__ZY__.readerCss()` 的 `node:false` = 没注入（「启用」没勾 / 规则被删空）；③ 等 60s（前端轮询周期）；④ `curl -s "http://127.0.0.1:5111/zy/api/reader-css?token=$(cat state/token)"` 看 css 是否有内容 |
 
 ## 10. 新书放进库了，Kavita 里刷不出来 / 系列名不对
 
