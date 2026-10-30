@@ -1288,7 +1288,9 @@ function rsPaint(j){
   const host = $('rs-items');
   host.innerHTML = '';
   (j.items||[]).forEach(it => host.appendChild(rsRow(it)));
-  const lh = (j.items||[]).find(i => i.id === 'line-height');
+  // 滑块要跟"实际带 line-height 的那条规则"联动, 不能按 id 找:
+  // 用户自己加的规则 id 是 rule / rule-2 ... (按名字派生), 按 id 找会失联。
+  const lh = (j.items||[]).find(i => i.decls && i.decls['line-height']);
   const v = lh && lh.decls && lh.decls['line-height'] ? parseFloat(lh.decls['line-height']) : 1.8;
   const val = (isNaN(v) ? 1.8 : v);
   $('rs-lh').value = val;
@@ -1391,13 +1393,22 @@ let rsLhTimer = null;
 $('rs-lh').oninput = ()=>{
   const v = Number($('rs-lh').value);
   $('rs-lh-val').textContent = v.toFixed(2);
-  const row = [...document.querySelectorAll('#rs-items .rs-item')]
+  // 同上: 找带 line-height 声明的那些行 (fallback 到 id 命中的)
+  const rows = [...document.querySelectorAll('#rs-items .rs-item')].filter(n => {
+    const d = n.querySelector('.rs-decl');
+    return d && /(^|;)\s*line-height\s*:/.test(d.value);
+  });
+  const fallback = [...document.querySelectorAll('#rs-items .rs-item')]
     .find(n => n.dataset.id === 'line-height');
-  const decl = row ? row.querySelector('.rs-decl') : null;
-  if(!decl) return;
-  const d = rsParseDecls(decl.value);
-  d['line-height'] = v.toFixed(2);
-  decl.value = rsDeclsText(d);
+  const targets = rows.length ? rows : (fallback ? [fallback] : []);
+  if(!targets.length) return;
+  // 所有带 line-height 的规则一起改 —— 两条不同值的 line-height 会互相打架
+  targets.forEach(row => {
+    const decl = row.querySelector('.rs-decl');
+    const d = rsParseDecls(decl.value);
+    d['line-height'] = v.toFixed(2);
+    decl.value = rsDeclsText(d);
+  });
   clearTimeout(rsLhTimer);
   rsLhTimer = setTimeout(()=>rsSave('行间距已保存'), 700);
 };

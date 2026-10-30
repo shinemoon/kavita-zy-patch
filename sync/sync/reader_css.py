@@ -202,13 +202,15 @@ def render_css(conf) -> str:
 def set_line_height(conf, value) -> dict:
     """控制台的"行间距"滑块走这条: 没有就建, 有就改 decls['line-height']。"""
     conf = normalize(conf)
-    item = next((i for i in conf["items"] if i["id"] == "line-height"), None)
-    if item is None:
+    targets = [i for i in conf["items"] if "line-height" in (i.get("decls") or {})]
+    if not targets:
         item = {"id": "line-height", "name": "行间距", "enabled": True,
                 "selector": TEXT_SELECTOR, "decls": {}, "important": True}
         conf["items"].insert(0, item)
-    item["decls"]["line-height"] = str(value)
-    item["enabled"] = True
+        targets = [item]
+    for it in targets:
+        it["decls"]["line-height"] = str(value)
+        it["enabled"] = True
     return conf
 
 
