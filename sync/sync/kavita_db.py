@@ -112,6 +112,17 @@ def series_name(series_id: int) -> str:
     return (r["Name"] if r else "") or ""
 
 
+def all_series() -> list[dict]:
+    """所有系列 (id/name/pages) —— 给配置面板选绑定用, 只读。"""
+    db = _open()
+    rows = db.execute(
+        "SELECT Id, Name, COALESCE(Pages,0) Pages "
+        "FROM Series ORDER BY Name").fetchall()
+    db.close()
+    return [{"id": r["Id"], "name": r["Name"] or f"#{r['Id']}",
+             "pages": r["Pages"]} for r in rows]
+
+
 def series_files(series_id: int) -> list[str]:
     """一个系列下所有书的文件路径 (多卷系列会有多条)。"""
     db = _open()

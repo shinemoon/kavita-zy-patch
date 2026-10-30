@@ -118,6 +118,9 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 | POST | `/api/run/links` | 跑 `zync.py links` |
 | GET | `/api/reader_css` | 阅读样式配置 (规则列表 + 渲染后的 css + 预设 + 文件侧状态) |
 | POST | `/api/reader_css` | `{op: save\|reset\|toggle\|delete\|line_height\|patch\|unpatch}` 改配置 / 写进 Kavita 文件 |
+| GET | `/api/keyword_mark` | 关键词高亮配置 (目录 / 绑定 / 语料清单 / 每类样式 / 系列列表) |
+| GET | `/api/keyword_mark/payload?series=N` | 试算: 这本书实际会下发多少词 (跟前端拿的是同一份) |
+| POST | `/api/keyword_mark` | `{op: save\|reset\|toggle\|bind\|unbind}` 改配置 |
 | GET | `/healthz` | 存活探针 |
 
 单例锁: 同时只允许一个 CLI (push 要写 `kavita.db`, 并发会打架), 冲突返 409。
@@ -150,6 +153,28 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
   `install.sh publish` 重建 index.html 后按它决定是否恢复
 - 文件侧已 patch 时, 保存/恢复默认会自动同步过去
 - CLI: `python3 sync/reader_css.py {file|patch|unpatch}`
+
+### 关键词高亮 / 阅读器滤镜 (2026-10-30)
+
+把 epub-refiner（5013）导出的 `keywords.json` 在阅读时叠到 Kavita 正文上。
+**纯前端滤镜**，不改 Kavita 文件、不走 Kavita 后端、默认模式下不改 DOM：
+
+```
+5012 (root) 写 <PATCH_ROOT>/state/keyword_mark.json
+   → 补丁后端 GET :5111/zy/api/keyword-mark?series=N  (按书挑语料, 返词表 + 每类样式)
+   → 补丁前端 在 .book-content 上用 CSS Custom Highlight API 上色
+```
+
+- 逻辑在 `sync/sync/keyword_mark.py`（补丁后端也 import 这一份，单一来源）
+- 语料格式两种都认：epub-refiner 的
+  `{categories:{id:{name,items:[{term,aliases}]}}}`，
+  以及本书库自己的 `{mappings:[{source,target,tags}]}`（`tags[0]` 当分类）
+- 选语料：显式 `bind`（`{"series_id": "文件名"}`）优先；否则按书名
+  完全相同 / 子串 / 词集合 Jaccard ≥ 0.55 匹配，**同一作者的另一本不会被硬配**
+- 词过滤：`min_len`（按字母数字个数）、`skip_digits`（挡 `1981`）、`stop`（默认一串人称/冠词）、
+  `only`（只留指定分类）、分类样式 `enabled:false`（该类不下发）
+- 冒烟: `python3 -m sync.keyword_mark pick 25` / `payload 25` / `summary`
+- 前端调试: Kavita 页面 F12 → `__ZY__.kw()`（`ranges` = 实际高亮段数）
 
 ### 启停
 

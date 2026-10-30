@@ -548,6 +548,74 @@ def _reader_css_post(body: dict) -> dict:
     return out
 
 
+# ---- 关键词高亮 (Kavita 阅读器滤镜) ----------------------------------
+#
+# 用户 2026-10-30: 阅读时按 epub-refiner 导出的 keywords.json 给词上色,
+# 必须是**纯前端滤镜** (不动 Kavita 文件、不走 Kavita 后端)。
+#   5012 (root) 写 <PATCH_ROOT>/state/keyword_mark.json
+#   → 补丁后端 /zy/api/keyword-mark?series=N 给出这本书的词表 + 每类样式
+#   → zy-kavita-patch.js 用 CSS Custom Highlight API 上色 (默认不改 DOM)
+# 语料目录 / 系列绑定 / 每类颜色都在这里配。
+
+def _kw_mod():
+    from sync import keyword_mark as km
+    return km
+
+
+def _kw_get() -> dict:
+    return _kw_mod().summary()
+
+
+def _kw_payload(series_id: int) -> dict:
+    km = _kw_mod()
+    name = ""
+    try:
+        from sync import kavita_db
+        name = kavita_db.series_name(series_id)
+    except Exception:
+        pass
+    return km.build_payload(series_id, name)
+
+
+def _kw_post(body: dict) -> dict:
+    km = _kw_mod()
+    op = str(body.get("op") or "save")
+    if op == "toggle":
+        conf = km.load()
+        conf["enabled"] = bool(body.get("enabled"))
+    elif op == "reset":
+        conf = km.default_conf()
+    elif op == "bind":
+        conf = km.load()
+        try:
+            sid = int(body.get("series_id") or 0)
+        except Exception:
+            sid = 0
+        f = str(body.get("file") or "").strip()
+        if sid > 0 and f:
+            conf.setdefault("bind", {})[str(sid)] = f
+        else:
+            out = km.summary()
+            out["error"] = "bind 需要 series_id 与 file"
+            return out
+    elif op == "unbind":
+        conf = km.load()
+        try:
+            sid = int(body.get("series_id") or 0)
+        except Exception:
+            sid = 0
+        conf.setdefault("bind", {}).pop(str(sid), None)
+    else:
+        conf = body.get("conf") if isinstance(body.get("conf"), dict) else body
+    saved = km.save(conf)
+    out = km.summary()
+    out["saved"] = {"version": saved["version"], "enabled": saved["enabled"],
+                    "binds": len(saved["bind"]), "dirs": saved["dirs"],
+                    "mode": saved["mode"]}
+    return out
+
+
+
 # ---- 掌阅认证 (扫码登录) ---------------------------------------------
 #
 # 用户 2026-10-21: 公网面板要能直接刷二维码重新认证, 不再回 PC 站。
@@ -766,6 +834,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, _reader_css_get())
             except Exception as e:  # noqa: BLE001 — 配置读失败不该整页 500
                 self._json(500, {"error": f"{type(e).__name__}: {e}"})
+        elif path == "/api/keyword_mark":
+            try:
+                self._json(200, _kw_get())
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
+        elif path == "/api/keyword_mark/payload":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                sid = int((q.get("series") or ["0"])[0])
+            except Exception:
+                sid = 0
+            try:
+                self._json(200, _kw_payload(sid))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
         elif path == "/api/auth/qr":
             self._send(200, (_qr_state.get("svg") or "").encode("utf-8"),
                        "image/svg+xml; charset=utf-8")
@@ -837,6 +920,17 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(404, {"error": f"unknown cloud action: {act}"})
             except Exception as e:  # noqa: BLE001 — 面板不能因掌阅/文件错误整页挂
                 self._json(502, {"error": f"{type(e).__name__}: {e}"})
+            return
+        if path == "/api/keyword_mark":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            except Exception:  # noqa: BLE001
+                body = {}
+            try:
+                self._json(200, _kw_post(body))
+            except Exception as e:  # noqa: BLE001
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
             return
         if path == "/api/reader_css":
             try:
@@ -1077,6 +1171,54 @@ details.sec>summary:hover{background:#20242b}
   </div>
 </details>
 
+<details class="sec" id="sec-kw">
+  <summary>关键词高亮 (阅读器滤镜) <span class="pill" id="kw-pill">…</span></summary>
+  <div class="sec-body">
+    <div class="meta" id="kw-meta" style="margin-bottom:8px">加载中…</div>
+    <div class="row" style="margin:0 0 8px;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="kw-en"> 启用
+      </label>
+      <label style="display:flex;align-items:center;gap:6px">
+        渲染模式
+        <select id="kw-mode">
+          <option value="highlight">highlight · 不改 DOM (推荐)</option>
+          <option value="span">span · 支持粗体/圆角</option>
+        </select>
+      </label>
+      <button id="b-kw-save">保存并应用</button>
+      <button id="b-kw-reset">恢复默认</button>
+    </div>
+    <div class="row" style="margin:0 0 8px;align-items:center">
+      <span class="k">语料目录</span>
+      <input id="kw-dirs" style="flex:1;min-width:220px"
+             placeholder="/vol2/1001/epub-refiner/exports (多个用逗号分隔)">
+      <button id="b-kw-scan">重新扫描</button>
+    </div>
+    <div class="meta" style="margin:0 0 4px">语料 (keywords.json) — 选一本 Kavita 系列绑定它</div>
+    <div style="overflow-x:auto"><table id="kw-corpora"></table></div>
+    <div class="meta" style="margin:10px 0 4px">分类样式</div>
+    <div style="overflow-x:auto"><table id="kw-cats"></table></div>
+    <div class="row" style="margin:10px 0 0;align-items:center">
+      <span class="k">试算</span>
+      <select id="kw-test-sel"></select>
+      <button id="b-kw-test">能高亮多少词</button>
+      <span class="meta" id="kw-test-out">—</span>
+    </div>
+    <div class="row" style="margin:8px 0 0;align-items:center">
+      <span class="k">忽略词</span>
+      <input id="kw-stop" style="flex:1;min-width:220px"
+             placeholder="it, him, the (逗号分隔; 清空 = 不过滤)">
+    </div>
+    <div class="meta" id="kw-hint" style="margin-top:8px">
+      纯前端滤镜: 词表由补丁后端按当前书返回, 前端用 <b>CSS Custom Highlight API</b>
+      上色 —— 默认模式<b>一个字符都不改 DOM</b>, Kavita 的进度/注解 XPath 不受影响。
+      <b>span</b> 模式会包一层 <code>&lt;span&gt;</code> 才能做粗体/圆角/内边距。
+      开着的阅读页 60 秒内自动换新配置; 按 F12 执行 <code>__ZY__.kw()</code> 看命中数。
+    </div>
+  </div>
+</details>
+
 <details class="sec" id="sec-log">
   <summary>最近日志</summary>
   <div class="sec-body"><pre id="log"></pre></div>
@@ -1140,7 +1282,7 @@ async function run(cmd){
 }
 $('b-push').onclick = ()=>run('push');
 $('b-pull').onclick = ()=>run('pull');
-$('b-refresh').onclick = ()=>{loadState();loadLog();loadAuth();loadKavita();loadCloud(false);loadCloudLocal();loadReaderCss();};
+$('b-refresh').onclick = ()=>{loadState();loadLog();loadAuth();loadKavita();loadCloud(false);loadCloudLocal();loadReaderCss();loadKeywordMark();};
 
 // ---- Kavita 改造 -----------------------------------------------------
 async function loadKavita(){
@@ -1362,6 +1504,144 @@ async function rsSave(what){
         : ' <span class="k">(文件侧已同步)</span>') : '');
   }catch(e){ $('rs-meta').textContent = (what||'保存') + '失败: ' + e.message; }
 }
+
+// ---- 关键词高亮 ------------------------------------------------------
+let kwConf = null;
+function kwSeriesName(id){
+  const hit = ((kwConf && kwConf.series) || []).find(x => x.id === id);
+  return hit ? hit.name : ('#' + id);
+}
+function kwCats(){
+  const styles = (kwConf && kwConf.styles) || {};
+  const names = {};
+  ((kwConf && kwConf.corpora) || []).forEach(c => (c.categories||[]).forEach(x => { names[x.id] = x.name; }));
+  return Object.keys(styles).map(id => ({ id: id, name: names[id] || id, st: styles[id] }));
+}
+function kwPaint(j){
+  if(j && j.error){ $('kw-meta').textContent = '加载失败: ' + j.error; return; }
+  kwConf = j;
+  $('kw-en').checked = !!j.enabled;
+  $('kw-mode').value = j.mode === 'span' ? 'span' : 'highlight';
+  $('kw-dirs').value = (j.dirs||[]).join(', ');
+  $('kw-stop').value = (j.stop||[]).join(', ');
+  $('kw-pill').textContent = j.enabled ? ('启用 · v' + j.version) : '已关闭';
+  $('kw-pill').className = 'pill ' + (j.enabled ? 'ok' : 'err');
+  $('kw-meta').innerHTML = '语料 <b>' + ((j.corpora||[]).length) + '</b> 份 · 已绑定 <b>' +
+    ((j.binds||[]).length) + '</b> 本 · 模式 <b>' + esc(j.mode) + '</b> · 版本 <b>v' +
+    esc(j.version) + '</b> · 落盘 <code>' + esc(j.path || '') + '</code>';
+
+  const cor = j.corpora || [];
+  $('kw-corpora').innerHTML = cor.length ? ('<thead><tr><th>文件</th><th>标题</th><th>词条</th>' +
+    '<th>大小</th><th>绑定到系列</th></tr></thead><tbody>' +
+    cor.map(c => {
+      const opts = ['<option value="">— 选系列 —</option>'].concat(
+        (j.series||[]).map(s => '<option value="' + s.id + '">' +
+          esc(s.name.slice(0,28) + ' #' + s.id) + '</option>')).join('');
+      const bound = (j.binds||[]).filter(b => b.file === c.file).map(b => b.series_id);
+      return '<tr><td><code>' + esc(c.file) + '</code>' +
+        (bound.length ? '<br><span class="k">已绑: ' + bound.map(esc).join(', ') + '</span>' : '') +
+        '</td><td>' + esc(c.title) + (c.author ? '<br><span class="k">' + esc(c.author) + '</span>' : '') +
+        '</td><td>' + esc(c.words) + ' 词<br><span class="k">' + esc(c.terms) + ' 条</span>' +
+        '</td><td>' + esc((c.size/1024).toFixed(0)) + 'KB</td>' +
+        '<td><select class="kw-bind" data-file="' + esc(c.file) + '">' + opts + '</select>' +
+        ' <button class="kw-unbind" data-file="' + esc(c.file) + '">解绑</button></td></tr>';
+    }).join('') + '</tbody>') : '<tbody><tr><td class="k">目录里没有 keywords.json — 先用 5013 epub-refiner 生成一份</td></tr></tbody>';
+
+  $('kw-corpora').querySelectorAll('.kw-bind').forEach(sel => {
+    sel.onchange = () => {
+      const file = sel.dataset.file, sid = Number(sel.value) || 0;
+      if(!sid) return;
+      kwPost({op:'bind', series_id: sid, file: file}, '已绑定 ' + kwSeriesName(sid));
+    };
+  });
+  $('kw-corpora').querySelectorAll('.kw-unbind').forEach(btn => {
+    btn.onclick = () => {
+      const file = btn.dataset.file;
+      const list = ((kwConf && kwConf.binds) || []).filter(b => b.file === file).map(b => b.series_id);
+      if(!list.length) return;
+      if(!confirm('解绑 ' + list.length + ' 个系列?')) return;
+      list.forEach(sid => kwPost({op:'unbind', series_id: sid}, '已解绑 #' + sid));
+    };
+  });
+
+  $('kw-cats').innerHTML = '<thead><tr><th>分类</th><th>背景</th><th>文字</th>' +
+    '<th>下划线</th><th>粗体*</th><th>斜体*</th><th>启用</th></tr></thead><tbody>' +
+    kwCats().map(c => {
+      const st = c.st || {};
+      const hex = v => /^#[0-9a-fA-F]{6}$/.test(v||'') ? v : '';
+      return '<tr data-cid="' + esc(c.id) + '"><td>' + esc(c.name) +
+        '<br><span class="k">' + esc(c.id) + '</span></td>' +
+        '<td><input type="color" class="kw-bg" value="' + (hex(st.bg) || '#fff3a0') + '"></td>' +
+        '<td><input type="color" class="kw-fg" value="' + (hex(st.color) || '#22262b') + '"></td>' +
+        '<td><input type="checkbox" class="kw-ul"' + (st.underline?' checked':'') + '></td>' +
+        '<td><input type="checkbox" class="kw-b"' + (st.bold?' checked':'') + '></td>' +
+        '<td><input type="checkbox" class="kw-i"' + (st.italic?' checked':'') + '></td>' +
+        '<td><input type="checkbox" class="kw-on"' + (st.enabled!==false?' checked':'') + '></td></tr>';
+    }).join('') + '</tbody>';
+
+  const sel = $('kw-test-sel');
+  const cur = sel.value;
+  sel.innerHTML = (j.series||[]).map(s => '<option value="' + s.id + '">' +
+    esc(s.name.slice(0,34) + ' #' + s.id) + '</option>').join('');
+  if(cur) sel.value = cur;
+  $('kw-test-out').textContent = '—';
+}
+
+function kwCollect(){
+  const styles = {};
+  document.querySelectorAll('#kw-cats tbody tr[data-cid]').forEach(tr => {
+    styles[tr.dataset.cid] = {
+      enabled: tr.querySelector('.kw-on').checked,
+      bg: tr.querySelector('.kw-bg').value,
+      color: tr.querySelector('.kw-fg').value,
+      underline: tr.querySelector('.kw-ul').checked,
+      bold: tr.querySelector('.kw-b').checked,
+      italic: tr.querySelector('.kw-i').checked,
+      radius: '', pad: '', shadow: ''
+    };
+  });
+  const conf = Object.assign({}, (kwConf && kwConf.conf) || {});
+  conf.enabled = $('kw-en').checked;
+  conf.mode = $('kw-mode').value;
+  conf.styles = styles;
+  conf.dirs = $('kw-dirs').value.split(',').map(x => x.trim()).filter(Boolean);
+  conf.stop = $('kw-stop').value.split(',').map(x => x.trim()).filter(Boolean);
+  delete conf.version; delete conf.updated;
+  return conf;
+}
+
+async function kwPost(body, what){
+  try{
+    const j = await postJson('/api/keyword_mark', body);
+    if(j && j.error){ $('kw-meta').innerHTML = '<span class="lv-ERROR">' + esc(j.error) + '</span>'; return j; }
+    kwPaint(j); openSec('sec-kw');
+    if(what) $('kw-meta').innerHTML += ' <span style="color:var(--ok)">✓ ' + esc(what) + '</span>';
+    return j;
+  }catch(e){ $('kw-meta').textContent = (what||'操作') + '失败: ' + e.message; }
+}
+
+async function loadKeywordMark(){
+  try{
+    const r = await fetch('/api/keyword_mark'); const j = await r.json();
+    kwPaint(j);
+  }catch(e){ $('kw-meta').textContent = '加载失败: ' + e.message; }
+}
+
+$('b-kw-save').onclick = ()=>kwPost({op:'save', conf: kwCollect()}, '已保存');
+$('b-kw-reset').onclick = ()=>{ if(confirm('恢复默认 (目录 / 模式 / 8 类配色)?')) kwPost({op:'reset'}, '已恢复默认'); };
+$('b-kw-scan').onclick = ()=>loadKeywordMark();
+$('b-kw-test').onclick = async ()=>{
+  const sid = Number($('kw-test-sel').value) || 0;
+  $('kw-test-out').textContent = '计算中…';
+  try{
+    const r = await fetch('/api/keyword_mark/payload?series=' + sid); const j = await r.json();
+    if(j.error){ $('kw-test-out').textContent = '失败: ' + j.error; return; }
+    $('kw-test-out').innerHTML = j.total
+      ? ('<b>' + j.total + '</b> 词 · ' + (j.cats||[]).length + ' 类 · 语料 ' +
+         esc(j.file || '?') + ' · 命中方式 <code>' + esc((j.pick||{}).how || '?') + '</code>')
+      : ('没匹配到语料 (' + esc((j.pick||{}).how || 'none') + ') — 在上表给它绑定一份');
+  }catch(e){ $('kw-test-out').textContent = '失败: ' + e.message; }
+};
 
 $('b-rs-patch').onclick = ()=>rsOp('patch', '已 patch 到 Kavita 文件');
 $('b-rs-unpatch').onclick = ()=>{
@@ -1698,7 +1978,7 @@ $('b-cl-dir-save').onclick = async ()=>{
 };
 
 loadState(); loadLog(); loadAuth(); loadKavita();
-loadCloud(false); loadCloudLocal(); loadReaderCss();
+loadCloud(false); loadCloudLocal(); loadReaderCss(); loadKeywordMark();
 </script></body></html>"""
 
 
