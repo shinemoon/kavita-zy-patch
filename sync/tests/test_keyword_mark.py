@@ -171,6 +171,40 @@ p6 = km.build_payload(25, "x", km.normalize({"dirs": [str(D1)], "bind": {"25": A
                                              "max_terms": 50}))
 ok(p6["total"] <= 50, "max_terms 截断生效")
 
+# ---- 预算公平分配 (2026-10-31 修: 人名吃光 max_terms, 道具/地点一个词都分不到) ----
+D3 = pathlib.Path(tempfile.mkdtemp(prefix="kw-dir3-"))
+BIG = write_corpus(D3, "Big_Book-big001.json", "Big Book", {
+    "person": ("人名", [("人物%d" % i, ["别名%d" % i]) for i in range(400)]),
+    "place": ("地点", [("地点%d" % i, []) for i in range(60)]),
+    "object": ("道具", [("道具%d" % i, []) for i in range(60)]),
+})
+pf = km.build_payload(25, "x", km.normalize({"dirs": [str(D3)], "bind": {"25": BIG.name},
+                                             "max_terms": 90}))
+cat_ids = [x["id"] for x in pf["cats"]]
+eq(sorted(cat_ids), ["object", "person", "place"], "大分类占满预算时其他分类仍要出现")
+ok(all(len(x["words"]) > 0 for x in pf["cats"]), "每类都分到词 (不再被第一个分类吃光)")
+eq(pf["total"], sum(len(x["words"]) for x in pf["cats"]), "公平分配后 total = 各分类之和")
+ok(pf["total"] <= 90, "公平分配不超过 max_terms")
+eq({x["id"]: len(x["words"]) for x in pf["cats"]}["place"], 30,
+   "小分类拿到均分额度 (90/3=30)")
+eq({x["id"]: len(x["words"]) for x in pf["cats"]}["person"], 30,
+   "大分类先拿均分, 不吃别人的额度")
+
+# count 降序: refiner 给的 count 决定截断顺序
+D4 = pathlib.Path(tempfile.mkdtemp(prefix="kw-dir4-"))
+COUNTED = D4 / "counted.json"
+COUNTED.write_text(json.dumps({
+    "meta": {"title": "Counted"},
+    "categories": {"person": {"name": "人名", "items": [
+        {"term": "冷门甲", "aliases": [], "count": 1},
+        {"term": "热门乙", "aliases": [], "count": 999},
+        {"term": "中频丙", "aliases": [], "count": 50},
+    ]}},
+}, ensure_ascii=False), encoding="utf-8")
+pc = km.build_payload(25, "x", km.normalize({"dirs": [str(D4)], "bind": {"25": "counted.json"}}))
+eq({x["id"]: x["words"] for x in pc["cats"]}["person"], ["热门乙", "中频丙", "冷门甲"],
+   "词按 count 降序排 (截断时先砍冷门词)")
+
 p7 = km.build_payload(99, "没有这本书", km.normalize({"dirs": [str(D1)]}))
 eq((p7["cats"], p7["total"], p7["pick"]["how"]), ([], 0, "none"), "没匹配 → 空词表不报错")
 

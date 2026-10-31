@@ -1751,10 +1751,21 @@ $('b-kw-test').onclick = async ()=>{
   try{
     const r = await fetch('/api/keyword_mark/payload?series=' + sid); const j = await r.json();
     if(j.error){ $('kw-test-out').textContent = '失败: ' + j.error; return; }
-    $('kw-test-out').innerHTML = j.total
-      ? ('<b>' + j.total + '</b> 词 · ' + (j.cats||[]).length + ' 类 · 语料 ' +
-         esc(j.file || '?') + ' · 命中方式 <code>' + esc((j.pick||{}).how || '?') + '</code>')
-      : ('没匹配到语料 (' + esc((j.pick||{}).how || 'none') + ') — 在上表给它绑定一份');
+    if(!j.total){
+      $('kw-test-out').textContent = '没匹配到语料 (' + ((j.pick||{}).how || 'none') + ') — 在上表给它绑定一份';
+      return;
+    }
+    // 每类分到多少词 (公平分配后 8 类都该有; 只显示 1 类说明预算被吃光了)
+    const chips = (j.cats || []).map(c =>
+      '<span class="pill" style="background:' + esc((c.style||{}).bg || '#eee') + ';color:' +
+      esc((c.style||{}).color || '#222') + '">' + esc(c.name || c.id) + ' ' +
+      c.words.length + (c.words_total && c.words_total > c.words.length ? '/' + c.words_total : '') +
+      '</span>').join(' ');
+    $('kw-test-out').innerHTML =
+      '<b>' + j.total + '</b> 词 · ' + (j.cats||[]).length + ' 类 · 语料 ' + esc(j.file || '?') +
+      ' · 命中方式 <code>' + esc((j.pick||{}).how || '?') + '</code>' +
+      (j.words_corpus ? ' · 语料共 ' + j.words_corpus + ' 词' : '') +
+      '<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px">' + chips + '</div>';
   }catch(e){ $('kw-test-out').textContent = '失败: ' + e.message; }
 };
 

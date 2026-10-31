@@ -272,7 +272,21 @@ def load_corpus(p: Path) -> dict | None:
                 continue
             cid = str(cid)
             words: list[str] = []
-            for it in (c.get("items") or []):
+            # 按 count 降序排 (refiner 给的条目带出现次数), 让 max_terms 截断
+            # 先砍掉冷门词, 而不是按文件里的书写顺序砍 (2026-10-31 修)
+            items = list(c.get("items") or [])
+            if any(isinstance(it, dict) for it in items):
+                def _cnt(pair):
+                    idx, it = pair
+                    if not isinstance(it, dict):
+                        return (1, idx)
+                    try:
+                        n = int(it.get("count") or 0)
+                    except Exception:
+                        n = 0
+                    return (-n, idx)
+                items = [it for _k, it in sorted(enumerate(items), key=_cnt)]
+            for it in items:
                 if isinstance(it, dict):
                     words.extend(_words_of_item(it))
                 elif isinstance(it, str):
@@ -458,6 +472,34 @@ def _clean_word(w: str, conf: dict) -> str:
     return w
 
 
+def _allocate(counts: dict[str, int], budget: int) -> dict[str, int]:
+    """按分类公平分预算 (注水法)。
+
+    旧实现按分类顺序一路装到 max_terms 就 break —— 大书里第一个分类 (人名)
+    动辄几千词, 后面 7 类一个词都分不到, 表现为"只有人名高亮, 道具/地点全无"。
+    这里每轮给还缺词的分类平均分, 分不完的额度留给别人, 直到预算用尽或词用完。
+    """
+    alloc = {k: 0 for k in counts}
+    left = max(0, int(budget))
+    pending = [k for k, v in counts.items() if v > 0]
+    while left > 0 and pending:
+        share = max(1, left // len(pending))
+        moved = False
+        for k in list(pending):
+            take = min(counts[k] - alloc[k], share, left)
+            if take > 0:
+                alloc[k] += take
+                left -= take
+                moved = True
+            if alloc[k] >= counts[k]:
+                pending.remove(k)
+            if left <= 0:
+                break
+        if not moved:          # 理论上到不了; 防死循环
+            break
+    return alloc
+
+
 def build_payload(series_id: int, series_name: str = "", conf: dict | None = None) -> dict:
     conf = conf or load()
     out = {"ok": True, "enabled": bool(conf["enabled"]), "version": conf["version"],
@@ -477,35 +519,54 @@ def build_payload(series_id: int, series_name: str = "", conf: dict | None = Non
 
     only = set(conf["only"] or [])
     stop = {str(s).lower() for s in (conf["stop"] or [])}
-    seen_global: set[str] = set()
-    cats_out = []
-    total = 0
+
+    # 第一步: 每类清洗 + 去重, 拿到完整候选词表
+    groups: list[dict] = []
     for cid, c in corpus["categories"].items():
         st = conf["styles"].get(cid) or _default_style(cid)
         if only and cid not in only:
             continue
         if not st.get("enabled", True):
             continue
-        seen_local: set[str] = set()
+        seen: set[str] = set()
         words = []
         for w in c["words"]:
             w2 = _clean_word(w, conf)
             if not w2:
                 continue
             low = w2.lower()
-            if low in stop or low in seen_local:
+            if low in stop or low in seen:
                 continue
-            seen_local.add(low)
+            seen.add(low)
             words.append(w2)
-            if total + len(words) >= conf["max_terms"]:
-                break
         if not words:
             continue
-        total += len(words)
-        seen_global |= seen_local
-        cats_out.append({"id": cid, "name": c["name"], "style": st, "words": words})
-        if total >= conf["max_terms"]:
-            break
+        groups.append({"id": cid, "name": c["name"], "style": st, "words": words})
+
+    # 第二步: 公平分预算 (不再让第一个分类吃光 max_terms)
+    quota = _allocate({g["id"]: len(g["words"]) for g in groups}, conf["max_terms"])
+
+    cats_out = []
+    total = 0
+    seen_global: set[str] = set()
+    for g in groups:
+        n = quota.get(g["id"], 0)
+        if n <= 0:
+            continue
+        picked = []
+        for w in g["words"]:
+            low = w.lower()
+            if low in seen_global:      # 跨分类去重: 先到先得 (分类顺序 = 语义优先级)
+                continue
+            picked.append(w)
+            seen_global.add(low)
+            if len(picked) >= n:
+                break
+        if not picked:
+            continue
+        total += len(picked)
+        cats_out.append({"id": g["id"], "name": g["name"], "style": g["style"],
+                         "words": picked, "words_total": len(g["words"])})
 
     out["cats"] = cats_out
     out["total"] = total
@@ -513,6 +574,7 @@ def build_payload(series_id: int, series_name: str = "", conf: dict | None = Non
     out["title"] = corpus["title"]
     out["author"] = corpus["author"]
     out["corpus_mtime"] = corpus["mtime"]
+    out["words_corpus"] = int(corpus.get("words_total") or 0)
     return out
 
 
