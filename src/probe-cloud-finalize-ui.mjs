@@ -5,6 +5,7 @@
 //   4) 本地清单里每行也有「补齐」
 // 用法: node src/probe-cloud-finalize-ui.mjs [origin]
 import { chromium } from 'playwright';
+import { addZyCookie } from './zyauth.mjs';
 
 const ORIGIN = process.argv[2] || 'http://127.0.0.1:5012';
 
@@ -12,6 +13,8 @@ const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1400, height: 1400 } });
 const errs = [];
 page.on('pageerror', (e) => errs.push(String(e)));
+
+await addZyCookie(page);
 
 await page.goto(ORIGIN + '/', { waitUntil: 'domcontentloaded' });
 // 云书籍是折叠卡, 需要先展开才会渲染列表

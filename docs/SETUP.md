@@ -35,6 +35,22 @@ setfacl -m u:youruser:rwx /vol1/1001/APPS/kavita   # 目录，WAL 要建 -wal/-s
 
 > 只有一台机器 + 一个公网端口映射时：映射 5000（Kavita）与 5012（控制台兼 API 入口）即可，5111 不用放行。
 
+### 5012 / 5013 的登录（2026-10-31）
+
+5012 控制台与 5013 epub-refiner 都要**先登录**，凭据就是 Kavita 的账号密码
+（用户要求与 `:5000` 一致）：输入直接打给 `POST /api/Account/login` 校验，通过才发
+`zy_webauth` 会话 cookie（HMAC-SHA256，7 天）。
+
+- 两个控制台共用 `/vol2/1001/webauth/webauth.json` 的密钥 → **登录一次，两边都能进**
+  （cookie 只看 host，不看端口）。
+- Kavita 响应过 200 后会缓存一份 pbkdf2 校验串：Kavita 挂了/在重建时同一把密码仍能登，
+  否则正好在最需要修 Kavita 的时候被锁在门外。在线但密码错**不**走缓存。
+- 失败限流 8 次 / 5 分钟 / IP。`/healthz` 与 `/zy/api/*` 不需要 cookie
+  （后者是 Kavita 页面的跨源调用，本来就不带本域 cookie，由 `X-ZY-Token` 守）。
+- 排障时想临时关掉：给进程加 `ZY_WEBAUTH_DISABLE=1`（别长期开）。
+- 自测：`node src/probe-login-gate.mjs`（真浏览器验 5012 + 5013 的拦截/放行/退出）。
+
+
 ---
 
 ## 1. 装改造（一键）
@@ -439,6 +455,9 @@ bash /vol2/1001/kavita-zy-patch/deploy/reapply.sh   # 判断 + 重建 + inode �
 
 | 现象 | 查 |
 |---|---|
+| 打开 5012 / 5013 变成登录页 | 正常（2026-10-31 起）：用 **Kavita 的账号密码**登。密码对不上 → 确认 `:5000` 能打开并登得进；登录接口 `POST 127.0.0.1:5000/api/Account/login` 返 401 就是密码错 |
+| 登录页提示「Kavita 不可达」且离线口令也不对 | Kavita 容器没起来，或这台从没成功登录过一次（缓存校验串在 `/vol2/1001/webauth/webauth.json`）。先把 Kavita 拉起来再登一次 |
+| 老的探针脚本打 5012 `/api/*` 返 401 | 登录门生效了。要么带会话 cookie，要么改走 `/zy/api/*`（免 cookie，由 `X-ZY-Token` 守） |
 | 页面没有「掌阅同步」 | 先 **强刷** Ctrl/Cmd+Shift+R（index.html 缓存）；再查自检 `前端资源` / `index 注入` / `前端资产版本` 是否红 → 「注入 / 重打」；F12 控制台看 `__ZY__.ver` 与 `document.getElementById('zy-top-item')` |
 | 顶栏有、左侧抽屉没有 | 正常：手机/窄屏抽屉默认收起，点汉堡菜单才看到；顶栏入口一直都在 |
 | 有导航项，徽标空白/「离线」 | 自检 `补丁后端` 是否红 → 「重启补丁后端」；F12 看请求打到哪个 base（`__ZY__.auto().base`）。若是 `host:5111` 且被浏览器拒（`ERR_CONNECTION_REFUSED`）= 这台设备到 5111 不通：v0.4.6 起会自动改走 `host:5012/zy/api`，仍不通就查 5012 的端口映射/反代 |

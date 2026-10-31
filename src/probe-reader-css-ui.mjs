@@ -1,5 +1,6 @@
 // 5012 控制台「阅读样式增强」卡片的 UI 冒烟: 折叠/展开 + 增删规则
 import { chromium } from 'playwright';
+import { addZyCookie } from './zyauth.mjs';
 
 const URL = process.argv[2] || 'http://127.0.0.1:5012/';
 const browser = await chromium.launch({ args: ['--no-sandbox'] });
@@ -8,6 +9,8 @@ const page = await ctx.newPage();
 const errs = [];
 page.on('pageerror', e => errs.push('PAGEERR ' + e.message));
 page.on('console', m => { if (m.type() === 'error') errs.push('CONSOLE ' + m.text().slice(0, 160)); });
+
+await addZyCookie(page);
 
 await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 await page.waitForTimeout(3000);

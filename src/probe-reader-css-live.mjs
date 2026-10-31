@@ -1,5 +1,6 @@
 // 活更新验证: 页面开着, 改配置, 等 65s 看 style 是否自动换 (不刷新页面)
 import { chromium } from 'playwright';
+import { zyToken } from './zyauth.mjs';
 import { execFileSync } from 'child_process';
 
 const ORIGIN = 'http://127.0.0.1:5000';
@@ -49,8 +50,10 @@ const read = () => page.evaluate(() => {
 });
 console.log('before:', JSON.stringify(await read()));
 
+// 5012 现在要登录 cookie (2026-10-31), 否则改配置会 401
 const r = await fetch('http://127.0.0.1:5012/api/reader_css', {
-  method: 'POST', headers: { 'Content-Type': 'application/json', 'X-ZY-Token': TOKEN },
+  method: 'POST', headers: { 'Content-Type': 'application/json', 'X-ZY-Token': TOKEN,
+    Cookie: 'zy_webauth=' + zyToken() },
   body: JSON.stringify({ op: 'line_height', value: '1.55' }) });
 const j = await r.json();
 console.log('saved version', j.version, JSON.stringify(j.items[0].decls));

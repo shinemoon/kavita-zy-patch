@@ -2,6 +2,7 @@
 // 不改行间距等配置值, 只点两个按钮 + 读状态文案。
 // 结束时保证文件侧是「已 patch」状态。
 import { chromium } from 'playwright';
+import { addZyCookie } from './zyauth.mjs';
 
 const URL = process.argv[2] || 'http://127.0.0.1:5012/';
 const browser = await chromium.launch({ args: ['--no-sandbox'] });
@@ -11,6 +12,8 @@ const errs = [];
 page.on('pageerror', e => errs.push('PAGEERR ' + e.message));
 page.on('console', m => { if (m.type() === 'error') errs.push('CONSOLE ' + m.text().slice(0, 160)); });
 page.on('dialog', d => d.accept());
+
+await addZyCookie(page);
 
 await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 await page.waitForTimeout(3000);

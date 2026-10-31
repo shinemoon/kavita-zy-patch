@@ -1,8 +1,10 @@
 import { chromium } from 'playwright';
+import { addZyCookie } from './zyauth.mjs';
 const b = await chromium.launch({ args: ['--no-sandbox'] });
 const p = await b.newPage({ viewport: { width: 430, height: 932 } });
 const errs = [];
 p.on('pageerror', e => errs.push(String(e)));
+await addZyCookie(p);
 await p.goto('http://127.0.0.1:5012/', { waitUntil: 'networkidle' });
 await p.waitForTimeout(1800);
 

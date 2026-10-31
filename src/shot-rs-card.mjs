@@ -1,10 +1,12 @@
 // 只截 5012 的「阅读样式增强」卡 (给人看按钮长什么样)
 import { chromium } from 'playwright';
+import { addZyCookie } from './zyauth.mjs';
 
 const URL = process.argv[2] || 'http://127.0.0.1:5012/';
 const OUT = process.argv[3] || '/tmp/rs-card.png';
 const browser = await chromium.launch({ args: ['--no-sandbox'] });
 const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+await addZyCookie(page);
 await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
 await page.waitForTimeout(2500);
 await page.evaluate(() => {
