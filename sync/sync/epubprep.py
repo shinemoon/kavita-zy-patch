@@ -140,6 +140,14 @@ def _ensure_mapping(series_id: int, *, zy_book_id: str, book_name: str,
                      kavita_chapter_count=cur.kavita_chapter_count or 1,
                      epub_path=str(orig), note=cur.note or "补 zy book_id")
         return "filled"
+    # 档在但字段缺 (老的自动建档只写了名字) → 补 epub_path / 章数, 幂等
+    if not cur.epub_path or not cur.kavita_chapter_count:
+        mapping.link(series_id, cur.zy_book_id, cur.zy_book_name,
+                     kavita_chapter_count=cur.kavita_chapter_count
+                     or len(kavita_db.list_chapters(series_id)),
+                     epub_path=cur.epub_path or str(orig), note=cur.note or "")
+        _say(f"映射补字段 series={series_id} epub_path={cur.epub_path or orig}", log)
+        return "filled"
     return "exists"
 
 
@@ -320,6 +328,289 @@ def prep_download(target: str | Path, *, book_name: str = "", zy_book_id: str = 
 
     res["state"] = "ok"
     return res
+
+
+# ---- 一站式收尾 (幂等, 可从磁盘现状补齐) --------------------------------
+
+def _step(res: dict, name: str, ok: bool, detail: str = "") -> bool:
+    res.setdefault("steps", []).append(
+        {"name": name, "ok": bool(ok), "detail": str(detail)[:500]})
+    return bool(ok)
+
+
+def _pages_read(series_id: int) -> int:
+    try:
+        return int(kavita_db.pages_read_by_series().get(int(series_id), 0))
+    except Exception:                                   # noqa: BLE001
+        return 0
+
+
+def ensure_ready(target: str | Path, *, book_name: str = "", zy_book_id: str = "",
+                 series_id: int | None = None, target_bytes: int | None = None,
+                 rescan: bool = True, pull: str | bool = "auto",
+                 log=print) -> dict:
+    """下载完成后的一站式收尾 —— **幂等, 可反复重跑**。
+
+    一次跑完下面全部步骤, 每一步都记进 `steps` (UI 直接展示哪步成了/哪步缺):
+
+        1. file     库里的文件在、能读
+        2. archive  原书归档 bridge/books (readPercent 的唯一权威; 已是切片版时只校验)
+        3. edition  库里那份是等字节切片版 (缺/坏就从原书重建, 原书不在才放弃)
+        4. sidecar  state/kpages/<series>.json (页 ↔ 原书字节)
+        5. series   找到 Kavita 系列 (没有就扫库)
+        6. pages    重扫并等 Chapter.Pages == sidecar 页数
+        7. mapping  book_link (多卷系列建卷级 / 单本建系列级)
+        8. pull     掌阅进度落到新页号
+
+    `pull="auto"` 只在**这本书在 Kavita 还没有任何进度**时自动 pull —— 新下载
+    的书属于这种情况; 已有进度的书不动 (避免把读者读了一半的位置按云端旧值
+    往回拨), 需要时手动点「从掌阅拉」。
+
+    与 prep_download 的区别: prep_download 是"从原始文件出发的一次性准备",
+    半路任何一步失败 (扫库 404 / API key 路径 / 页数没对上) 都会留下
+    "库里是切片版、但没有 sidecar / 没有映射" 的中间态, 而它下次看到
+    is_edition 就直接 return "edition"。ensure_ready 从**磁盘现状**出发补
+    缺的那几步, 所以下载、覆盖下载、事后修复都走同一个入口。
+    """
+    res: dict = {"state": "skipped", "steps": [], "msgs": []}
+
+    def say(m: str) -> None:
+        res["msgs"].append(str(m))
+        _say(m, log)
+
+    tgt = Path(target)
+    tb = target_bytes if target_bytes is not None else kpages.TARGET_PAGE_BYTES
+
+    if not tgt.exists():
+        res.update(state="error", error=f"文件不存在: {tgt}")
+        _step(res, "file", False, res["error"])
+        return res
+    if not in_library(tgt):
+        res["why"] = f"不在 Kavita 库目录 {LIB}"
+        _step(res, "file", False, res["why"])
+        return res
+    _share(tgt)
+
+    try:
+        is_ed = kpages.is_edition(tgt)
+    except Exception as e:                              # noqa: BLE001
+        is_ed = False
+        say(f"is_edition 判定失败 ({type(e).__name__}: {e}), 按原书处理")
+
+    # ---- 2 原书归档 ----
+    ORIG.mkdir(parents=True, exist_ok=True)
+    orig = ORIG / tgt.name
+    if is_ed:
+        if orig.exists():
+            res["orig"] = str(orig)
+            _step(res, "archive", True, f"原书已在 {orig}")
+        else:
+            _step(res, "archive", False,
+                  f"原书归档缺失 ({orig}) — 现在这份是切片版, 无法重建几何")
+    else:
+        try:
+            if orig.exists() and orig.stat().st_size == tgt.stat().st_size:
+                _step(res, "archive", True, f"原书已在 {orig} (字节数一致)")
+            else:
+                # 原书是 readPercent 的唯一权威 —— 覆盖前先把旧归档留一份,
+                # 否则"库里的文件被别的工具改过 + 又下载了一次"就会把真原件弄丢。
+                if orig.exists():
+                    try:
+                        BACKUP.mkdir(parents=True, exist_ok=True)
+                        old = BACKUP / (f"{orig.stem}.orig.epub.bak-"
+                                        + time.strftime("%Y%m%d-%H%M%S"))
+                        shutil.copy2(orig, old)
+                        say(f"旧原书归档备份 -> {old}")
+                    except OSError as e:
+                        say(f"旧原书归档备份失败 ({type(e).__name__}: {e}), 继续")
+                shutil.copy2(tgt, orig)
+                _share(orig)
+                _step(res, "archive", True,
+                      f"原书归档 -> {orig} ({tgt.stat().st_size}B)")
+                say(f"原书归档 -> {orig}")
+            res["orig"] = str(orig)
+        except OSError as e:
+            res.update(state="error", error=f"归档原书失败: {type(e).__name__}: {e}")
+            _step(res, "archive", False, res["error"])
+            return res
+
+    # ---- 5' 先摸一遍系列 (可能还没有) ----
+    sid = series_id or kavita_db.series_for_file(tgt.name)
+    if sid:
+        res["series_id"] = sid
+
+    # ---- 多卷系列: 不切片, 但必须建卷级映射 ----
+    files = kavita_db.series_files(sid) if sid else []
+    if sid and len(files) > 1:
+        _step(res, "edition", False,
+              f"多卷系列 ({len(files)} 个文件) — 不做字节切片")
+        mstate = _ensure_volume_mapping(sid, tgt, zy_book_id=zy_book_id,
+                                       book_name=book_name, log=say)
+        _step(res, "mapping", mstate in ("created", "updated"), mstate)
+        _maybe_pull(res, sid, pull, say)
+        res["state"] = "skipped"
+        res["why"] = (f"系列有 {len(files)} 个文件 (多卷), 卷级映射 {mstate}, "
+                      f"不做字节切片 (掌阅按整本 pct, Kavita 按卷内页)")
+        return res
+
+    # ---- 图片型 epub: 不切片, 建档即可 ----
+    if not is_ed:
+        try:
+            reason = kpages.image_book_reason(kpages.load_epub(orig))
+        except Exception:                               # noqa: BLE001
+            reason = None
+        if reason:
+            _step(res, "edition", False, f"图片型 epub, 保持原样: {reason}")
+            if not sid:
+                sid = resolve_series(tgt, log=say)
+            if not sid:
+                res.update(state="no_series", why="扫库后仍没找到这本书的系列")
+                _step(res, "series", False, res["why"])
+                return res
+            res["series_id"] = sid
+            _step(res, "series", True, f"series={sid}")
+            mstate = _ensure_mapping(sid, zy_book_id=zy_book_id,
+                                     book_name=book_name, orig=orig, log=say)
+            _step(res, "mapping", mstate != "no_zy_id", mstate)
+            _maybe_pull(res, sid, pull, say)
+            res["state"] = "skipped"
+            res["why"] = f"图片型 epub, 保持原样: {reason}"
+            return res
+
+    # ---- 3 sidecar 现状 ----
+    sc = kpages.load(sid) if sid else None
+    sc_pages = len(sc.get("pages") or []) if sc else 0
+
+    need_build = (not is_ed)
+    why_build = "" if need_build else ""
+    if is_ed and sc_pages == 0:
+        # 切片版但 sidecar 丢了 → 用原书确定性重建一次 (库里的内容不变语义)
+        need_build = True
+        why_build = "切片版缺 sidecar, 用原书重建以恢复页映射"
+
+    if need_build:
+        if not orig.exists():
+            res.update(state="error",
+                       error="缺少原书 (bridge/books), 无法重建切片版")
+            _step(res, "edition", False, res["error"])
+            return res
+        tmp = tgt.with_name(tgt.name + ".kptmp.epub")
+        try:
+            sc = kpages.build_edition(orig, tmp, target_bytes=tb)
+        except Exception as e:                          # noqa: BLE001
+            tmp.unlink(missing_ok=True)
+            res.update(state="error", error=f"构建切片版失败: {type(e).__name__}: {e}")
+            _step(res, "edition", False, res["error"])
+            say(f"构建切片版失败, 库里文件保持原样: {res['error']}")
+            return res
+        try:
+            BACKUP.mkdir(parents=True, exist_ok=True)
+            bak = BACKUP / f"{tgt.stem}.epub.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(tgt, bak)
+            os.replace(tmp, tgt)
+            _share(tgt)
+            res["backup"] = str(bak)
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            res.update(state="error", error=f"换库失败: {type(e).__name__}: {e}")
+            _step(res, "edition", False, res["error"])
+            return res
+        sc_pages = len(sc.get("pages") or [])
+        res.update(pages=sc_pages,
+                   bytes_per_page=sc["src_total_bytes"] // max(1, sc_pages),
+                   opf_downgraded=bool(sc.get("opf_version_downgraded")))
+        _step(res, "edition", True,
+              (why_build + " " if why_build else "")
+              + f"{sc_pages} 页 (每页 ~{res['bytes_per_page']}B)" + f" -> {tgt}")
+        say(f"切片版 {sc_pages} 页 (每页 ~{res['bytes_per_page']}B) -> {tgt}")
+    else:
+        res["pages"] = sc_pages
+        _step(res, "edition", True, f"已是切片版 ({sc_pages} 页, sidecar 在)")
+
+    # ---- 5 找系列 (新书这里才扫库) ----
+    if not sid:
+        sid = resolve_series(tgt, log=say)
+    if not sid:
+        res.update(state="no_series", why="扫库后仍没找到这本书的系列")
+        _step(res, "series", False, res["why"])
+        say(res["why"])
+        return res
+    res["series_id"] = sid
+    _step(res, "series", True, f"series={sid} {kavita_db.series_name(sid)}")
+
+    # ---- 4 sidecar (缺/刚建才写) ----
+    if sc is not None:
+        sc["series_id"] = sid
+        sc["library_path"] = str(tgt)
+        sc["book_name"] = book_name or tgt.stem
+        try:
+            sc_path = kpages.save(sc, sid)
+            _step(res, "sidecar", True, str(sc_path))
+        except Exception as e:                          # noqa: BLE001
+            _step(res, "sidecar", False, f"{type(e).__name__}: {e}")
+    else:
+        _step(res, "sidecar", False, "没有 sidecar 且未重建")
+
+    # ---- 6 重扫 + 等页数 ----
+    want = len(sc.get("pages") or []) if sc else 0
+    have = _chapter_pages(sid)
+    if rescan and want and have != want:
+        for _ in range(2):
+            _scan_library()
+            if _wait_pages(sid, want, wait=min(SCAN_WAIT, 120)):
+                break
+        have = _chapter_pages(sid)
+    pages_ok = (not want) or have == want
+    _step(res, "pages", pages_ok, f"Kavita {have} 页 / 期望 {want}")
+    res.update(rescanned=True, kavita_pages=have)
+    if not pages_ok:
+        res["warn"] = f"Kavita 页数 {have} 还没跟 sidecar {want} 对上"
+
+    # ---- 7 映射 ----
+    mstate = _ensure_mapping(sid, zy_book_id=zy_book_id,
+                             book_name=book_name, orig=orig, log=say)
+    _step(res, "mapping", mstate != "no_zy_id", mstate)
+
+    # ---- 8 pull ----
+    _maybe_pull(res, sid, pull, say)
+
+    ok_all = all(s["ok"] for s in res["steps"]
+                 if s["name"] in ("file", "archive", "edition", "sidecar",
+                                  "series", "mapping"))
+    res["state"] = "ok" if ok_all else "partial"
+    return res
+
+
+def _maybe_pull(res: dict, sid: int, pull: str | bool, say) -> None:
+    """按 pull 策略把掌阅进度落到 Kavita (只前进)。
+
+    pull=True   → 总是 pull
+    pull="auto" → 只有这本书在 Kavita 还没有任何进度时才 pull (新书)
+    pull=False  → 不 pull
+    """
+    if pull is False:
+        res.setdefault("steps", []).append(
+            {"name": "pull", "ok": True, "detail": "跳过 (未要求)"})
+        return
+    if pull == "auto":
+        cur = _pages_read(sid)
+        if cur > 0:
+            res.setdefault("steps", []).append(
+                {"name": "pull", "ok": True,
+                 "detail": f"跳过 (Kavita 已有进度 {cur} 页, 用「从掌阅拉」手动覆盖)"})
+            return
+    try:
+        from . import sync as syncmod                    # noqa: PLC0415 — 环形 import
+        out = syncmod.pull_once(series_ids={sid}, only_forward=True)
+        res["pull"] = out
+        _step(res, "pull", not out.get("error"),
+              f"updated={out.get('updated')} skipped={out.get('skipped')}"
+              + (f" error={out['error']}" if out.get("error") else ""))
+        say(f"pull: {out}")
+    except Exception as e:                              # noqa: BLE001
+        res["pull"] = {"error": f"{type(e).__name__}: {e}"}
+        _step(res, "pull", False, res["pull"]["error"])
+        say(f"pull 失败 (不影响入库): {res['pull']['error']}")
 
 
 def main() -> int:

@@ -335,17 +335,21 @@ def test_kavita_pagesread_equals_spine_index():
             if not Path(path).exists():
                 print(f"  SKIP {label}: epub 不在 {path}")
                 continue
-            assert r["PagesRead"] == want_pages, \
-                f"{label}: Kavita PagesRead 变成 {r['PagesRead']}, 标尺是 {want_pages}"
+            # 断言**自洽**, 不冻结数字: 用这一行自己的 BookScrollId 算命中篇号,
+            # PagesRead 必须落在里面 (PagesRead = 续读篇的 spine 下标)。
+            # 历史上这里写过死数 (PR=3), 用户多读一页测试就红 —— 那不是语义崩了,
+            # 是指尺本身过期了。
+            xp = r["BookScrollId"]
             g = zpct.load_geometry(path)
             hits = [i for i in range(len(g.spine))
-                    if (di := zpct.build_doc_index(path, i)) and want_xp in di._by_xpath]
-            assert hits, f"{label}: BookScrollId {want_xp} 在任何 spine 文档里都没命中"
-            assert want_pages in hits, (
-                f"{label}: BookScrollId {want_xp} 命中篇号 {hits}, "
-                f"不含 PagesRead={want_pages} —— 两侧语义假设崩了")
+                    if (di := zpct.build_doc_index(path, i)) and xp in di._by_xpath]
+            assert hits, f"{label}: BookScrollId {xp} 在任何 spine 文档里都没命中"
+            assert r["PagesRead"] in hits, (
+                f"{label}: BookScrollId {xp} 命中篇号 {hits}, "
+                f"不含 PagesRead={r['PagesRead']} —— 两侧语义假设崩了")
             checked += 1
-            print(f"  OK   {label}: PagesRead={want_pages} ∈ 命中篇号 {hits} (spine={len(g.spine)})")
+            print(f"  OK   {label}: PagesRead={r['PagesRead']} ∈ 命中篇号 {hits} "
+                  f"(spine={len(g.spine)}, 旧标尺 {want_pages})")
 
         # 掌阅侧: 狐的故事 pct=0.257346 解出 chapterId=5 → Kavita 要 6
         # 狐的故事已被重排成 Kavita 版, 几何必须取原书归档

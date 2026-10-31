@@ -89,6 +89,22 @@ def iter_progress(user_id: int = KAVITA_USER_ID) -> Iterator[Progress]:
     db.close()
 
 
+def pages_read_by_series(user_id: int = KAVITA_USER_ID) -> dict[int, int]:
+    """{series_id: PagesRead 合计} —— 一次拷库全部拿到, 避免逐本 iter_progress。
+
+    用途: 下载收尾/补齐时判断这本书"还没读过"(可安全自动 pull) 还是"已有进度"
+    (不该被自动改)。
+    """
+    db = _open()
+    out: dict[int, int] = {}
+    for r in db.execute(
+            "SELECT SeriesId, COALESCE(PagesRead,0) P FROM AppUserProgresses "
+            "WHERE AppUserId = ?", (user_id,)):
+        out[int(r["SeriesId"])] = out.get(int(r["SeriesId"]), 0) + int(r["P"] or 0)
+    db.close()
+    return out
+
+
 def list_chapters(series_id: int) -> list[dict]:
     """列一本书的全部章节, 通过 Volume 关联 Series."""
     db = _open()

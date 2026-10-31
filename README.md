@@ -121,7 +121,46 @@ CORS、以及掌阅风控 —— 浏览器从头到尾只跟本机说话。
 | GET | `/api/keyword_mark` | 关键词高亮配置 (目录 / 绑定 / 语料清单 / 每类样式 / 系列列表) |
 | GET | `/api/keyword_mark/payload?series=N` | 试算: 这本书实际会下发多少词 (跟前端拿的是同一份) |
 | POST | `/api/keyword_mark` | `{op: save\|reset\|toggle\|bind\|unbind}` 改配置 |
+| GET | `/api/cloud/books` | 掌阅个人云书架（`is_local_book=true`，无 DRM）+ 本地匹配状态 |
+| GET | `/api/cloud/local` | 已下载清单（索引 + 目录里未登记的文件、是否切片版、页数） |
+| POST | `/api/cloud/download` | `{key, overwrite?, target?}` 下载；落在 Kavita 库目录里会自动收尾 |
+| POST | `/api/cloud/finalize` | `{keys?, paths?, pull?}` 对**已下载**的书重跑收尾（幂等，不重新下载） |
+| POST | `/api/cloud/job` | 查下载/收尾任务进度（含每一步 `steps`） |
+| POST | `/api/cloud/move` `/api/cloud/local_delete` `/api/cloud/delete` | 搬移 / 删本地 / 删云端条目 |
 | GET | `/healthz` | 存活探针 |
+
+### 掌阅云书下载 = 一站式收尾 (2026-10-31)
+
+从 5012 下载个人云书，落点若在 Kavita 库目录，**下载完成那一刻就已经可用**：
+
+```
+下载字节 → 原书归档 bridge/books  → 切片版换进库 → sidecar(页↔原书字节)
+        → 扫库并等 Chapter.Pages 对上 → book_link 建档 → pull(掌阅进度落到页号)
+```
+
+七步由 `epubprep.ensure_ready()` 串起来，**幂等、可从磁盘现状续做**：
+
+- 已经是切片版 + sidecar 在 → 不重建，只补后面缺的步骤
+- 切片版但 sidecar 丢了 → 用**原书确定性重建**一次（页映射随之恢复）
+- 库里是原件 → 归档 + 切片 + 换库（旧文件留 `state/backup/`）
+- 多卷 / 图片型 epub → 不切片，但**必须建档**（卷级映射），否则永远推不动
+- 缺原书又缺 sidecar → 明确报错，不瞎猜几何
+
+**pull 策略 `auto`**：只在 Kavita 这本书**还没有任何进度**时才自动 pull（新书就是这种情况）。
+已有进度的书不动 —— 避免把读者读了一半的位置按云端旧值往回拨，需要时手动点「从掌阅拉」。
+
+**「补齐收尾」按钮 / `POST /api/cloud/finalize`**：不重新下载，只把缺的步骤补上。
+行内「补齐」针对单本；卡片顶部针对索引里全部；`data-path` 也支持下载目录里未登记的文件。
+返回的 `steps[]` 会直接展示哪一步没成（例如「pages: Kavita 100 页 / 期望 204」）。
+
+> 历史教训（2026-10-31 万古江河）：`prep_download` 是"从原始文件出发的一次性准备"，
+> 扫库那步抛异常（API key 路径被脱敏成 `/home/youruser`）就留下"库里已是切片版、但没有
+> sidecar / 没核对页数"的中间态，而它下次看到 `is_edition` 直接 return `"edition"` ——
+> 中间态永远补不回来。所以下载、覆盖下载、事后修复现在都走同一个入口 `ensure_ready`。
+
+**本地字节数 ≠ 云端是预期的**：字节数不同只说明本地那份是切片版（为了跟掌阅对齐进度
+而重排），不是错误。5012 面板不再对大小差异弹警告，只在卡片顶部说明一句；列表里改用
+「已切片 N 页 / 原书」pill 表达状态，原文在 `bridge/books/` 里（算进度用的永远是它）。
 
 单例锁: 同时只允许一个 CLI (push 要写 `kavita.db`, 并发会打架), 冲突返 409。
 

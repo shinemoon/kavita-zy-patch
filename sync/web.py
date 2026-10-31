@@ -900,6 +900,14 @@ class Handler(BaseHTTPRequestHandler):
                 elif act == "job":
                     j = cb.job_status(str(body.get("id") or ""))
                     self._json(200 if j else 404, j or {"error": "job 不存在"})
+                elif act == "finalize":
+                    # 对已下载的书重跑收尾 (归档/切片/sidecar/扫库/建档/pull)
+                    keys = body.get("keys") or ([key] if key else None)
+                    paths = body.get("paths") or ([body.get("path")]
+                                                  if body.get("path") else None)
+                    jid = cb.start_finalize(keys, pull=body.get("pull") or "auto",
+                                            paths=paths)
+                    self._json(200, {"ok": True, "job": cb.job_status(jid)})
                 elif act == "move":
                     rec = cb.move_local(key, body.get("dest") or "",
                                         new_name=body.get("name") or None)
@@ -1017,6 +1025,7 @@ td:last-child{text-align:right;white-space:nowrap;color:var(--dim)}
 .pill{display:inline-block;font-size:12px;padding:1px 8px;border-radius:10px;
   border:1px solid var(--line);color:var(--dim)}
 .pill.ok{color:var(--ok);border-color:#3c4a35}.pill.err{color:var(--err);border-color:#4a3330}
+.pill.warn{color:var(--warn);border-color:#4a4230}
 details.sec{background:#1b1e24;border:1px solid var(--line);border-radius:10px;
   margin-bottom:12px;overflow:hidden}
 details.sec>summary{list-style:none;cursor:pointer;padding:12px 14px;font-size:14px;
@@ -1060,10 +1069,17 @@ details.sec>summary:hover{background:#20242b}
       <input id="cl-dest" placeholder="/vol2/1001/dav/Books/掌阅" style="flex:1;min-width:200px">
       <button id="b-cl-dir-save">保存目录</button>
       <button id="b-cl-refresh">刷新列表</button>
+      <button id="b-cl-finalize" title="对已下载的书重跑归档/切片/扫库/建档/pull（不重新下载）">补齐收尾</button>
     </div>
     <div class="meta" id="cl-dir-hint" style="margin-bottom:8px">下载与搬移都只落在这个目录（可新建子目录）。</div>
+    <div class="meta" id="cl-note" style="margin-bottom:8px;line-height:1.7">
+      说明：落在 Kavita 库目录里的书会自动做<b>重排版（等字节切片）</b>并建档、扫库、对进度 ——
+      下载完就已经可用，不需要再手工做什么。切片版的字节数本来就和云端那份<b>不同</b>
+      （云端是原件，本地是为了跟掌阅对齐进度而重排的版本），这是<b>预期行为，不是错误</b>；
+      原书另存在 bridge/books，算进度用的永远是它。
+    </div>
     <div id="cl-list">加载中…</div>
-    <div class="meta" id="cl-jobs" style="margin-top:8px"></div>
+    <div class="meta" id="cl-jobs" style="margin-top:8px;white-space:pre-wrap;line-height:1.6"></div>
   </div>
 </details>
 
@@ -1788,13 +1804,19 @@ function bookRow(b){
   const localSize = lo ? (lo.actual_size ?? lo.size ?? 0) : 0;
   let st;
   if(lo){
-    const diff = cloudSize && localSize &&
-      Math.abs(localSize - cloudSize) > Math.max(8192, cloudSize * 0.05);
-    st = '<span class="pill ok">已下载</span>'+
+    // 本地那份是重排版（切片）版本时字节数本来就跟云端不同 —— 不提示差异,
+    // 只标出"已切片 N 页 / 原书", 由卡片顶部那段说明负责解释。
+    const edPin = lo.is_edition
+      ? '<span class="pill ok">已切片'+(lo.pages?(' '+lo.pages+' 页'):'')+'</span>'
+      : '<span class="pill warn">原书</span>';
+    const notReady = lo.ready && ['ok','skipped','edition'].indexOf(lo.ready) < 0;
+    st = '<span class="pill ok">已下载</span> '+edPin+
+      (notReady ? ' <span class="pill warn" title="点「补齐」从磁盘现状续做">收尾未完成</span>' : '')+
       '<div class="meta" style="font-size:11px;line-height:1.5">'+esc(lo.name||'')+
-      '<br>'+fmtBytes(localSize)+
-      (diff ? ' <span style="color:var(--warn)">≠ 云端 '+fmtBytes(cloudSize)+'（本地已改，可能是重排版版）</span>' : '')+
-      '<br>'+esc(lo.path||'')+'</div>';
+      '<br>'+fmtBytes(localSize)+' · 云端 '+fmtBytes(cloudSize)+
+      '<br>'+esc(lo.path||'')+
+      (lo.why ? ('<br>'+esc(String(lo.why)).slice(0,120)) : '')+
+      '</div>';
   }else{
     st = '<span class="meta">未下载</span>';
   }
@@ -1802,6 +1824,9 @@ function bookRow(b){
   const dlBtn = lo
     ? '<button data-dl="'+esc(b.key)+'" data-ow="1" style="padding:2px 8px;font-size:12px">覆盖下载</button> '
     : '<button data-dl="'+esc(b.key)+'" style="padding:2px 8px;font-size:12px">下载</button> ';
+  const finBtn = lo
+    ? '<button data-fin="'+esc(b.key)+'" data-path="'+esc(lo.path||'')+'" style="padding:2px 8px;font-size:12px" title="重跑归档/切片/扫库/建档/pull（不重新下载）">补齐</button> '
+    : '';
   return '<tr><td>'+esc(b.name)+
     '<div class="meta" style="font-size:11px">'+esc(String(b.id).slice(0,20))+'…'+
     (b.file_id?' · file '+esc(String(b.file_id).slice(0,12))+'…':'')+'</div></td>'+
@@ -1809,7 +1834,7 @@ function bookRow(b){
     '<td>'+sizeTxt+'</td>'+
     '<td>'+esc(b.ctime||'')+'</td>'+
     '<td>'+st+'</td>'+
-    '<td>'+dlBtn+
+    '<td>'+dlBtn+finBtn+
     '<button data-del="'+esc(b.key)+'" style="padding:2px 8px;font-size:12px">删云端</button></td></tr>';
 }
 
@@ -1852,9 +1877,15 @@ async function loadCloudLocal(){
     host.innerHTML = '<table><thead><tr><th>文件</th><th>大小</th><th>操作</th></tr></thead><tbody>'+
       fs.map(f=>'<tr><td>'+esc(f.name||f.path)+
         '<div class="meta" style="font-size:11px">'+esc(f.source||'')+' · '+esc(f.path)+
+        (f.is_edition?(f.pages?(' · <span class="pill ok">已切片 '+f.pages+' 页</span>')
+                                :' · <span class="pill ok">已切片</span>')
+                     :' · <span class="pill warn">原书</span>')+
         (f.exists?'':' <span style="color:var(--err)">文件缺失</span>')+'</div></td>'+
         '<td>'+fmtBytes(f.actual_size ?? f.size)+'</td>'+
-        '<td>'+(f.unmanaged
+        '<td>'+((f.exists || f.unmanaged)
+          ? '<button data-fin="'+esc(f.key)+'" data-path="'+esc(f.path)+'" style="padding:2px 8px;font-size:12px">补齐</button> '
+          : '')+
+        (f.unmanaged
           ? '<span class="meta">未登记 · </span><button data-lfile="'+esc(f.key)+'" style="padding:2px 8px;font-size:12px">删文件</button>'
           : '<button data-mv="'+esc(f.key)+'" style="padding:2px 8px;font-size:12px">搬移</button> '+
             '<button data-lrm="'+esc(f.key)+'" style="padding:2px 8px;font-size:12px">移出清单</button> '+
@@ -1864,15 +1895,46 @@ async function loadCloudLocal(){
   }catch(e){ host.innerHTML = '<div class="meta">读取失败: '+esc(e.message)+'</div>'; }
 }
 
+function stepsText(steps){
+  // 只列没成的步骤 —— 成的步骤 UI 上不需要占用注意力
+  const bad = (steps||[]).filter(s=>!s.ok);
+  if(!bad.length) return '';
+  return ' · 缺: ' + bad.map(s=>s.name+'('+(s.detail||'')+')').join('; ');
+}
+
+function finalizeText(j){
+  const st = j.state;
+  const head = '补齐收尾 '+(j.id||'')+' · '+st+
+    (j.total ? (' · '+((st==='preparing')?(((j.idx||0)+1)+'/'+j.total):(j.total+' 本'))) : '');
+  const lines = [head];
+  if(j.note && st==='preparing') lines.push('  · '+j.note);
+  if(j.error) lines.push('  ! '+j.error);
+  (j.results||[]).forEach(r=>{
+    let ln = '  · '+(r.name||r.path||r.key)+' → '+(r.state||'?')+
+      (r.pages?(' · '+r.pages+' 页'):'')+
+      (r.series_id?(' · 系列 '+r.series_id):'');
+    if(r.why) ln += ' · '+String(r.why).slice(0,160);
+    ln += stepsText(r.steps);
+    if(r.pull && r.pull.updated!=null) ln += ' · pull 写入 '+r.pull.updated;
+    lines.push(ln);
+  });
+  return lines.join('\n');
+}
+
 async function pollJob(id){
-  for(let i=0;i<600;i++){
+  for(let i=0;i<1200;i++){
     await new Promise(r=>setTimeout(r,700));
     let j=null;
     try{ j = await postJson('/api/cloud/job', {id}); }catch(e){ $('cl-jobs').textContent='任务丢失: '+e.message; return; }
     const s = j.state;
+    if(j.kind==='finalize'){
+      $('cl-jobs').textContent = finalizeText(j);
+      if(s==='done'||s==='error'){ await loadCloud(false); await loadCloudLocal(); return; }
+      continue;
+    }
     $('cl-jobs').textContent = '任务 '+id+' · '+s+' · '+fmtBytes(j.bytes)+(j.total?(' / '+fmtBytes(j.total)):'')+
       (j.error?(' · '+j.error):'');
-    if(s==='preparing'){ $('cl-jobs').textContent += ' · 重排中: '+(j.note||''); }
+    if(s==='preparing'){ $('cl-jobs').textContent += ' · 收尾中: '+(j.note||''); }
     if(s==='done'||s==='error'){
       if(s==='done'){
         $('cl-jobs').textContent += ' · 落盘 '+j.path;
@@ -1880,9 +1942,12 @@ async function pollJob(id){
         if(pp.state==='ok'){ $('cl-jobs').textContent += ' · 已重排 '+pp.pages+' 页'+
           (pp.series_id?(' (Kavita 系列 '+pp.series_id+')'):''); }
         else if(pp.state==='edition'){ $('cl-jobs').textContent += ' · 已是切片版'; }
+        else if(pp.state==='partial'){ $('cl-jobs').textContent += ' · 部分完成'; }
         else if(pp.state==='skipped'||pp.state==='no_series'){
           $('cl-jobs').textContent += ' · 未重排: '+(pp.why||pp.state); }
-        else if(pp.state==='error'){ $('cl-jobs').textContent += ' · 重排失败: '+pp.error; }
+        else if(pp.state==='error'){ $('cl-jobs').textContent += ' · 收尾失败: '+pp.error; }
+        $('cl-jobs').textContent += stepsText(pp.steps);
+        if(pp.warn) $('cl-jobs').textContent += ' · 注意: '+pp.warn;
       }
       await loadCloud(false); await loadCloudLocal();
       return;
@@ -1899,13 +1964,9 @@ document.addEventListener('click', async ev=>{
     const lo = b.local;
     const ow = t.dataset.ow === '1' && lo;
     if(ow){
-      const cloudSize = b.size || 0, localSize = lo.actual_size ?? lo.size ?? 0;
-      const diff = cloudSize && localSize &&
-      Math.abs(localSize - cloudSize) > Math.max(8192, cloudSize * 0.05);
       if(!confirm('覆盖本地文件?\n\n'+lo.path+
-        (diff ? '\n\n注意: 本地文件 '+fmtBytes(localSize)+' 与云端 '+fmtBytes(cloudSize)+
-                ' 大小不同，本地可能是重排版/Kavita 适配版，覆盖后进度映射会失效。' : '')+
-        '\n\n云端那份不会动。')) return;
+        '\n\n会用云端原件重新生成切片版，并重建页映射、重新扫库、重新建档（原书归档一起更新）。'+
+        '\n云端那份不会动。')) return;
     }
     const label = t.textContent;
     t.disabled = true; t.textContent='…';
@@ -1915,6 +1976,16 @@ document.addEventListener('click', async ev=>{
       pollJob(j.job.id);
     }catch(e){ $('cl-jobs').textContent = '下载启动失败: '+e.message; }
     t.disabled = false; t.textContent = label;
+  }
+  if(t.dataset.fin){
+    const key = t.dataset.fin, path = t.dataset.path || '';
+    t.disabled = true;
+    try{
+      const payload = key.startsWith('file:') ? {paths:[path]} : {keys:[key]};
+      const j = await postJson('/api/cloud/finalize', payload);
+      pollJob(j.job.id);
+    }catch(e){ $('cl-jobs').textContent = '补齐启动失败: '+e.message; }
+    t.disabled = false;
   }
   if(t.dataset.del){
     const key = t.dataset.del;
@@ -1965,6 +2036,14 @@ document.addEventListener('click', async ev=>{
   }
 });
 $('b-cl-refresh').onclick = ()=>loadCloud(true);
+$('b-cl-finalize').onclick = async ()=>{
+  const b = $('b-cl-finalize'); b.disabled = true;
+  try{
+    const j = await postJson('/api/cloud/finalize', {});
+    pollJob(j.job.id);
+  }catch(e){ $('cl-jobs').textContent = '补齐启动失败: '+e.message; }
+  b.disabled = false;
+};
 $('cl-dest').oninput = ()=>{ $('cl-dest').dataset.touched = '1'; };
 $('b-cl-dir-save').onclick = async ()=>{
   const p = ($('cl-dest').value||'').trim();

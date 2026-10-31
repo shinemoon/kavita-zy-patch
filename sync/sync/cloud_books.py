@@ -239,8 +239,18 @@ def _match_local(book: dict, files: list[Path]) -> dict | None:
                 size = None
             return {"path": str(p), "name": p.name, "size": size,
                     "bookid": book.get("id"), "source": "shelf",
+                    "is_edition": _is_edition(p),
                     "unmanaged": True}
     return None
+
+
+def _is_edition(path) -> bool:
+    """是不是我们生成的切片版 (只读 zip 目录, 很快)。"""
+    try:
+        from . import kpages                                     # noqa: PLC0415
+        return bool(kpages.is_edition(path))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def list_books(*, refresh: bool = True) -> dict:
@@ -553,12 +563,15 @@ def _download_worker(jid: str, key: str, dest: Path, name: str | None,
         _share_file(target)
 
         # 落盘即入库: 库目录里的书直接做成 Kavita 切片版 (原书另存)
+        # ensure_ready 是幂等的一站式收尾: 原书归档 → 切片版 → sidecar →
+        # 扫库等页数 → 映射 → pull。任何一步失败都记在 steps 里, 可以事后
+        # 用「补齐收尾」从磁盘现状续做 (不需要重新下载)。
         prep: dict = {"state": "off"}
         if do_prep:
             upd(state="preparing")
             try:
                 from . import epubprep                                  # noqa: PLC0415
-                prep = epubprep.prep_download(
+                prep = epubprep.ensure_ready(
                     target, book_name=info.get("name") or "",
                     zy_book_id=str(info.get("id") or key).split(":")[-1],
                     log=lambda m: upd(note=str(m)[:300]))
@@ -587,6 +600,8 @@ def _download_worker(jid: str, key: str, dest: Path, name: str | None,
                "name": target.name, "author": info.get("author"),
                "nav_fix": nav, "edition": prep.get("state"),
                "pages": prep.get("pages"), "series_id": prep.get("series_id"),
+               "steps": prep.get("steps") or [], "ready": prep.get("state"),
+               "why": prep.get("why") or prep.get("warn") or prep.get("error"),
                "downloaded_at": datetime.now().isoformat(timespec="seconds")}
         _record(key, rec)
         upd(state="done", path=str(target), bytes=got, nav=nav, prep=prep,
@@ -606,6 +621,96 @@ def jobs_list(limit: int = 20) -> list[dict]:
     with _jobs_lock:
         items = sorted(_jobs.values(), key=lambda x: x["started"], reverse=True)
         return [dict(x) for x in items[:limit]]
+
+
+# ---- 补齐收尾 (不重新下载) ----------------------------------------------
+
+def start_finalize(keys: list[str] | None = None, *, pull: str | bool = "auto",
+                   paths: list[str] | None = None) -> str:
+    """对**已下载**的书重跑入库收尾 (幂等, 不重新下载)。
+
+    keys=None 且 paths 为空 → 索引里所有还在磁盘上的书。
+    paths 用于"下载目录里未登记的文件"(file:... 那条) —— 只按路径补齐。
+    典型用途: 上一次下载半路失败 (扫库 404 / 页数没对上 / 没建档), 现在补齐。
+    """
+    idx = _read_index()
+    items: list[tuple[str, dict]] = []
+    if keys is None and not paths:
+        keys = list(idx.keys())
+    for k in keys or []:
+        rec = dict(idx.get(k) or {})
+        if rec.get("path"):
+            items.append((k, rec))
+    seen_paths = {r.get("path") for _, r in items}
+    for p in paths or []:
+        p = str(p)
+        if p in seen_paths:
+            continue
+        items.append((f"file:{p}", {"path": p, "name": Path(p).name}))
+        seen_paths.add(p)
+    jid = uuid.uuid4().hex[:12]
+    with _jobs_lock:
+        _jobs[jid] = {"id": jid, "kind": "finalize", "state": "queued",
+                      "keys": [k for k, _ in items], "total": len(items),
+                      "idx": 0, "bytes": 0, "results": [], "error": None,
+                      "note": None,
+                      "started": datetime.now().isoformat(timespec="seconds"),
+                      "finished": None}
+    threading.Thread(target=_finalize_worker, args=(jid, items, pull),
+                     daemon=True).start()
+    return jid
+
+
+def _finalize_worker(jid: str, items: list[tuple[str, dict]], pull: str | bool) -> None:
+    job = _jobs[jid]
+
+    def upd(**kw):
+        with _jobs_lock:
+            job.update(kw)
+
+    try:
+        from . import epubprep                                  # noqa: PLC0415
+    except Exception as e:                                      # noqa: BLE001
+        upd(state="error", error=f"{type(e).__name__}: {e}",
+            finished=datetime.now().isoformat(timespec="seconds"))
+        return
+
+    results: list[dict] = []
+    for i, (key, rec) in enumerate(items):
+        path = rec.get("path") or ""
+        upd(state="preparing", idx=i,
+            note=f"{i + 1}/{len(items)} {rec.get('name') or key}")
+        if not path or not Path(path).exists():
+            results.append({"key": key, "state": "missing", "path": path})
+            upd(results=list(results))
+            continue
+        try:
+            r = epubprep.ensure_ready(
+                path, book_name=rec.get("name") or "",
+                zy_book_id=str(rec.get("bookid") or key.split(":")[-1]),
+                pull=pull, log=lambda m: upd(note=str(m)[:300]))
+        except Exception as e:                                  # noqa: BLE001
+            r = {"state": "error", "error": f"{type(e).__name__}: {e}"}
+
+        item = {"key": key, "state": r.get("state"), "path": path,
+                "pages": r.get("pages"), "series_id": r.get("series_id"),
+                "steps": r.get("steps") or [],
+                "why": r.get("why") or r.get("warn") or r.get("error") or ""}
+        results.append(item)
+        upd(results=list(results))
+
+        if r.get("state") in ("ok", "partial", "skipped", "edition"):
+            rec2 = dict(rec)
+            rec2.update({"ready": r.get("state"),
+                         "series_id": r.get("series_id") or rec.get("series_id"),
+                         "pages": r.get("pages") or rec.get("pages"),
+                         "edition": ("edition" if r.get("state") in ("ok", "partial")
+                                     else rec.get("edition")),
+                         "steps": r.get("steps") or [],
+                         "why": item["why"] or None})
+            _record(key, rec2)
+    upd(state="done", results=results,
+        finished=datetime.now().isoformat(timespec="seconds"))
 
 
 # ---- 搬移 / 删除 ---------------------------------------------------------
@@ -725,6 +830,8 @@ def local_files() -> list[dict]:
         rec["key"] = key
         rec["exists"] = p.exists()
         rec["actual_size"] = p.stat().st_size if p.exists() else None
+        # is_edition = 磁盘事实 (rec["edition"] 是上次 prep 的状态串, 可能就是 "error")
+        rec["is_edition"] = _is_edition(p) if rec["exists"] else False
         out.append(rec)
         try:
             seen.add(str(p.resolve()))
@@ -739,5 +846,6 @@ def local_files() -> list[dict]:
             continue
         out.append({"key": f"file:{rp}", "path": rp, "name": p.name,
                     "source": "本地目录", "unmanaged": True, "exists": True,
+                    "is_edition": _is_edition(p),
                     "actual_size": p.stat().st_size})
     return sorted(out, key=lambda r: r.get("downloaded_at") or "", reverse=True)
