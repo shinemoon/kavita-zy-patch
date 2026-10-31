@@ -566,9 +566,18 @@ def _download_worker(jid: str, key: str, dest: Path, name: str | None,
                 prep = {"state": "error", "error": f"{type(e).__name__}: {e}"}
 
         # 没做成切片版 (不在库目录 / 多卷 / 出错) 才需要补 EPUB3 nav
+        #
+        # 判据要看**磁盘上的文件**, 不看 prep 的返回值: 2026-10-31 万古江河
+        # 那次 prep 已经在库里换成切片版, 只是后面扫库那步抛异常 (API key 路径
+        # 被脱敏成 /home/youruser) → state=error → 走了 nav 修补, 把刚生成的
+        # 切片版整本 lxml 重新序列化一遍 (页内容全变), 白折腾还掩盖了真错误。
         nav = ""
-        made_edition = prep.get("state") in ("ok", "edition")
-        if made_edition:
+        try:
+            from . import kpages as _kp                            # noqa: PLC0415
+            is_edition = _kp.is_edition(target)
+        except Exception:                                          # noqa: BLE001
+            is_edition = prep.get("state") in ("ok", "edition")
+        if is_edition:
             nav = "edition"
         else:
             nav = _post_download_nav_fix(target)
