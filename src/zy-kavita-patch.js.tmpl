@@ -841,6 +841,67 @@
     }).catch(function () { /* 后端不可用 → 不显示, 静默 */ });
   }
 
+  // ---- 图片/漫画阅读器: 把"书签图标"钉回图片内 (v0.4.15) -------------
+  // Kavita 给图片阅读器里每一页 <img> 挂一个 div.bookmark-overlay
+  // (空心=本页未加书签, 实心=已加)。位置是注入那一刻算死的:
+  //     left = imgW + (imgLeft-parentLeft) - min(32, imgW*0.05)
+  //     top  = imgH + (imgTop -parentTop ) - min(32, imgH*0.05)
+  // 两个坑:
+  //   1. 这个 div 实际高 42px (32px 字号 + 上下 5px 内边距), 却按 32px 定位
+  //      → 底边探出图片 10px (小图 20px+)。单页模式下悬在页外的黑底上,
+  //      连续滚动/条漫模式下正好压在下一张图顶部 —— 就是"书签图标浮在
+  //      页面当中"的样子。
+  //   2. 只在注入时算一次, 之后换 fit / 浏览器缩放 / 窗口 resize 都不重算,
+  //      图标会从页角飘到页面中间。
+  // 不改 Kavita: 用 right/bottom 把它钉回自己那张图的右下角内侧 (不依赖
+  // 图片尺寸), 并在 DOM 变动 / resize 后重算。
+  var BM = { fixed: 0, removed: 0, last: 0, skip: 0 };
+
+  function bmHost(ov) {
+    var h = ov.parentElement;
+    if (h && h.tagName === 'IMG') h = h.parentElement;   // 防呆: img 不能当容器
+    return h;
+  }
+
+  // 返回本轮新摆正/清理的数量
+  function bmFix() {
+    var list = document.querySelectorAll('.bookmark-overlay');
+    var n = 0;
+    for (var i = 0; i < list.length; i++) {
+      var ov = list[i];
+      var host = bmHost(ov);
+      if (!host) { continue; }
+      var img = host.querySelector('img');
+      if (!img) {                                   // 图没了, 图标成了孤儿
+        if (ov.parentNode) { ov.parentNode.removeChild(ov); BM.removed++; n++; }
+        continue;
+      }
+      if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+      var hr = host.getBoundingClientRect();
+      var ir = img.getBoundingClientRect();
+      // 图片相对容器右下角的偏移 (双页模式下两张图共用容器时也各自贴自己的角)
+      var right = Math.round(hr.right - ir.right) + 4;
+      var bottom = Math.round(hr.bottom - ir.bottom) + 4;
+      var st = ov.style;
+      var want = ['absolute', 'auto', 'auto', right + 'px', bottom + 'px'].join('|');
+      if (ov.getAttribute('data-zy-bm') === want) continue;   // 已经摆好, 不重复写
+      st.position = 'absolute';
+      st.left = 'auto';
+      st.top = 'auto';
+      st.right = right + 'px';
+      st.bottom = bottom + 'px';
+      st.margin = '0';
+      ov.setAttribute('data-zy-bm', want);
+      BM.fixed++; BM.last = i; n++;
+    }
+    return n;
+  }
+
+  function bmFixSoon() {
+    clearTimeout(bmFixSoon._t);
+    bmFixSoon._t = setTimeout(function () { try { bmFix(); } catch (e) {} }, 120);
+  }
+
   function routeTick() {
     var p = location.pathname;
     var rm = READER_RE.exec(p);
@@ -871,6 +932,8 @@
       if (sn) pullSeries(sn, false);          // 详情页: 只刷进度, 不重载
       heartbeat(true);
     }
+    // 图片阅读器的书签图标归位 (廉价: 没有 .bookmark-overlay 直接返回)
+    if (rn) bmFixSoon();
   }
 
   // Kavita 保存阅读进度 = 一次 POST api/reader/progress。抓到它就排一次 push。
@@ -918,8 +981,7 @@
     }
 
     var OPS = history.pushState;
-    var ORS = history.replaceState;
-    history.pushState = function () {
+    var ORS = history.replaceState;    history.pushState = function () {
       var r = OPS.apply(this, arguments);
       setTimeout(routeTick, 60);
       return r;
@@ -988,6 +1050,8 @@
   var mo = new MutationObserver(function () {
     clearTimeout(tick._t);
     tick._t = setTimeout(tick, 250);
+    // 换页/换章会重新注入 .bookmark-overlay; 只有见过才付查询成本
+    if (BM.fixed) bmFixSoon();
   });
 
   function boot() {
@@ -1003,6 +1067,13 @@
           }).catch(function () {});
         }).then(tick).catch(tick);
         setInterval(tick, 15000);
+        // 缩图/换 fit/横竖屏都会让 Kavita 里那张"算死的"书签图标脱离页角
+        window.addEventListener('resize', bmFixSoon);
+        window.addEventListener('orientationchange', bmFixSoon);
+        if (window.visualViewport) {
+          window.visualViewport.addEventListener('resize', bmFixSoon);
+          window.visualViewport.addEventListener('scroll', bmFixSoon);
+        }
         setInterval(function () { probe().then(tick).catch(tick); }, 30000);
         setInterval(applyReaderCss, 60000);
         setInterval(function () {
@@ -1045,6 +1116,27 @@
                node: !!document.getElementById('zy-reader-css') };
     },
     applyReaderCss: applyReaderCss,
+    bm: function () {
+      var list = document.querySelectorAll('.bookmark-overlay');
+      var rows = [];
+      for (var i = 0; i < list.length; i++) {
+        var ov = list[i], h = bmHost(ov), im = h ? h.querySelector('img') : null;
+        var or = ov.getBoundingClientRect();
+        var ir = im ? im.getBoundingClientRect() : null;
+        rows.push({
+          solid: /fa-solid/.test(ov.className),
+          style: ov.getAttribute('data-zy-bm') || '(kavita 原样)',
+          ov: [or.left, or.top, or.width, or.height].map(Math.round),
+          img: ir ? [ir.left, ir.top, ir.width, ir.height].map(Math.round) : null,
+          dRight: ir ? Math.round(ir.right - or.right) : null,
+          dBottom: ir ? Math.round(ir.bottom - or.bottom) : null,
+          inside: ir ? (or.left >= ir.left - 1 && or.top >= ir.top - 1 &&
+                        or.right <= ir.right + 1 && or.bottom <= ir.bottom + 1) : null
+        });
+      }
+      return { fixed: BM.fixed, removed: BM.removed, count: rows.length, rows: rows };
+    },
+    bmFix: function () { return bmFix(); },
     kw: function () {
       return { ver: KM.ver, sid: KM.sid, mode: KM.mode, on: !!(KM.data && KM.data.enabled),
                cats: KM.cats, words: KM.words, ranges: KM.ranges, spans: KM.spans,
