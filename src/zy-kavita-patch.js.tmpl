@@ -451,6 +451,15 @@
     'pointer-events:none;user-select:none;white-space:nowrap;',
     'font-variant-numeric:tabular-nums;}',
     '@media (max-width:600px){#zy-push-stamp{font-size:.62rem;right:.4rem;bottom:.15rem;}}',
+    // ---- 书签图标 (v0.4.16) -------------------------------------------
+    // Kavita 在漫画阅读器里给每张 <img> 追加一个 div.bookmark-overlay,
+    // 位置是"注入那一刻"按 left/top 算死的, 而且底边比图片低 10px;
+    // 我们的 JS 归位要等 120ms + 一次 MutationObserver 抖动 →
+    // 实际观感是"图标先在页面外露出来, 再跳回页角"。
+    // 纯 CSS 覆盖: 元素一插入就由浏览器算位置, 没有中间态。
+    '.bookmark-overlay{position:absolute !important;left:auto !important;top:auto !important;',
+    'right:4px !important;bottom:4px !important;margin:0 !important;}',
+    '.kavita-scale-width-container{position:relative;}',
   ].join('');
 
   function injectCss() {
