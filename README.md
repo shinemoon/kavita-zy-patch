@@ -240,6 +240,36 @@ location /zy/ {
 **安全提醒**: `ZY_WEB_TOKEN` 默认为空 = 任何能访问到该端口的人都能触发 push/pull
 (会改掌阅云端进度)。公网暴露前务必设 token, 之后请求要带 `X-ZY-Token` 头。
 
+### 登录保护（2026-10-31）
+
+5012 现在**先要登录**才能用（用户要求: 和 Kavita `:5000` 用同一套凭据）。
+
+* 用户名 / 密码 = 你登 Kavita 的那套。做法是把输入直接打给
+  `POST /api/Account/login`，200 才发会话 cookie —— 改 Kavita 密码自动跟着变，
+  本仓不存任何明文口令。
+* 会话 cookie `zy_webauth`，HMAC-SHA256 签名，默认 7 天。cookie 只看 host
+  （不看端口），且 5012/5013 共用同一份密钥（`/vol2/1001/webauth/webauth.json`），
+  所以**登录一次，两个控制台都进得去**。
+* Kavita 先通过一次验证后会缓存一份 pbkdf2 校验串。Kavita 挂了/在重建时，
+  用同一把密码仍能登录（否则正好在最需要修 Kavita 的时候被锁在门外）。
+  Kavita 在线但密码错，**不会**走缓存兜底。
+* 失败限流: 同一 IP 5 分钟 8 次，超了 429 并给倒计时。
+* 退出: 页面右上「退出」，或 `GET /logout`。
+* 放行的例外: `/login`、`/logout`、`/healthz`（heal/自检用）、`/zy/api/*`
+  （来自 Kavita 页面的跨源调用，浏览器不会带本域 cookie，那边由 `X-ZY-Token` 守）。
+* 开关: `ZY_WEBAUTH_DISABLE=1` 关掉（仅排障）、`ZY_WEBAUTH_DIR` 换状态目录、
+  `ZY_WEBAUTH_TTL` 改有效期、`ZY_WEBAUTH_KAVITA` 换校验用的 Kavita 地址。
+
+```sh
+# 自测
+python3 tests/test_webauth.py             # 17 项单元
+node ../kavita-zy-patch/src/probe-login-gate.mjs   # 真浏览器验门
+```
+
+> 注意: 之前写的一些探针脚本 (`src/probe-*.mjs`) 直接打 5012 的 `/api/*`，
+> 现在会 401。需要用 5012 的 cookie 或改走 `/zy/api/*`。
+
+
 ### 已修的 bug
 
 `sync.log` 里刷了一整天的:

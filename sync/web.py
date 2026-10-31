@@ -46,6 +46,10 @@ sys.path.insert(0, str(SYNC_DIR))
 HOST = os.environ.get("ZY_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ZY_WEB_PORT", "5012"))
 TOKEN = os.environ.get("ZY_WEB_TOKEN", "")
+
+# 登录保护: 复用 Kavita (:5000) 的账号密码 (用户 2026-10-31 拍板)
+#   与 5013 共用 /vol2/1001/webauth 的签名密钥 -> 一处登录, 两个控制台都进得去
+import webauth  # noqa: E402 — 必须在 sys.path 设好之后
 CLI_TIMEOUT = int(os.environ.get("ZY_CLI_TIMEOUT", "180"))
 
 # 同一时刻只允许一个 CLI 跑 (push 会写 kavita.db, 并发会打架)
@@ -738,11 +742,83 @@ class Handler(BaseHTTPRequestHandler):
         got = self.headers.get("X-ZY-Token", "")
         return got == TOKEN
 
-    def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8"):
+    def _user(self) -> str | None:
+        """已登录用户名; 未登录 None."""
+        return webauth.current_user(self.headers.get("Cookie"))
+
+    def _redirect(self, location: str, cookie: str | None = None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _gate(self) -> bool:
+        """未登录拦截. 返回 True = 放行.
+
+        例外:
+          /login /logout        登录表单本身
+          /healthz              探活 (heal / 5012 自检用)
+          /zy/api/*             补丁后端反代 —— 请求来自 Kavita 页面 (跨源),
+                                浏览器不会带本域 cookie; 那边由 X-ZY-Token 守
+        """
+        if not webauth.enabled():
+            return True
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/login", "/logout", "/healthz") or path.startswith("/zy/api/"):
+            return True
+        if self._user():
+            return True
+        if self.command == "POST" or path.startswith("/api/"):
+            self._json(401, {"error": "unauthorized", "login": "/login"})
+        else:
+            self._redirect("/login?next=" + urllib.parse.quote(path or "/"))
+        return False
+
+    def _login_form(self):
+        """GET/POST /login 共用: 验密码发 cookie."""
+        ip = (self.client_address or ("",))[0]
+        if self.command == "GET":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            nxt = (q.get("next") or ["/"])[0] or "/"
+            err = (q.get("err") or [""])[0]
+            self._send(200, webauth.login_page("掌阅桥接", nxt, err).encode("utf-8"),
+                       "text/html; charset=utf-8")
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        user = (form.get("username") or [""])[0].strip()
+        password = (form.get("password") or [""])[0]
+        nxt = (form.get("next") or ["/"])[0] or "/"
+        if not nxt.startswith("/") or nxt.startswith("//"):
+            nxt = "/"
+        wait = webauth.rate_blocked(ip)
+        if wait:
+            body = webauth.login_page("掌阅桥接", nxt,
+                                      f"失败次数太多, {wait} 秒后再试", user)
+            self._send(429, body.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        ok, msg, via = webauth.verify(user, password)
+        if ok:
+            webauth.rate_clear(ip)
+            print(f"login ok user={user} via={via} from {ip}", flush=True)
+            self._redirect(nxt, webauth.set_cookie(user))
+        else:
+            webauth.rate_fail(ip)
+            print(f"login FAIL user={user} from {ip}: {msg}", flush=True)
+            body = webauth.login_page("掌阅桥接", nxt, msg, user)
+            self._send(401, body.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8",
+              cookie: str | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         # 浏览器页面在 Kavita (:5000), 调本服务 (:5012) 是跨源 → 必须给 CORS 头,
         # 否则 fetch 直接报错 (X-ZY-Token 属自定义头, 还会触发 OPTIONS 预检)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -795,6 +871,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler 契约
         path = urllib.parse.urlparse(self.path).path
         if self._proxy_patch():
+            return
+        if path in ("/login", "/logout"):
+            if path == "/logout":
+                self._redirect("/login", webauth.clear_cookie())
+            else:
+                self._login_form()
+            return
+        if not self._gate():
             return
         if path == "/api/state":
             self._json(200, {**_read_state(), "running": _run_lock.locked(),
@@ -862,6 +946,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
         if self._proxy_patch():
+            return
+        if path == "/login":
+            self._login_form()
+            return
+        if not self._gate():
             return
         if not self._auth_ok():
             self._json(403, {"error": "bad or missing X-ZY-Token"})
@@ -1040,8 +1129,11 @@ details.sec>summary:hover{background:#20242b}
 .divider{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:12px;
   margin:22px 0 10px}
 .divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--line)}
+.logout{float:right;font-size:12px;color:var(--dim);text-decoration:none;
+  border:1px solid var(--line);border-radius:10px;padding:1px 9px}
+.logout:hover{color:var(--fg);border-color:var(--acc)}
 </style></head><body>
-<h1>掌阅桥接</h1>
+<h1>掌阅桥接<a class="logout" href="/logout">退出</a></h1>
 <div class="sub">Kavita ⇄ 掌阅 · 本地 CLI 驱动</div>
 
 <div class="row" style="margin-bottom:10px">
@@ -1242,6 +1334,13 @@ details.sec>summary:hover{background:#20242b}
 
 <script>
 const $ = id => document.getElementById(id);
+// 会话过期/未登录: 任何 401 都回登录页 (各页面 fetch 不用各写一遍)
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...a) => {
+  const r = await _fetch(...a);
+  if (r.status === 401) location.href = '/login?next=' + encodeURIComponent(location.pathname);
+  return r;
+};
 let busy = false;
 function setBusy(b){ busy=b; document.querySelectorAll('button').forEach(x=>x.disabled=b); }
 function esc(s){ return String(s??'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
