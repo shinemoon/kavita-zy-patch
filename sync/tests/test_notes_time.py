@@ -461,5 +461,27 @@ check("positions_payload 自家 key 不补字",
       len(_res_pp.get("booknotes") or []) == 2 and
       _res_pp["booknotes"][1]["summary"].endswith("世界"), _res_pp)
 
+
+# --- 章节名 (ChapterTitle): 切片版 Chapter.Title 是书名, 必须换 epub 目录名 -----------
+_geo = zpct.BookGeometry(spine=["cover.xhtml", "ch1.xhtml", "ch2.xhtml"],
+                         sizes=[100, 500, 400], name="t",
+                         catalog=2, toc={1: "卷一 第一章 起", 2: "卷一 第二章 承"})
+check("_label_at 落在第一篇 -> 目录名", zy_notes._label_at(_geo, 150) == "卷一 第一章 起",
+      zy_notes._label_at(_geo, 150))
+check("_label_at 落在第二篇 -> 目录名", zy_notes._label_at(_geo, 700) == "卷一 第二章 承",
+      zy_notes._label_at(_geo, 700))
+check("_label_at 无目录时退回文件名", zy_notes._label_at(
+    zpct.BookGeometry(spine=["a.xhtml", "b.xhtml"], sizes=[10, 10], name="t",
+                      catalog=1, toc={}), 15) == "b", zy_notes._label_at(
+    zpct.BookGeometry(spine=["a.xhtml", "b.xhtml"], sizes=[10, 10], name="t",
+                      catalog=1, toc={}), 15))
+check("_page_global_offset 原书版按 spine 累积",
+      zy_notes._page_global_offset(_geo, None, 2) == 600,
+      zy_notes._page_global_offset(_geo, None, 2))
+check("_page_global_offset 切片版查 sidecar",
+      zy_notes._page_global_offset(_geo, {"pages": [{"s": 0}, {"s": 120}, {"s": 700}]}, 1) == 120)
+check("_page_global_offset 越界返回 None",
+      zy_notes._page_global_offset(_geo, {"pages": [{"s": 0}]}, 3) is None)
+
 print("\nFAIL =", FAIL)
 sys.exit(1 if FAIL else 0)

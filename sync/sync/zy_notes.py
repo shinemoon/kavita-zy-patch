@@ -659,8 +659,14 @@ def _now_pair() -> tuple[str, str]:
 def kavita_upsert_note(*, series_id: int, chapter_id: int, page: int,
                        xpath: str, end_xpath: str, text: str, context: str,
                        comment: str, created: str | None = None,
-                       ann_id: int | None = None) -> int:
-    """写一条划线 (annotation)。ann_id 给了就 UPDATE, 否则 INSERT。"""
+                       ann_id: int | None = None,
+                       chapter_title: str | None = None) -> int:
+    """写一条划线 (annotation)。ann_id 给了就 UPDATE, 否则 INSERT。
+
+    chapter_title: 展示用章节名。不给就退回 Chapter.Title —— 切片版/单章 epub
+    里 Chapter.Title 就是**书名**, 纸间导出后章节名会变成书名 (2026-11-01 用户报)。
+    传目录名 (卷名 章名) 才是读者看到的东西。
+    """
     local, utc = _now_pair()
     created = created or local
     created_utc = utc if not created else created
@@ -671,6 +677,7 @@ def kavita_upsert_note(*, series_id: int, chapter_id: int, page: int,
                          JOIN Series s ON s.Id=v.SeriesId WHERE c.Id=?""",
                       (chapter_id,)).fetchone()
     vol_id, ser_id, lib_id, ch_title = (vol or (0, series_id, 1, ""))
+    ch_title = (chapter_title or ch_title or "")
     if ann_id:
         cur.execute("""UPDATE AppUserAnnotation SET XPath=?, EndingXPath=?,
                        SelectedText=?, Context=?, CommentPlainText=?, CommentHtml=?,
@@ -722,7 +729,8 @@ def kavita_refresh_note_text(ann_id: int, text: str) -> bool:
 
 
 def kavita_upsert_bookmark(*, series_id: int, chapter_id: int, page: int,
-                           xpath: str, bm_id: int | None = None) -> int:
+                           xpath: str, bm_id: int | None = None,
+                           chapter_title: str | None = None) -> int:
     local, utc = _now_pair()
     d = sqlite3.connect(KAVITA_DB)
     cur = d.cursor()
@@ -730,6 +738,7 @@ def kavita_upsert_bookmark(*, series_id: int, chapter_id: int, page: int,
                          FROM Chapter c JOIN Volume v ON v.Id=c.VolumeId
                          WHERE c.Id=?""", (chapter_id,)).fetchone()
     vol_id, ser_id, ch_title = (vol or (0, series_id, ""))
+    ch_title = (chapter_title or ch_title or "")
     if bm_id:
         cur.execute("""UPDATE AppUserBookmark SET Page=?, XPath=?, ChapterTitle=?,
                        LastModified=?, LastModifiedUtc=? WHERE Id=?""",
@@ -863,13 +872,18 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             page, rel, raw, inner = _locate(geo, epub, sc, g, (n.get("summary") or "").strip())
             xp = _kv_xpath(geo, page, rel, sliced)     # 切片版用相对路径, 原书带文件名 id
             ex = _kv_xpath(geo, page, _end_xpath(geo, epub, sc, n, g, page, rel), sliced)
+            lbl = _label_at(geo, g, page)
             existing = link_get("note", book32, key)
             if existing and int(existing["marktime"] or 0) == int(n.get("marktime") or 0):
-                # 正文口径修过一次 (2026-11-01: 少最后一个字), 已同步过的就补文本
-                if not dry_run and kavita_refresh_note_text(
-                        int(existing["kavita_annotation_id"] or 0),
-                        (n.get("summary") or "").strip()):
-                    report["retitled"] += 1
+                # 已同步过: 只补口径修正 (正文少最后一字 / 章节名是书名), 不重推
+                if not dry_run:
+                    ann0 = int(existing["kavita_annotation_id"] or 0)
+                    text_fixed = kavita_refresh_note_text(ann0, (n.get("summary") or "").strip())
+                    title_fixed = kavita_set_chapter_title("note", ann0, lbl)
+                    if text_fixed or title_fixed:
+                        report["retitled"] += 1
+                    else:
+                        report["skipped"] += 1
                 else:
                     report["skipped"] += 1
                 continue
@@ -881,7 +895,8 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 xpath=xp, end_xpath=ex, text=(n.get("summary") or "").strip(),
                 context=_ctx_of(raw, zpct.DocIndex(raw), inner),
                 comment=(n.get("remark") or "").strip(),
-                ann_id=int(existing["kavita_annotation_id"]) if existing and existing["kavita_annotation_id"] else None)
+                ann_id=int(existing["kavita_annotation_id"]) if existing and existing["kavita_annotation_id"] else None,
+                chapter_title=lbl)
             link_put("note", book32, key, series_id=link.kavita_series_id,
                      chapter_id=chapter_id, annotation_id=ann_id,
                      marktime=int(n.get("marktime") or 0), source="zy")
@@ -898,9 +913,14 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 continue
             page, rel, _raw, _inner = _locate(geo, epub, sc, g, "")
             xp = _kv_xpath(geo, page, rel, sliced)     # 同划线: 切片版相对, 原书带文件名 id
+            lbl = _label_at(geo, g, page)
             existing = link_get("bookmark", book32, key)
             if existing and int(existing["marktime"] or 0) == int(m.get("marktime") or 0):
-                report["skipped"] += 1
+                if not dry_run and kavita_set_chapter_title(
+                        "bookmark", int(existing["kavita_annotation_id"] or 0), lbl):
+                    report["retitled"] += 1
+                else:
+                    report["skipped"] += 1
                 continue
             if dry_run:
                 report["added" if not existing else "updated"] += 1
@@ -908,7 +928,8 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             bm_id = kavita_upsert_bookmark(
                 series_id=link.kavita_series_id, chapter_id=chapter_id, page=page,
                 xpath=xp,
-                bm_id=int(existing["kavita_annotation_id"]) if existing and existing["kavita_annotation_id"] else None)
+                bm_id=int(existing["kavita_annotation_id"]) if existing and existing["kavita_annotation_id"] else None,
+                chapter_title=lbl)
             link_put("bookmark", book32, key, series_id=link.kavita_series_id,
                      chapter_id=chapter_id, annotation_id=bm_id,
                      marktime=int(m.get("marktime") or 0), source="zy")
@@ -1036,6 +1057,123 @@ def _chapter_label(geo: zpct.BookGeometry, ch: int) -> str:
         if 0 <= idx < len(geo.spine):
             return Path(geo.spine[idx]).stem
     return ""
+
+
+def _label_at(geo: zpct.BookGeometry, g: int | None) -> str:
+    """全局字节偏移 -> 展示用章名 (卷名 章名)。取不到返回空串 (调用方就别改)。"""
+    if g is None:
+        return ""
+    try:
+        ch, _f3 = geo.locate(int(g))
+        return _chapter_label(geo, int(ch))
+    except Exception:
+        return ""
+
+
+CHAPTER_TITLE_TABLES = {"note": "AppUserAnnotation", "bookmark": "AppUserBookmark"}
+
+
+def kavita_set_chapter_title(kind: str, row_id: int, title: str) -> bool:
+    """把已有注解/书签的 ChapterTitle 改成真章名。返回是否改动。
+
+    为什么需要: 切片版/单章 epub 的 Chapter.Title 就是**书名**, Kavita 新建注解时
+    写进去的就是它, 纸间导出的「章节」于是变成书名 (2026-11-01 用户报)。
+    真值只能来自 epub 目录 (卷名 章名)。
+    """
+    tbl = CHAPTER_TITLE_TABLES.get(kind)
+    t = (title or "").strip()
+    if not tbl or not row_id or not t:
+        return False
+    d = sqlite3.connect(KAVITA_DB, timeout=15)
+    try:
+        row = d.execute(f"SELECT ChapterTitle FROM {tbl} WHERE Id=?", (row_id,)).fetchone()
+        if row is None or (row[0] or "").strip() == t:
+            return False
+        d.execute(f"UPDATE {tbl} SET ChapterTitle=? WHERE Id=?", (t, row_id))
+        d.commit()
+        return True
+    finally:
+        d.close()
+
+
+def _page_global_offset(geo: zpct.BookGeometry, sc: dict | None, page: int) -> int | None:
+    """Kavita 页号 -> 原书全局字节偏移。切片版查 sidecar, 原书版按 spine 累积。"""
+    if page is None or page < 0:
+        return None
+    if sc:
+        pages = sc.get("pages") or []
+        if page >= len(pages):
+            return None
+        return int(pages[page]["s"])
+    if page < len(geo.sizes):
+        return sum(geo.sizes[:page])
+    return None
+
+
+def repair_chapter_titles(series_ids: list[int] | None = None,
+                          dry_run: bool = False) -> dict:
+    """把所有**有映射**的系列的注解/书签 ChapterTitle 重算成 epub 目录名。
+
+    位置源 = 注解自己的 PageNumber (切片版走 sidecar 页表, 原书版走 spine 下标)。
+    不依赖 zy_note_link, 所以 Kavita 侧自己建的注解也能修。
+    多卷系列按 (series, chapter) 逐卷处理, 只动映射里那一卷。
+    """
+    report: dict[str, Any] = {"series": {}, "notes": 0, "bookmarks": 0,
+                              "skipped": 0, "changed_notes": 0,
+                              "changed_bookmarks": 0}
+    want = set(series_ids or [])
+    links = [l for l in mapping.all_links() if not want or l.kavita_series_id in want]
+    for link in links:
+        sid = link.kavita_series_id
+        try:
+            geo = geometry(link)
+        except Exception as e:               # noqa: BLE001
+            report["series"][sid] = {"skip": f"no_geometry: {e}"}
+            continue
+        if geo is None:
+            report["series"][sid] = {"skip": "no_geometry"}
+            continue
+        sc = kpages.load(sid)
+        ch_filter = int(getattr(link, "kavita_chapter_id", mapping.SERIES_LEVEL)
+                       or mapping.SERIES_LEVEL)
+        changed_n = changed_b = 0
+        for kind, tbl in CHAPTER_TITLE_TABLES.items():
+            page_col = "PageNumber" if kind == "note" else "Page"
+            sql = (f"SELECT Id, ChapterId, {page_col} AS PageNumber, ChapterTitle "
+                   f"FROM {tbl} WHERE SeriesId=?")
+            args: list[Any] = [sid]
+            if ch_filter and ch_filter > 0:      # 卷级映射: 只修自己那一卷
+                sql += " AND ChapterId=?"
+                args.append(ch_filter)
+            c = _kv_read_conn()
+            try:
+                rows = [dict(r) for r in c.execute(sql, args).fetchall()]
+            finally:
+                c.close()
+            for r in rows:
+                g = _page_global_offset(geo, sc, int(r.get("PageNumber") or 0))
+                lbl = _label_at(geo, g)
+                report[kind + "s"] = report.get(kind + "s", 0) + 1
+                if not lbl:
+                    report["skipped"] += 1
+                    continue
+                if (r.get("ChapterTitle") or "").strip() == lbl:
+                    continue
+                if dry_run:
+                    report["skipped"] += 1
+                    continue
+                if kavita_set_chapter_title(kind, int(r["Id"]), lbl):
+                    if kind == "note":
+                        changed_n += 1
+                    else:
+                        changed_b += 1
+        report["changed_notes"] += changed_n
+        report["changed_bookmarks"] += changed_b
+        report["series"][sid] = {"notes_changed": changed_n,
+                                 "bookmarks_changed": changed_b,
+                                 "pages": len(sc["pages"]) if sc else len(geo.spine),
+                                 "chapter_filter": ch_filter}
+    return report
 
 
 def _idea_fields(epub: str, geo: zpct.BookGeometry, g: int) -> dict:
