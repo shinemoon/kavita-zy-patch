@@ -483,5 +483,80 @@ check("_page_global_offset 切片版查 sidecar",
 check("_page_global_offset 越界返回 None",
       zy_notes._page_global_offset(_geo, {"pages": [{"s": 0}]}, 3) is None)
 
+# --- 高亮尾部重复字: Kavita 0.9.0.2 单元素注入的坑 ----------------------------
+# 同元素时让 EndingXPath 与 XPath 不同 -> Kavita 走多元素注入, 不重复字
+check("_force_multi 同元素加 [1]", zy_notes._force_multi("//body/div[1]/p[4]",
+                                                         "//body/div[1]/p[4]") ==
+      "//body/div[1]/p[4][1]")
+check("_force_multi 跨段不动", zy_notes._force_multi("//body/div[1]/p[5]",
+                                                     "//body/div[1]/p[4]") ==
+      "//body/div[1]/p[5]")
+
+_orig_kv, _orig_db = zy_notes._kv_read_conn, zy_notes.KAVITA_DB
+
+
+class _FakeNotesDB:
+    def __init__(self, rows):
+        self.rows = rows
+        self.updates = []
+
+    def execute(self, sql, args=()):
+        if sql.lstrip().upper().startswith("SELECT"):
+            return self
+        self.updates.append((sql, args))
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+_tmpdb = __import__("tempfile").NamedTemporaryFile(suffix=".db", delete=False).name
+_w = __import__("sqlite3").connect(_tmpdb)
+_w.execute("CREATE TABLE AppUserAnnotation (Id INTEGER PRIMARY KEY, SeriesId INT,"
+           " XPath TEXT, EndingXPath TEXT)")
+_w.executemany("INSERT INTO AppUserAnnotation VALUES (?,?,?,?)", [
+    (1, 27, "//body/div[1]/p[4]", "//body/div[1]/p[4]"),
+    (2, 27, "//body/div[1]/p[4]", "//body/div[1]/p[4][1]"),
+    (3, 27, "//body/div[1]/p[9]", "//body/div[1]/p[10]"),
+])
+_w.commit()
+_w.close()
+_fake = _FakeNotesDB([
+    {"Id": 1, "SeriesId": 27, "XPath": "//body/div[1]/p[4]", "EndingXPath": "//body/div[1]/p[4]"},
+    {"Id": 2, "SeriesId": 27, "XPath": "//body/div[1]/p[4]", "EndingXPath": "//body/div[1]/p[4][1]"},
+    {"Id": 3, "SeriesId": 27, "XPath": "//body/div[1]/p[9]", "EndingXPath": "//body/div[1]/p[10]"},
+])
+zy_notes._kv_read_conn = lambda: _fake
+zy_notes.KAVITA_DB = _tmpdb
+_out = zy_notes.fix_end_paths()
+check("fix_end_paths 只改相同的", _out["fixed"] == 1 and _out["scanned"] == 3, _out)
+_r = __import__("sqlite3").connect(_tmpdb)
+_rows = dict(_r.execute("SELECT Id, EndingXPath FROM AppUserAnnotation").fetchall())
+_r.close()
+check("fix_end_paths 落 [1]", _rows[1] == "//body/div[1]/p[4][1]" and
+      _rows[3] == "//body/div[1]/p[10]", _rows)
+_r = __import__("sqlite3").connect(_tmpdb)
+_fake.rows = [{"Id": i, "SeriesId": 27, "XPath": x, "EndingXPath": e}
+              for i, x, e in _r.execute("SELECT Id, XPath, EndingXPath FROM AppUserAnnotation")]
+_r.close()
+check("fix_end_paths 幂等 (再跑 0 改)", zy_notes.fix_end_paths()["fixed"] == 0)
+_fake2 = _FakeNotesDB([{"Id": 9, "SeriesId": 22, "XPath": "a", "EndingXPath": "a"}])
+zy_notes._kv_read_conn = lambda: _fake2
+check("fix_end_paths --series 过滤", zy_notes.fix_end_paths(series_ids=[27])["scanned"] == 0)
+zy_notes._kv_read_conn, zy_notes.KAVITA_DB = _orig_kv, _orig_db
+
+# --- 页片段首尾缩进被去掉 (Kavita 注入才不算错位置) ---------------------------
+_h = kpages._normalize_fragment("<p>\n    正文一句。\n   </p>\n   <p>a<span>b</span> <em>c</em>\n</p>")
+check("块元素首尾缩进去掉", "<p>正文一句。</p>" in _h, _h)
+check("行内元素之间的空白保留", "a<span>b</span> <em>c</em></p>" in _h, _h)
+check("pre 原样保留", "\n  保留\n" in kpages._normalize_fragment("<pre>\n  保留\n</pre>"))
+check("段首无缩进的段落不变", kpages._normalize_fragment("<p>已有</p>") == "<p>已有</p>")
+
 print("\nFAIL =", FAIL)
 sys.exit(1 if FAIL else 0)

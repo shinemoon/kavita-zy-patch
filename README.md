@@ -379,6 +379,41 @@ App 侧口径没有改动（我们 push 仍写开区间）—— 换口径会改
 等于让云端多出一条新笔记，得不偿失。
 
 
+### 高亮尾部重复一段字（2026-11-01 晚，Kavita 0.9.0.2 的注入 bug）
+
+用户在 Kavita 里看到划线渲染成 `…无情的天地大道。天地大道。` —— 末尾多了 4 个字 + 句号。
+
+根因不在我们的数据（DB 里的 `SelectedText` 正确、页文件里那段文字只有一份），
+在 **Kavita v0.9.0.2 的 `AnnotationHelper`**（上游 `develop` 已重写）：
+
+* 单元素注入 `InjectSingleElementAnnotations`：
+  `currentPos = realStartPos + SelectedText.Length`，而
+  `MapNormalizedPositionToOriginal()` 一开头就 `if (normalizedPosition == 0) return 0;`
+  —— **不跳过元素文本开头的空白**（源书写作 `<p>\n    正文\n   </p>`，缩进 4-6 个字符）。
+  于是"从段落第一个字开始"的划线：前缀少算缩进、尾部 `originalText[currentPos..]`
+  补回来 → **多出重复的字，长度正好等于缩进长度**（实测 5 和 6，逐条对上）。
+* 多元素注入（`InjectHighlightInElement`）没有这个错位，但会 `RemoveAllChildren()`
+  **压平行内标签**；另外元素之间用 `"\n\n"` 拼、归一化时被压成一个空格，
+  所以**跨段选择的末尾会多高亮 1 个字**（周期恰好落在段末时）。
+
+修法（两层，都已落地）：
+
+1. **让同元素的 `EndingXPath != XPath`**（`_force_multi()` → 追加 `[1]` 谓词）。
+   Kavita 因此走多元素注入，不再算错缩进。历史数据：
+   `python3 sync/zync.py notes endings`（幂等，可反复跑，28 条注解修 25 条）。
+2. **切页时去掉块元素首尾的纯空白**（`kpages._normalize_fragment` 里调 `_tighten_whitespace`）。
+   `Trim()` 退化成 no-op，两条注入路径的位置算法都对了。
+   ⚠️ 这层改了页文件内容，**必须重建 edition + 重扫**（页数不变，进度不动）：
+   `python3 tools/apply_edition.py --series 26 --series 30 --series 27`。
+
+实测（28 条注解）：`book-page` 里的高亮正文与 `SelectedText` **26/28 逐字相等**；
+剩下 2 条是跨段选择，末尾多 1 个字（上游分隔符口径，纯显示层，无解除非升级）。
+另：非重排版的书（直接进库的原始 epub，如《九诗心》）只受益于第 1 层。
+
+彻底解法：升级到 **Kavita v0.9.1.0+**（`MapNormalizedPositionToText` 会先跳过前导空白，
+并用 `originalText` 切片替代 `SelectedText` 直接拼接），届时两层都可以去掉。
+
+
 ### 进度记录的 bookId 双 key（2026-10-26 晚，修正上面那段）
 
 上一段说的"两套存储"其实只是**表面现象**：`getUserNotebooks` 只是把 App 自己

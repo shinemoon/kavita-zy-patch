@@ -544,6 +544,26 @@ def _kv_xpath(geo, page: int, rel: str, sliced: bool) -> str:
     return f'id("{name}"){rel[1:] if rel.startswith("/") else rel}'
 
 
+def _force_multi(end: str, xp: str) -> str:
+    """同元素时给 EndingXPath 加个 `[1]` 谓词, 让 Kavita 走**多元素**注入。
+
+    为什么: Kavita v0.9.0.2 的 `AnnotationHelper.InjectSingleElementAnnotations`
+    有 bug —— `MapNormalizedPositionToOriginal` 在 `normalizedPosition == 0` 时
+    直接 `return 0`, 不跳过元素文本开头的空白 (`<p>\\n    正文`) ; 于是
+    `currentPos = realStartPos + SelectedText.Length` 少算了这串空白, 尾部再
+    `originalText[currentPos..]` 补回 → **高亮后面多出重复的字** (实测 5~6 个,
+    正好等于元素开头空白长度)。任何 "从段落第一个字开始" 的划线都会中招。
+
+    让 `XPath != EndingXPath`, Kavita 改走 `InjectHighlightInElement`
+    (自己按 originalText 切 start/end), 不出这个错。已实测: 改前页面多出
+    「天地大道。」, 改后正常。
+
+    上游 v0.9.1.0 起已修 (新增前导空白跳过 + 用 originalText 切片替代
+    SelectedText 直接拼接)。等升级 Kavita 后可以去掉这层。
+    """
+    return end if end != xp else f"{xp}[1]"
+
+
 def _end_xpath(geo, epub: str, sc: dict | None, note: dict, g_start: int,
                page: int, xp: str) -> str:
     """划线结束位置的页内 xpath —— Kavita 靠 XPath + EndingXPath 划高亮范围。
@@ -551,17 +571,20 @@ def _end_xpath(geo, epub: str, sc: dict | None, note: dict, g_start: int,
     实测 (2026-11-01): 只给起点时, 跨段的选择整条不高亮 (Kavita 在单个节点里找不到
     完整 SelectedText 就跳过); 把 EndingXPath 指到结束段落, 两段会各画一段高亮。
     跨页的选择退回起点 (Kavita 只按 PageNumber 那一页注入, 跨页本来就画不出来)。
+
+    **同一段落时也要让它"看起来不同"** —— 见 `_force_multi`: Kavita 0.9.0.2 的
+    单元素注入会把段落开头空白算错, 高亮尾部重复一段字。
     """
     try:
         g_end = pos_to_global(geo, note.get("positionend") or "")
         if g_end is None or g_end <= g_start:
-            return xp
+            return _force_multi(xp, xp)
         summary = (note.get("summary") or "").strip()
         tail = summary[-8:] if len(summary) >= 8 else ""
         epage, erel, _raw, _inner = _locate(geo, epub, sc, g_end, tail)
-        return erel if epage == page else xp
+        return _force_multi(erel if epage == page else xp, xp)
     except Exception:                       # noqa: BLE001 — 失败就用起点, 不影响写入
-        return xp
+        return _force_multi(xp, xp)
 
 
 def _chapter_id_for(link: mapping.BookLink) -> int:
@@ -1583,6 +1606,45 @@ def repair(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dic
     if conn is not None:
         conn.commit()
         conn.close()
+    return report
+
+
+def fix_end_paths(*, dry_run: bool = False, series_ids: list[int] | None = None) -> dict:
+    """库里 `XPath == EndingXPath` 的注解 → `EndingXPath += "[1]"`。
+
+    绕开 Kavita v0.9.0.2 单元素注入的 bug (高亮尾部重复一段字, 见 `_force_multi`)。
+    不依赖 zy_note_link, 所以**Kavita 侧自己建的注解也能修**; 幂等 (改完两边不同了)。
+    """
+    want = set(series_ids or [])
+    report: dict[str, Any] = {"scanned": 0, "fixed": 0, "skipped": 0, "by_series": {}}
+    c = _kv_read_conn()
+    try:
+        rows = c.execute("""SELECT Id, SeriesId, XPath, EndingXPath
+                            FROM AppUserAnnotation""").fetchall()
+    finally:
+        c.close()
+    conn = None if dry_run else sqlite3.connect(KAVITA_DB, timeout=30)
+    try:
+        for r in rows:
+            sid = int(r["SeriesId"] or 0)
+            if want and sid not in want:
+                continue
+            report["scanned"] += 1
+            xp = (r["XPath"] or "").strip()
+            ex = (r["EndingXPath"] or "").strip()
+            if not xp or not ex or xp != ex:
+                report["skipped"] += 1
+                continue
+            report["fixed"] += 1
+            report["by_series"][sid] = report["by_series"].get(sid, 0) + 1
+            if conn is not None:
+                conn.execute("UPDATE AppUserAnnotation SET EndingXPath=? WHERE Id=?",
+                             (f"{xp}[1]", r["Id"]))
+        if conn is not None:
+            conn.commit()
+    finally:
+        if conn is not None:
+            conn.close()
     return report
 
 

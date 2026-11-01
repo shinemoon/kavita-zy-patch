@@ -540,17 +540,64 @@ class _Render:
         return (m.group(1).strip() if m else "") or ""
 
 
+_TIGHT_SKIP_TAGS = {"pre", "code", "textarea"}
+_TIGHT_BLOCK_TAGS = {
+    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "ul", "ol", "dl",
+    "dd", "dt", "blockquote", "td", "th", "tr", "table", "section", "article",
+    "header", "footer", "aside", "figure", "figcaption", "nav",
+}
+
+
+def _tighten_whitespace(root) -> None:
+    """去掉块元素里**首尾**的纯空白文本 (缩进)。
+
+    为什么 (2026-11-01): Kavita v0.9.0.2 的注解注入按字符位置切元素文本,
+    它的 `MapNormalizedPositionToOriginal` 先用 `Trim()` 归一, 但回算位置时把
+    开头那串空白也算作一个"归一化字符" —— 于是
+      · 从段落第一个字开始的划线: 高亮后面**重复**一段字 (长度 = 缩进长度)
+      · 段落中间的划线: 焦点整体偏 1 个字 (少最后一字)
+    常见源书写作 `<p>\\n    正文\\n   </p>`, 每段都中招。
+    把块元素首尾的缩进空白去掉, Trim 就退化成 no-op, 两条路都算对了。
+    (上游 v0.9.1.0 起修好了, 但在那之前这层是对用户可见的唯一解法。)
+    """
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        name = el.tag.lower()
+        parent = el.getparent()
+        skip = False
+        while parent is not None:
+            if isinstance(parent.tag, str) and parent.tag.lower() in _TIGHT_SKIP_TAGS:
+                skip = True
+                break
+            parent = parent.getparent()
+        if skip or name in _TIGHT_SKIP_TAGS:
+            continue
+        if name not in _TIGHT_BLOCK_TAGS:
+            continue
+        if el.text and el.text.strip() == "":
+            el.text = None
+        if el.text:
+            el.text = el.text.strip() if len(el) == 0 else el.text.lstrip()
+        if len(el) and el[-1].tail:
+            el[-1].tail = None if el[-1].tail.strip() == "" else el[-1].tail.rstrip()
+
+
 def _normalize_fragment(text: str) -> str:
     """把 (可能没闭合的) 片段过一遍容错解析器, 输出合法 XHTML。
 
     源书是"能读但 XML 不合法"的 HTML (`<p>` 大量不闭合)。Kavita 自己解析
     时是容错的, 但我们切页后必须保证每页自洽 —— 否则 epub 校验/别的阅读器
     会直接拒绝整章。lxml.html 按浏览器语义补闭合, 再按 XML 序列化。
+
+    顺手把块元素首尾的缩进空白去掉 (`_tighten_whitespace`), 否则 Kavita
+    0.9.0.2 的注解注入会在高亮尾部重复字。
     """
     try:
         from lxml import etree as LE
         from lxml import html as LH
         frag = LH.fragment_fromstring(text, create_parent="div")
+        _tighten_whitespace(frag)
         out: list[str] = []
         if frag.text and frag.text.strip():
             out.append(frag.text)
