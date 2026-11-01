@@ -451,15 +451,15 @@
     'pointer-events:none;user-select:none;white-space:nowrap;',
     'font-variant-numeric:tabular-nums;}',
     '@media (max-width:600px){#zy-push-stamp{font-size:.62rem;right:.4rem;bottom:.15rem;}}',
-    // ---- 书签图标 (v0.4.16) -------------------------------------------
+    // ---- 书签图标: 直接隐藏 (v0.4.17) ---------------------------------
     // Kavita 在漫画阅读器里给每张 <img> 追加一个 div.bookmark-overlay,
-    // 位置是"注入那一刻"按 left/top 算死的, 而且底边比图片低 10px;
-    // 我们的 JS 归位要等 120ms + 一次 MutationObserver 抖动 →
-    // 实际观感是"图标先在页面外露出来, 再跳回页角"。
-    // 纯 CSS 覆盖: 元素一插入就由浏览器算位置, 没有中间态。
-    '.bookmark-overlay{position:absolute !important;left:auto !important;top:auto !important;',
-    'right:4px !important;bottom:4px !important;margin:0 !important;}',
-    '.kavita-scale-width-container{position:relative;}',
+    // 位置按注入那一刻的 left/top 算死, 底边比图片低 10px; 换 fit/缩放/
+    // resize 都不重算 → 观感就是"书签图标浮在页面当中"。
+    // v0.4.15/16 试过 JS 归位 + 纯 CSS 钉页角, 用户拍板: 不要这个图标。
+    // 一行 display:none 从源头掐掉, 元素一插入就不可见 (无中间态)。
+    // 想恢复时把下面这条注释掉即可 (Kavita 自己的书签功能不受影响,
+    // 书签抽屉 / 侧栏管理照旧可用)。
+    '.bookmark-overlay{display:none !important;}',
   ].join('');
 
   function injectCss() {
@@ -864,7 +864,7 @@
   //      图标会从页角飘到页面中间。
   // 不改 Kavita: 用 right/bottom 把它钉回自己那张图的右下角内侧 (不依赖
   // 图片尺寸), 并在 DOM 变动 / resize 后重算。
-  var BM = { fixed: 0, removed: 0, last: 0, skip: 0 };
+  var BM = { fixed: 0, removed: 0, last: 0, skip: 0, off: true };
 
   function bmHost(ov) {
     var h = ov.parentElement;
@@ -874,6 +874,7 @@
 
   // 返回本轮新摆正/清理的数量
   function bmFix() {
+    if (BM.off) return 0;                         // v0.4.17: 图标已 CSS 隐藏
     var list = document.querySelectorAll('.bookmark-overlay');
     var n = 0;
     for (var i = 0; i < list.length; i++) {
