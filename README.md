@@ -533,9 +533,9 @@ warning 条只上 error + 最多 1 条 warn，info 不上条。
   (shell 里 `$()` 会被 agent 环境的 guard 拦)
 - 冒烟: `node src/probe-push-stamp.mjs` (映射书出现 / 未映射书消失 / 样式为 fixed 小灰字)
 
-## 图片阅读器：书签图标钉回页角 (v0.4.15)
+## 图片阅读器：书签图标直接隐藏 (v0.4.17)
 
-**症状**：看图片型书（如「路邊的藤井」多卷）时，页面右下角／下方会浮着一个书签图标，
+**症状**：看图片型书（如「路邊的藤井」多卷）时，页面右下角／下方浮着一个书签图标，
 条漫（连续滚动）模式下更明显 —— 它压在下一张图上面，看着像"书签图标浮在页面当中"。
 
 **根因（Kavita 自己的定位算式，不是我们注入的）**：
@@ -547,23 +547,28 @@ left = imgW + (imgLeft - parentLeft) - min(32, imgW*0.05)
 top  = imgH + (imgTop  - parentTop ) - min(32, imgH*0.05)
 ```
 
-两个坑：
-
 1. 这个 div 实际高 **42px**（32px 字号 + 上下 5px 内边距），却按 **32px** 定位
-   → 底边探出图片 **10px**（小图能到 20px+）。单页模式悬在页外黑底上，
-   条漫模式正好落在下一张图顶部。
-2. **只算一次**：之后换 fit / 浏览器缩放 / 窗口缩放 / 横竖屏都不重算。
-   实测 1400×900 → 900×1000，图从 590×786 缩到 540×720，图标仍停在旧像素坐标
-   → 偏离页角 50px / 66px，飘进页面。
+   → 底边探出图片 **10px**（小图能到 20px+）。
+2. **只算一次**：之后换 fit / 缩放 / 横竖屏都不重算 → 偏离页角 50px+。
 
-**修法**（补丁侧，不改 Kavita 一个字节）：`bmFix()` 把每个 `.bookmark-overlay`
-用 `right/bottom`（不依赖图片尺寸）钉回**自己那张图的右下角内侧 4px**，
-并在 DOM 变动 / `resize` / `orientationchange` / `visualViewport` 缩放后重算；
-容器里没有 `<img>` 的孤儿图标直接删掉。点击行为不变（点一下＝加/取消书签）。
+**处理过程**：v0.4.15 用 JS（`bmFix`）归位、v0.4.16 改成纯 CSS 钉页角。
+两种都能修好位置，但用户拍板「不需要这个图标」→ **v0.4.17 直接隐藏**：
 
-**自检**：浏览器控制台 `__ZY__.bm()` → `{fixed, removed, count, rows:[{inside,dRight,dBottom}]}`，
-正常时每行 `inside:true`、`dRight=4`、`dBottom=4`。
-回归冒烟：`node src/verify-bm-pin.mjs`（4 种状态都应 `inside:true`；epub 书应 `count=0`）。
+```css
+.bookmark-overlay { display: none !important; }
+```
 
-> 根本不想看到这个图标：Kavita 阅读配置里有「禁用书签图标」(BookReaderDisableBookmarkIcon)，
-> 一勾就整批不注入。本补丁只负责"它在的时候别乱飘"，不替你关功能。
+纯 CSS，元素一插入就不可见，没有"先飘出来再跳回去"的中间态；
+`bmFix()` 保留但 `BM.off = true` 提前返回（不再付 DOM 查询成本）。
+
+**副作用（明确知道）**：图片/漫画阅读器里"点图标加书签"的入口没了
+（Kavita 只在该 overlay 上绑点击）。侧栏 `/bookmarks` 列表与删除照旧可用；
+epub 阅读器的书签功能完全不受影响。
+
+**想恢复**：删掉 `src/zy-kavita-patch.js.tmpl` 里那条 `display:none` 规则后
+`bash install.sh publish`（Kavita 自己的「禁用书签图标」配置也能达到同样效果）。
+
+**自检**：进图片书后浏览器控制台 `__ZY__.bm()` → `off:true`，
+`.bookmark-overlay` 的 `getComputedStyle().display === 'none'`、box 0×0、`data-zy-bm` 不再写入。
+冒烟：`node src/probe-bm-hidden.mjs`（翻页后仍 `display:none`）。
+
