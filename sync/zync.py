@@ -69,6 +69,8 @@ def cmd_notes(args):
         out = zy_notes.pull(sid, dry_run=args.dry_run)
     elif args.action == "push":
         out = zy_notes.push(sid, dry_run=args.dry_run)
+    elif args.action == "repair":
+        out = zy_notes.repair(sid, dry_run=args.dry_run)
     else:
         out = zy_notes.sync(sid, dry_run=args.dry_run)
     print(json.dumps(out, ensure_ascii=False, indent=1))
@@ -135,7 +137,7 @@ def main(argv=None):
     p_daemon.set_defaults(func=cmd_daemon)
 
     p_nt = sub.add_parser("notes", help="划线/书签 双向同步")
-    p_nt.add_argument("action", choices=("sync", "pull", "push"))
+    p_nt.add_argument("action", choices=("sync", "pull", "push", "repair"))
     p_nt.add_argument("--series", type=int, action="append", default=[],
                       help="只处理这些 Kavita series id (可多次)")
     p_nt.add_argument("--dry-run", action="store_true")

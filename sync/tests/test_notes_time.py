@@ -3,7 +3,7 @@
     python3 tests/test_notes_time.py
 """
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 sys.path.insert(0, "/vol2/1001/zhangyue-bridge/sync")
 
@@ -59,9 +59,22 @@ if link:
     back = zy_notes.global_to_pos(geo, g)
     check("字节↔位置 往返", back == ps, back)
     page, rel, raw, inner = zy_notes._locate(geo, zy_notes._orig_epub(link), sc, g, "哈哈，家乡便是那坛老酒了")
-    check("定位到页", page == 568, page)          # 0-based 567 -> 1-based 568
+    check("定位到页", page == 567, page)          # 0 基: Kavita page / PageNumber 同一套序号
     check("xpath 命中段落", rel.startswith("//body/div"), rel)
+    check("切片版 xpath 不带文档 id", not rel.startswith("id("), rel)
     check("页内含原文", "哈哈" in raw.decode("utf-8", "replace"))
+    # xpath 形态: 切片版 Kavita 的包裹 div 没有 id → 必须用相对路径;
+    # 原书直接进库的包裹 div 带 id="<文件名>" → 必须带前缀 (2026-11-01 实测)
+    check("_kv_xpath 切片版原样", zy_notes._kv_xpath(geo, 0, "//body/p[1]", True) == "//body/p[1]")
+    _xp_ns = zy_notes._kv_xpath(geo, 6, "//body/p[1]", False)
+    check("_kv_xpath 原书带文件名 id", _xp_ns.startswith('id("') and _xp_ns.endswith("/body/p[1]"), _xp_ns)
+    # 跨段划线: EndingXPath 必须指到结束段, 否则 Kavita 整条不高亮 (实测)
+    _ex = zy_notes._end_xpath(
+        geo, zy_notes._orig_epub(link), sc,
+        {"positionend": "106_0_0$##3-0-106-66900-0##$",
+         "summary": "哈哈，家乡便是那坛老酒了，这就行，至少台面上终究是个念想，" * 2},
+        g, page, rel)
+    check("跨段 EndingXPath 有效", _ex.startswith("//"), _ex)
     # 反向: Kavita 注解文本 -> 位置
     g2 = zy_notes._find_in_book(zy_notes._orig_epub(link), "哈哈，家乡便是那坛老酒了")
     check("文本反查同一位置", g2 == g, (g2, g))
@@ -124,7 +137,7 @@ tmpdir = tempfile.mkdtemp(prefix="zytest-")
 zy_notes.STATE_DB = str(Path(tmpdir) / "state.db")
 
 _today = date.today()
-_yday = _today.replace(day=_today.day - 1) if _today.day > 1 else _today
+_yday = _today - timedelta(days=1)          # 别用 replace(day=day-1): 月初会撞 day=0
 _r = zy_time.enqueue(_today.replace(year=_today.year + 1), series_ids=[26])
 check("入队 未来日期拒绝", bool(_r["errors"]) and _r["queued"] == 0, _r)
 

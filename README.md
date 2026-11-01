@@ -323,6 +323,29 @@ python3 tests/test_notes_time.py
 | 书签 | ✅ | ✅ 同上 |
 | 阅读时长 | ✅ 精确到每天每书 | ✅ 队列 + 位图（幂等；历史 key 会被服务端并入上传日） |
 
+### Kavita 注解的坐标约定（2026-11-01：这才是"划线不互通"的真因）
+
+数据一直是双向同步的（两侧条数逐本对得上），问题是**Kavita 阅读器一条高亮都不画**，
+所以看起来"没同步过去"。三处坐标写错，全部只在显示层暴露：
+
+| # | 错法 | 后果 |
+|---|---|---|
+| 1 | `PageNumber` 用了 1 基（`p+1`） | Kavita 的 `book-page?page=` / `PageNumber` 是**同一套 0 基序号**（= `page_files` 下标 / spine 下标），整体错开一页 |
+| 2 | `XPath` 带 `id("kp/pNNNN.xhtml")` 前缀 | 切片版的包裹 `div` **没有 id 属性**，`id()` 解析失败 → 整条跳过 |
+| 3 | `EndingXPath` = `XPath` | 跨段选择在单个节点里凑不齐 `SelectedText`，整条跳过 |
+
+实测（剑来 20 条 + 狐 2 条 + 万古江河 1 条，24/24 修完都能画出来）：
+
+* 切片版（kpages 重排版）→ **必须页内相对路径**（`//body/div[1]/p[19]`）
+* 原书直接进库（图片书）→ **必须带文件名前缀**（`id("chapter04.xhtml")/p[3]/span[1]`），
+  因为那种书的包裹 `div` 带 `id="<文件名>"`
+* 跨段/跨页：`EndingXPath` 指到结束段落（跨页退回起点 —— Kavita 只按 `PageNumber` 那一页注入）
+* 短划线（1-2 字）没法当检索锚 → 用**原书同位置往后 12 字正文**当锚反查页内 xpath
+
+修法落在 `sync/sync/zy_notes.py`：`locate_note/_locate` 统一返回 0 基页号，
+`_kv_xpath()` 按切片与否决定前缀，`_end_xpath()` 算结束段落。
+历史数据一条命令重算：`python3 sync/zync.py notes repair`（幂等，可反复跑）。
+
 ### 进度记录的 bookId 双 key（2026-10-26 晚，修正上面那段）
 
 上一段说的"两套存储"其实只是**表面现象**：`getUserNotebooks` 只是把 App 自己

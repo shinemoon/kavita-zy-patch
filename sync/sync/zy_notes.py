@@ -432,20 +432,78 @@ def _doc_raw(epub: str, spine_index: int) -> bytes | None:
         return None
 
 
+def _needle_from_raw(raw: bytes, offset: int, n: int = 12) -> str:
+    """从原书文档的字节位置取一小段正文当锚 (给页内 xpath 反查用)。
+
+    短划线 (1-2 字, 如单字「暌」) 没法直接当检索锚 (`_xpath_in_page` 要求 ≥4 字节);
+    结构 xpath 又可能因为 DocIndex 与 Kavita 的 HTML 归一化差异而偏几段。这里从
+    **原书**同一位置往后取十几字正文 —— 内容页里必有一份一样的文本。
+    """
+    try:
+        chunk = raw[max(0, int(offset)): int(offset) + 800].decode("utf-8", "replace")
+    except Exception:                       # noqa: BLE001
+        return ""
+    chunk = re.sub(r"<[^>]*>", "", chunk)
+    chunk = re.sub(r"\s+", "", chunk)
+    return chunk[:n]
+
+
 def _locate(geo, epub: str, sc: dict | None, g: int, summary: str) -> tuple[int, str, bytes, int]:
-    """全书字节 -> (Kavita 页号 1 基, 页内 xpath, 该页原始字节, 页内偏移)。"""
+    """全书字节 -> (Kavita 页号, 页内 xpath, 该页原始字节, 页内偏移)。
+
+    **页号是 0 基** —— Kavita 的 `book-page?page=N` 与 `AppUserAnnotation.PageNumber`
+    用的是同一条序号 (spine / 切片页下标)。早先这里返回 1 基, 高亮整体错一页。
+    xpath 是**页内相对路径** (`//body/div[1]/p[19]`), 不能带 `id("pNNNN.xhtml")` 前缀 ——
+    Kavita 逐页渲染, 页文档里根本没有那个 id, 解析失败就整条不高亮。
+    """
     if sc:
         ed = kpages.edition_path(sc)
-        page, rel = locate_note(sc, ed, g, summary, sc["page_files"])
-        raw = _page_file_raw(ed, sc["page_files"], page - 1) or b""
-        inner = max(0, g - sc["pages"][page - 1]["s"])
+        ch, off = geo.locate(g)
+        anchor = _needle_from_raw(_doc_raw(epub, ch + 1) or b"", off)
+        page, rel = locate_note(sc, ed, g, summary, sc["page_files"], anchor)
+        raw = _page_file_raw(ed, sc["page_files"], page) or b""
+        inner = max(0, g - sc["pages"][page]["s"])
         return page, rel, raw, inner
     ch, off = geo.locate(g)
     spine = ch + 1
     raw = _doc_raw(epub, spine) or b""
     rel = (_xpath_in_page(raw, summary) if summary else None) \
         or (zpct.DocIndex(raw).xpath_of_offset(off) if raw else None) or "//body"
-    return spine + 1, rel, raw, off
+    return spine, rel, raw, off
+
+
+def _kv_xpath(geo, page: int, rel: str, sliced: bool) -> str:
+    """把页内相对 xpath 变成 Kavita 能解析的形式。
+
+    - **切片版** (kpages): Kavita 把每页包成 `<div class=" ">` (没有 id 属性),
+      所以只能用页内相对路径 (`//body/div[1]/p[19]`) —— 带 `id(...)` 前缀反而解析不到。
+    - **原书直接进库**: Kavita 的包裹 div 带 `id="<文件名>"`, 它自己的注解也存
+      `id("chapter04.xhtml")/p[3]/span[1]` 这种, 所以这边必须带文件名前缀。
+    """
+    if sliced:
+        return rel
+    name = Path(geo.spine[min(page, len(geo.spine) - 1)]).name
+    return f'id("{name}"){rel[1:] if rel.startswith("/") else rel}'
+
+
+def _end_xpath(geo, epub: str, sc: dict | None, note: dict, g_start: int,
+               page: int, xp: str) -> str:
+    """划线结束位置的页内 xpath —— Kavita 靠 XPath + EndingXPath 划高亮范围。
+
+    实测 (2026-11-01): 只给起点时, 跨段的选择整条不高亮 (Kavita 在单个节点里找不到
+    完整 SelectedText 就跳过); 把 EndingXPath 指到结束段落, 两段会各画一段高亮。
+    跨页的选择退回起点 (Kavita 只按 PageNumber 那一页注入, 跨页本来就画不出来)。
+    """
+    try:
+        g_end = pos_to_global(geo, note.get("positionend") or "")
+        if g_end is None or g_end <= g_start:
+            return xp
+        summary = (note.get("summary") or "").strip()
+        tail = summary[-8:] if len(summary) >= 8 else ""
+        epage, erel, _raw, _inner = _locate(geo, epub, sc, g_end, tail)
+        return erel if epage == page else xp
+    except Exception:                       # noqa: BLE001 — 失败就用起点, 不影响写入
+        return xp
 
 
 def _chapter_id_for(link: mapping.BookLink) -> int:
@@ -457,29 +515,35 @@ def _chapter_id_for(link: mapping.BookLink) -> int:
 
 
 def locate_note(sc: dict, edition: str, g: int, summary: str,
-                page_files: list[str]) -> tuple[int, str]:
-    """字节位置 -> (页号 1 基, 页内 xpath)。
+                page_files: list[str], anchor: str = "") -> tuple[int, str]:
+    """字节位置 -> (页号 0 基, 页内 xpath)。
 
     先用字节位置定页; 若该页找不到 summary 文本, 再试相邻页 —— 原书与设备那份
     可能有字节差 (剑来本地 41.9MB vs 云端 30.7MB), 文本才是最终锚。
+    `anchor` 是原文该位置的正文片段, 用于短划线 (summary 太短) 兜底。
+
+    页号 0 基: 与 Kavita `book-page?page=N` / `PageNumber` 同一套序号 (page_files 下标)。
     """
     page = kpages.page_of_bytes(sc, g)
     cands = [page]
     for d in (1, -1, 2, -2):
         if 0 <= page + d < len(page_files):
             cands.append(page + d)
-    for p in cands:
-        raw = _page_file_raw(edition, page_files, p)
-        if not raw:
+    for needle in (summary, anchor):
+        if not needle:
             continue
-        xp = _xpath_in_page(raw, summary) if summary else None
-        if xp:
-            return p + 1, xp
+        for p in cands:
+            raw = _page_file_raw(edition, page_files, p)
+            if not raw:
+                continue
+            xp = _xpath_in_page(raw, needle)
+            if xp:
+                return p, xp
     p = page
     raw = _page_file_raw(edition, page_files, p) or b""
     di = zpct.DocIndex(raw)
     inner = max(0, g - sc["pages"][p]["s"])
-    return p + 1, (di.xpath_of_offset(inner) or "//body")
+    return p, (di.xpath_of_offset(inner) or "//body")
 
 
 # --------------------------------------------------------------------------
@@ -495,6 +559,19 @@ def _kv_read_conn() -> sqlite3.Connection:
     src.close()
     dst.row_factory = sqlite3.Row
     return dst
+
+
+def _series_notes_for(link: mapping.BookLink, loader) -> list[dict]:
+    """取本次要同步的注解/书签, **按卷过滤**。
+
+    `kavita_annotations/bookmarks(series)` 返回整个系列的; 多卷系列 (路邊的藤井 3 卷)
+    如果不过滤, 卷02 的一条书签会被当成三卷各一条推到掌阅的三个 bookid 上。
+    """
+    rows = loader(link.kavita_series_id)
+    chid = int(getattr(link, "kavita_chapter_id", 0) or 0)
+    if chid <= 0:
+        return rows
+    return [r for r in rows if int(r.get("ChapterId") or 0) == chid]
 
 
 def kavita_annotations(series_id: int) -> list[dict]:
@@ -687,9 +764,8 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 report["skipped"] += 1
                 continue
             page, rel, raw, inner = _locate(geo, epub, sc, g, (n.get("summary") or "").strip())
-            xp = f'id("kp/p{page:04d}.xhtml"){rel[1:] if rel.startswith("/") else rel}' if sliced \
-                else f'id("{Path(geo.spine[min(page - 1, len(geo.spine)-1)]).name}"){rel[1:] if rel.startswith("/") else rel}'
-            ex = xp
+            xp = _kv_xpath(geo, page, rel, sliced)     # 切片版用相对路径, 原书带文件名 id
+            ex = _kv_xpath(geo, page, _end_xpath(geo, epub, sc, n, g, page, rel), sliced)
             existing = link_get("note", book32, key)
             if existing and int(existing["marktime"] or 0) == int(n.get("marktime") or 0):
                 report["skipped"] += 1
@@ -718,8 +794,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 report["skipped"] += 1
                 continue
             page, rel, _raw, _inner = _locate(geo, epub, sc, g, "")
-            xp = f'id("kp/p{page:04d}.xhtml")/body' if sliced else \
-                 f'id("{Path(geo.spine[min(page - 1, len(geo.spine)-1)]).name}")/body'
+            xp = _kv_xpath(geo, page, rel, sliced)     # 同划线: 切片版相对, 原书带文件名 id
             existing = link_get("bookmark", book32, key)
             if existing and int(existing["marktime"] or 0) == int(m.get("marktime") or 0):
                 report["skipped"] += 1
@@ -952,7 +1027,7 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
         ann_keys: set[str] = set()          # Kavita 侧仍然是活的 key (用于判删除)
 
         # --- 划线
-        for a in kavita_annotations(link.kavita_series_id):
+        for a in _series_notes_for(link, kavita_annotations):
             text = (a.get("SelectedText") or "").strip()
             if not text:
                 report["skipped"] += 1
@@ -998,7 +1073,7 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
 
         # --- 书签
         mark_keys: set[str] = set()
-        for b in kavita_bookmarks(link.kavita_series_id):
+        for b in _series_notes_for(link, kavita_bookmarks):
             g = _page_start_bytes(link, geo, int(b.get("Page") or 0))
             if g is None:
                 report["skipped"] += 1
@@ -1098,6 +1173,76 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
     return report
 
 
+def repair(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
+    """修历史遗留的注解/书签坐标 (2026-11-01 之前 pull 写错的两种形态)。
+
+    老 pull 写进去的两处错, 导致 Kavita 阅读器里**一条高亮都不画**:
+      1. XPath 带 `id("kp/pNNNN.xhtml")` 前缀 —— Kavita 逐页渲染, 页文档里没有那个 id
+      2. PageNumber 用 1 基 —— Kavita 的 page 序号 0 基, 高亮整体错开一页
+      3. EndingXPath = XPath —— 跨段选择在单节点里凑不齐, 整条被跳过
+
+    这里按 `zy_note_link` 里登记的 uniquecheck (内含起止字节位置) 重新算一遍坐标,
+    直接 UPDATE 库里的行。幂等, 可反复跑。
+    """
+    report: dict[str, Any] = {"fixed_notes": 0, "fixed_marks": 0, "skipped": 0,
+                              "books": [], "errors": []}
+    links = [l for l in mapping.all_links() if not series_ids or l.kavita_series_id in series_ids]
+    conn = None if dry_run else sqlite3.connect(KAVITA_DB, timeout=30)
+    for link in links:
+        epub = _orig_epub(link)
+        geo = geometry(link)
+        if not epub or geo is None:
+            report["books"].append({"series": link.kavita_series_id, "skip": "no_geometry"})
+            continue
+        sc = kpages.load(link.kavita_series_id)
+        book32 = kb32(link.zy_book_id)
+        done = {"note": 0, "bookmark": 0}
+        for row in links_for_series(link.kavita_series_id):
+            poses = _split_positions(row["zy_key"] or "")
+            if row["kind"] == "note":
+                if len(poses) < 2 or not row["kavita_annotation_id"]:
+                    report["skipped"] += 1
+                    continue
+                summary = text_of_span(epub, poses[0], poses[1]).strip()
+                g = pos_to_global(geo, poses[0])
+                if g is None:
+                    report["skipped"] += 1
+                    continue
+                page, rel, _raw, _inner = _locate(geo, epub, sc, g, summary)
+                xp = _kv_xpath(geo, page, rel, bool(sc))
+                ex = _kv_xpath(geo, page, _end_xpath(
+                    geo, epub, sc, {"positionend": poses[1], "summary": summary},
+                    g, page, rel), bool(sc))
+                if not dry_run:
+                    conn.execute(
+                        "UPDATE AppUserAnnotation SET PageNumber=?, XPath=?, EndingXPath=?"
+                        " WHERE Id=?", (page, xp, ex, row["kavita_annotation_id"]))
+                done["note"] += 1
+            else:
+                if not poses or not row["kavita_annotation_id"]:
+                    report["skipped"] += 1
+                    continue
+                g = pos_to_global(geo, poses[0])
+                if g is None:
+                    report["skipped"] += 1
+                    continue
+                page, rel, _raw, _inner = _locate(geo, epub, sc, g, "")
+                if not dry_run:
+                    conn.execute(
+                        "UPDATE AppUserBookmark SET Page=?, XPath=? WHERE Id=?",
+                        (page, _kv_xpath(geo, page, rel, bool(sc)),
+                         row["kavita_annotation_id"]))
+                done["bookmark"] += 1
+        report["fixed_notes"] += done["note"]
+        report["fixed_marks"] += done["bookmark"]
+        report["books"].append({"series": link.kavita_series_id,
+                               "notes": done["note"], "bookmarks": done["bookmark"]})
+    if conn is not None:
+        conn.commit()
+        conn.close()
+    return report
+
+
 def sync(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
     """先 pull 掌阅 (掌阅权威), 再 push Kavita 独有项。"""
     p = pull(series_ids, dry_run=dry_run)
@@ -1108,5 +1253,5 @@ def sync(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "sync"
     dry = "--dry-run" in sys.argv
-    fn = {"pull": pull, "push": push, "sync": sync}[cmd]
+    fn = {"pull": pull, "push": push, "sync": sync, "repair": repair}[cmd]
     print(json.dumps(fn(dry_run=dry), ensure_ascii=False, indent=2))
