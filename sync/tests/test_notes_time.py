@@ -412,5 +412,54 @@ zy_notes.mapping.all_links = _orig_links
 zy_notes.STATE_DB = _real_state
 print("清理临时库:", tmpdir2)
 
+# --- 划线正文起止口径 (2026-11-01) ----------------------------------------
+# App 的 positionend = 最后一个字的**起始字节** (闭区间); 我们自己 push 的是开区间。
+check("_utf8_char_len 中文 3", zy_notes._utf8_char_len("你".encode(), 0) == 3)
+check("_utf8_char_len ascii 1", zy_notes._utf8_char_len(b"a", 0) == 1)
+check("_utf8_char_len 续字节 -> 0", zy_notes._utf8_char_len("你".encode(), 1) == 0)
+check("_utf8_char_len 越界 -> 0", zy_notes._utf8_char_len("你".encode(), 3) == 0)
+
+_RAW = b"<p>" + "你好世界".encode("utf-8") + b"</p>"      # 正文 12..23
+_S = zpct.build_position(5, 3)                            # 章内字节 3 = "你" 起点
+_E_INCL = zpct.build_position(5, 12)                      # "界" 起点 (App 口径)
+_E_EXCL = zpct.build_position(5, 15)                      # "界" 之后 (我们 push 的口径)
+
+
+def _with_raw(monkey):
+    _orig_raw = zy_notes._chapter_raw
+    zy_notes._chapter_raw = lambda epub, ch: _RAW
+    try:
+        return monkey()
+    finally:
+        zy_notes._chapter_raw = _orig_raw
+
+
+_span_incl = _with_raw(lambda: zy_notes.text_of_span("x.epub", _S, _E_INCL))
+_span_excl = _with_raw(lambda: zy_notes.text_of_span("x.epub", _S, _E_INCL, end_inclusive=False))
+_span_own = _with_raw(lambda: zy_notes.text_of_span("x.epub", _S, _E_EXCL))
+check("App 口径闭区间补最后一个字", _span_incl == "你好世界", _span_incl)
+check("开区间少最后一个字", _span_excl == "你好世", _span_excl)
+check("自家 push 的开区间不多补", _span_own == "你好世界", _span_own)
+
+
+def _pp():
+    _orig_dv = zy_notes.data_ver
+    zy_notes.data_ver = lambda b: {"booknotesVerList": [
+        {"uniquecheck": "AB_" + _S + _E_INCL, "marktime": 1},
+        {"uniquecheck": "AB_" + _S + _E_EXCL, "marktime": 2}]}
+    try:
+        return zy_notes.positions_payload("AB", "x.epub",
+                                          exclusive_keys={"AB_" + _S + _E_EXCL})
+    finally:
+        zy_notes.data_ver = _orig_dv
+
+
+_res_pp = _with_raw(_pp)
+check("positions_payload 默认补字", (_res_pp["booknotes"][0]["summary"] if _res_pp.get("booknotes") else "")
+      in ("你好世界", "<p>你好世界</p>"), _res_pp)
+check("positions_payload 自家 key 不补字",
+      len(_res_pp.get("booknotes") or []) == 2 and
+      _res_pp["booknotes"][1]["summary"].endswith("世界"), _res_pp)
+
 print("\nFAIL =", FAIL)
 sys.exit(1 if FAIL else 0)

@@ -110,11 +110,42 @@ def _chapter_raw(epub_path: str, chapter_id: int) -> bytes | None:
     return raw
 
 
-def text_of_span(epub_path: str, pos_s: str, pos_e: str = "") -> str:
+def _utf8_char_len(raw: bytes, off: int) -> int:
+    """`raw[off:]` 开头那个 UTF-8 字符占几个字节 (不在字符边界上 / 越界 → 0)。"""
+    if raw is None or off < 0 or off >= len(raw):
+        return 0
+    b = raw[off]
+    if b < 0x80:
+        n = 1
+    elif b < 0xC0:          # 续字节: off 落在字符中间
+        return 0
+    elif b < 0xE0:
+        n = 2
+    elif b < 0xF0:
+        n = 3
+    elif b < 0xF8:
+        n = 4
+    else:
+        return 0
+    if off + n > len(raw):
+        return 0
+    return n
+
+
+def text_of_span(epub_path: str, pos_s: str, pos_e: str = "",
+                 *, end_inclusive: bool = True) -> str:
     """掌阅位置区间 → 划线正文。
 
     `downloadDataV2` 拿不到正文时 (2026-10-24 起一直返 status:0 无 res)，
     用 `getUserDataVer` 的位置 + 原书字节自己切。原文即权威，比下载还准。
+
+    **`positionend` 的口径 (2026-11-01 实测 22 条真实划线)**: App 写的是
+    「**最后一个字的起始字节**」(闭区间)，不是"最后一个字之后"。按开区间切
+    每条都会少最后一个字 (`不可` / `站了许` / `温` 这种截断)。所以默认
+    `end_inclusive=True` → 切完再补一个字。
+
+    例外: **我们自己 push 上去的划线** (`zy_note_link.source='kv'`) 当初就是按
+    开区间写的，读回来必须 `end_inclusive=False`，否则会多出一个字。
     """
     a = parse_chapter_offset(pos_s)
     if a is None:
@@ -127,6 +158,13 @@ def text_of_span(epub_path: str, pos_s: str, pos_e: str = "") -> str:
     end = b[1] if (b and b[0] == ch) else start
     lo = max(0, min(start, len(raw)))
     hi = max(lo, min(end, len(raw)))
+    if end_inclusive and hi > lo:
+        n = _utf8_char_len(raw, hi)
+        if n:
+            cand = raw[hi:hi + n].decode("utf-8", "ignore")
+            # 补出来的若是标签开头 / 空白，就当作"选中范围恰好收在字尾"
+            if cand and cand != "<" and not cand.isspace():
+                hi = min(len(raw), hi + n)
     if hi <= lo:
         # 零长度选择 (掌阅允许只点一下留标) → 取所在段落开头一段做上下文
         try:
@@ -145,20 +183,26 @@ def text_of_span(epub_path: str, pos_s: str, pos_e: str = "") -> str:
     return txt[:200]
 
 
+
 def _split_positions(uniquecheck: str) -> list[str]:
     """uniquecheck 里嵌的两段位置 (划线) / 一段 (书签)。"""
     return _POS_RE.findall(uniquecheck or "")
 
 
-def positions_payload(book32: str, epub_path: str) -> dict:
+def positions_payload(book32: str, epub_path: str,
+                      *, exclusive_keys: set[str] | None = None) -> dict:
     """`getUserDataVer` → downloadDataV2 形状的 res (正文从原书切)。
 
     云端 `downloadDataV2` 现在是坏通道 (只回 status/msg, 无 res)，但
     `getUserDataVer` 稳定给出：每条的 uniquecheck (含起止字节位置) +
     marktime + delList。正文由原书按字节切出来，与云端一致。
     唯一拿不到的是「批注正文」(remark)，留空。
+
+    `exclusive_keys`: 这些 key 的 `positionend` 是**开区间** (我们自己 push 上去的
+    划线, 见 `text_of_span` 的口径说明)，切正文时不补最后一个字。
     """
     v = data_ver(book32)
+    excl = {norm_key(k) for k in (exclusive_keys or set())}
     notes, marks = [], []
     for it in (v.get("booknotesVerList") or []):
         uc = str(it.get("uniquecheck") or "")
@@ -167,7 +211,8 @@ def positions_payload(book32: str, epub_path: str) -> dict:
             continue
         notes.append({"uniquecheck": uc,
                       "positionstart": poses[0], "positionend": poses[1],
-                      "summary": text_of_span(epub_path, poses[0], poses[1]),
+                      "summary": text_of_span(epub_path, poses[0], poses[1],
+                                              end_inclusive=norm_key(uc) not in excl),
                       "remark": "", "marktime": int(it.get("marktime") or 0)})
     for it in (v.get("bookmarksVerList") or []):
         uc = str(it.get("uniquecheck") or "")
@@ -652,6 +697,30 @@ def kavita_upsert_note(*, series_id: int, chapter_id: int, page: int,
     return new_id
 
 
+def kavita_refresh_note_text(ann_id: int, text: str) -> bool:
+    """旧口径切出来的划线正文少最后一个字 → 就地补齐 SelectedText。
+
+    只在「库里文本是本次文本的严格前缀，且只短 1-3 字」时改 —— 否则可能是
+    用户自己在 Kavita 侧改过 / 两边本来就不同, 不动。返回是否改动。
+    """
+    if not ann_id or not text:
+        return False
+    d = sqlite3.connect(KAVITA_DB, timeout=15)
+    try:
+        row = d.execute("SELECT SelectedText FROM AppUserAnnotation WHERE Id=?",
+                        (ann_id,)).fetchone()
+        cur = (row[0] or "").strip() if row else ""
+        if not cur or cur == text or not text.startswith(cur):
+            return False
+        if not 0 < len(text) - len(cur) <= 3:
+            return False
+        d.execute("UPDATE AppUserAnnotation SET SelectedText=? WHERE Id=?", (text, ann_id))
+        d.commit()
+        return True
+    finally:
+        d.close()
+
+
 def kavita_upsert_bookmark(*, series_id: int, chapter_id: int, page: int,
                            xpath: str, bm_id: int | None = None) -> int:
     local, utc = _now_pair()
@@ -708,7 +777,7 @@ def _ctx_of(raw: bytes, di: zpct.DocIndex, off: int, span: int = 400) -> str:
 
 def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
     """掌阅 -> Kavita: 拉划线/书签, 写进 Kavita 注解表。"""
-    report: dict[str, Any] = {"books": [], "added": 0, "updated": 0,
+    report: dict[str, Any] = {"books": [], "added": 0, "updated": 0, "retitled": 0,
                               "deleted": 0, "skipped": 0, "empty": [], "errors": []}
     links = [l for l in mapping.all_links() if not series_ids or l.kavita_series_id in series_ids]
     nb_index = {}
@@ -756,7 +825,9 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
         if not res:
             # downloadDataV2 坏通道兜底: 用 getUserDataVer 的位置 + 原书切正文
             try:
-                res = positions_payload(book32, epub)
+                own = {norm_key(r["zy_key"]) for r in links_for_series(link.kavita_series_id, "note")
+                       if (r["source"] or "") == "kv" and r["zy_key"]}
+                res = positions_payload(book32, epub, exclusive_keys=own)
             except Exception as e:
                 report["errors"].append(f"positions {book32}: {e}")
                 res = {}
@@ -794,7 +865,13 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             ex = _kv_xpath(geo, page, _end_xpath(geo, epub, sc, n, g, page, rel), sliced)
             existing = link_get("note", book32, key)
             if existing and int(existing["marktime"] or 0) == int(n.get("marktime") or 0):
-                report["skipped"] += 1
+                # 正文口径修过一次 (2026-11-01: 少最后一个字), 已同步过的就补文本
+                if not dry_run and kavita_refresh_note_text(
+                        int(existing["kavita_annotation_id"] or 0),
+                        (n.get("summary") or "").strip()):
+                    report["retitled"] += 1
+                else:
+                    report["skipped"] += 1
                 continue
             if dry_run:
                 report["added" if not existing else "updated"] += 1
@@ -1330,7 +1407,8 @@ def repair(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dic
                 if len(poses) < 2 or not row["kavita_annotation_id"]:
                     report["skipped"] += 1
                     continue
-                summary = text_of_span(epub, poses[0], poses[1]).strip()
+                summary = text_of_span(epub, poses[0], poses[1],
+                                       end_inclusive=(row["source"] or "") != "kv").strip()
                 g = pos_to_global(geo, poses[0])
                 if g is None:
                     report["skipped"] += 1

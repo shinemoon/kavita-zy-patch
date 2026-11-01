@@ -352,6 +352,33 @@ python3 tests/test_notes_time.py
 `_kv_xpath()` 按切片与否决定前缀，`_end_xpath()` 算结束段落。
 历史数据一条命令重算：`python3 sync/zync.py notes repair`（幂等，可反复跑）。
 
+### 划线的 `positionend` 是「最后一个字的起始字节」（2026-11-01 晚）
+
+同一天修完坐标之后发现的第二层问题：**每条从 App 拉回来的划线，正文都少最后一个字**
+（`不可` / `站了许` / `温` / `碎冰碰壁` / `对错是` … 22 条里 18 条如此）。
+
+拿 22 条真实划线逐条对齐原书字节才看清两边口径不同：
+
+| 写法 | `positionend` 指向 | 例 |
+|---|---|---|
+| **App** | 最后一个字的**起始字节**（闭区间） | `不可及` → 指向「及」的第一个字节 |
+| **我们 push** | 最后一个字**之后**（开区间） | `不可及` → 指向「及」后面的字节 |
+
+所以按开区间切（`raw[start:end]`）会把 App 那条的最后一个字切掉；若按闭区间读我们自己
+push 的那几条，又会多出一个字。修法（`text_of_span(..., end_inclusive=)`）：
+
+* `positions_payload(..., exclusive_keys=)` —— `zy_note_link.source='kv'`（我们推上去的）
+  用开区间，其余（App 写的）按闭区间补一个字；补到的若是 `<` / 空白就不补
+* `pull` 发现已有注解的 `marktime` 相同（以前直接 skip）时，再比对一次正文：
+  库里的文本是新文本的**严格前缀且只短 1-3 字** → 就地补 `SelectedText`
+  （`kavita_refresh_note_text()`，`report["retitled"]`）。两边确实不同的不动
+* `repair()` 同样按 `source` 选口径
+
+实测：剑来 17 条 + 狐 1 条补齐，27/27 注解在 `book-page` 里仍能注入高亮。
+App 侧口径没有改动（我们 push 仍写开区间）—— 换口径会改 `uniquecheck`，
+等于让云端多出一条新笔记，得不偿失。
+
+
 ### 进度记录的 bookId 双 key（2026-10-26 晚，修正上面那段）
 
 上一段说的"两套存储"其实只是**表面现象**：`getUserNotebooks` 只是把 App 自己
