@@ -375,11 +375,12 @@ def _notes_sync(kind: str, sid: int, quiet: bool = True) -> dict:
         res = (zy_notes.pull if kind == "pull" else zy_notes.push)([sid])
         touched = (res.get("added") or 0) + (res.get("updated") or 0) + \
                   (res.get("pushed") or 0) + (res.get("pushed_marks") or 0) + \
-                  (res.get("deleted") or 0)
+                  (res.get("deleted") or 0) + (res.get("retitled") or 0)
         if (not quiet) or touched or res.get("errors") or res.get("empty"):
             log(f"notes-{kind} series={sid} pushed={res.get('pushed') or 0} "
                 f"marks={res.get('pushed_marks') or 0} added={res.get('added') or 0} "
                 f"updated={res.get('updated') or 0} del={res.get('deleted') or 0} "
+                f"retitled={res.get('retitled') or 0} "
                 f"skip={res.get('skipped') or 0} empty={len(res.get('empty') or [])}"
                 + (f" errors={res.get('errors')}" if res.get("errors") else ""))
         _NOTES_LAST[key] = now
