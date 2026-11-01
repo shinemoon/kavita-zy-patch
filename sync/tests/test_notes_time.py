@@ -356,6 +356,55 @@ finally:
     zy_notes.urllib.request.urlopen = _orig_urlopen
 check("uploadData URL 用 & 续接 (不出现双问号)", bool(_urls) and "?isCheck=1&" in _urls[0], _urls)
 
+# --- 身份大小写融合 (consolidate_case) ------------------------------------
+_orig_c = {n: getattr(zy_notes, n) for n in
+           ("positions_payload", "data_ver", "upload", "delete_items", "_orig_epub", "geometry")}
+_uploads, _dels = [], []
+
+
+def _fake_pp(book32, epub):
+    return {"booknotes": [{"uniquecheck": "ab_1_0_0$##3-0-1-5-0##$1_0_0$##3-0-1-9-0##$",
+                           "positionstart": "1_0_0$##3-0-1-5-0##$",
+                           "positionend": "1_0_0$##3-0-1-9-0##$",
+                           "summary": "内容", "remark": "", "marktime": 111}],
+            "bookmarks": [{"uniquecheck": "ab_2_0_0$##3-0-2-7-0##$",
+                           "markpostion": "2_0_0$##3-0-2-7-0##$", "marktime": 222}],
+            "delList": []}
+
+
+zy_notes.positions_payload = _fake_pp
+zy_notes._orig_epub = lambda link: "/nonexistent.epub"
+zy_notes.geometry = lambda link: None
+zy_notes.data_ver = lambda b: {}                       # 大写那边什么都没有
+zy_notes.upload = lambda payload: (_uploads.append(payload), {"code": 0})[1]
+zy_notes.delete_items = lambda b, keys, type_=2: (_dels.append((b, list(keys), type_)), {"code": 0})[1]
+
+_link = type("L", (), {"zy_book_id": "AB" + "C" * 62, "zy_book_name": "测试书",
+                       "kavita_series_id": 99, "kavita_chapter_id": -1, "epub_path": None})()
+_res = zy_notes.consolidate_case(_link)
+check("consolidate 并入大写", _res.get("merged") == 1 and _res.get("merged_marks") == 1, _res)
+_pl = _uploads[0] if _uploads else {}
+_keys = [n.get("uniquecheck") for n in (_pl.get("booknotes") or [])]
+check("并入后 key 是大写", _keys and _keys[0].startswith("AB"), _keys)
+check("旧身份按小写删 (划线 type=2 / 书签 type=1)",
+      [d[0] for d in _dels] == ["abc" + "c" * 29, "abc" + "c" * 29]
+      and [d[2] for d in _dels] == [2, 1], _dels)
+
+_dels.clear()
+_res2 = zy_notes.consolidate_case(_link, dry_run=True)
+check("consolidate dry-run 不写不删", _res2.get("dry_run") and not _dels, _res2)
+
+zy_notes.data_ver = lambda b: {"booknotesVerList": [
+    {"uniquecheck": "AB_1_0_0$##3-0-1-5-0##$1_0_0$##3-0-1-9-0##$", "marktime": 111}],
+    "bookmarksVerList": [{"uniquecheck": "AB_2_0_0$##3-0-2-7-0##$", "marktime": 222}]}
+_uploads.clear()
+_res3 = zy_notes.consolidate_case(_link)
+check("consolidate 幂等 (已在大写的不重推)",
+      _res3.get("merged") == 0 and _res3.get("merged_marks") == 0 and not _uploads, _res3)
+
+for _n, _v in _orig_c.items():
+    setattr(zy_notes, _n, _v)
+
 for _n, _v in _orig.items():
     setattr(zy_notes, _n, _v)
 zy_notes.mapping.all_links = _orig_links

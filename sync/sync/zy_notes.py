@@ -725,6 +725,14 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
 
     for link in links:
         book32 = kb32(link.zy_book_id)
+        if not dry_run:
+            try:                       # 云端可能又被 App 写了小写身份 -> 折回大写
+                merged = consolidate_case(link)
+                if merged.get("merged") or merged.get("merged_marks") or merged.get("error"):
+                    report.setdefault("case_merged", []).append(
+                        {"series": link.kavita_series_id, **merged})
+            except Exception as e:     # noqa: BLE001
+                report["errors"].append(f"consolidate {book32}: {e}")
         geo = geometry(link)
         epub = _orig_epub(link)
         if geo is None or not epub:
@@ -1189,6 +1197,107 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                                 "pushed": len(out_notes), "pushed_marks": len(out_marks),
                                 "deleted": len(del_notes) + len(del_marks)})
     return report
+
+
+# --------------------------------------------------------------------------
+# 身份大小写融合 (2026-11-01)
+# --------------------------------------------------------------------------
+
+def _old_key(zy_book_id: str) -> str:
+    """历史身份: 32hex **小写** (>=2026-11-01 之前的写法)。"""
+    return (zy_book_id or "").strip().split("_")[0][:32].lower()
+
+
+def consolidate_case(link: mapping.BookLink, *, dry_run: bool = False,
+                     delete_old: bool = True) -> dict:
+    """把小写身份上的笔记/书签并入大写身份, 再删掉小写那份。
+
+    云端对 bookid 大小写敏感: 小写 `<md5>` 与大写 `<MD5>` 是**两个独立身份**,
+    App 的「笔记本」列表会显示成两条同名书。App 有时仍会往小写写 (它自己的
+    本地书 id 口径), 所以 pull 每次先融合一次 —— 否则用户会一直看到两条。
+    幂等: 已在大写里的 key 跳过; 正文从原书按字节切。
+
+    返回 {"merged": n, "marks": n, "deleted": n} / {"skip": ...}
+    """
+    new = kb32(link.zy_book_id)
+    old = _old_key(link.zy_book_id)
+    if not old or old == new:
+        return {"skip": "no_twin"}
+    src = positions_payload(old, _orig_epub(link)) if _orig_epub(link) else {}
+    src_notes = src.get("booknotes") or []
+    src_marks = src.get("bookmarks") or []
+    if not src_notes and not src_marks:
+        return {"skip": "empty_old"}
+    dst = data_ver(new)
+    have_n = {norm_key(str(i.get("uniquecheck"))) for i in (dst.get("booknotesVerList") or [])}
+    have_m = {norm_key(str(i.get("uniquecheck"))) for i in (dst.get("bookmarksVerList") or [])}
+    notes = [n for n in src_notes if norm_key(n["uniquecheck"]) not in have_n]
+    marks = [m for m in src_marks if norm_key(m["uniquecheck"]) not in have_m]
+    out = {"old_notes": len(src_notes), "old_marks": len(src_marks),
+           "merged": len(notes), "merged_marks": len(marks)}
+    if dry_run:
+        out["dry_run"] = True
+        return out
+    if notes or marks:
+        geo = geometry(link)
+        epub = _orig_epub(link)
+        payload_notes, payload_marks = [], []
+        for n in notes:
+            pos_s, pos_e = _split_positions(n["uniquecheck"])[:2]
+            item = {"uniquecheck": norm_key(n["uniquecheck"]), "style": 0,
+                    "color": DEFAULT_COLOR, "summary": (n.get("summary") or "").strip(),
+                    "remark": (n.get("remark") or "").strip(),
+                    "positionstart": pos_s, "positionend": pos_e,
+                    "positionstartl": 0, "positionendl": 0,
+                    "marktime": int(n.get("marktime") or 0)}
+            g = pos_to_global(geo, pos_s) if geo else None
+            if g is not None and epub:
+                try:
+                    item.update(_idea_fields(epub, geo, g))
+                except Exception:                      # noqa: BLE001
+                    pass
+            payload_notes.append(item)
+        for m in marks:
+            pos = m.get("markpostion") or (_split_positions(m["uniquecheck"])[:1] or [""])[0]
+            g = pos_to_global(geo, pos) if geo else None
+            label, pct = "", 0
+            if g is not None and geo is not None:
+                try:
+                    label = _chapter_label(geo, int(geo.locate(g)[0]))
+                except Exception:                      # noqa: BLE001
+                    label = ""
+                pct = round(g / max(1, geo.total_bytes), 8)
+            payload_marks.append({"uniquecheck": norm_key(m["uniquecheck"]),
+                                  "marksummary": label, "markpostion": pos,
+                                  "markpercent": pct, "markstyle": 0,
+                                  "marktime": int(m.get("marktime") or 0)})
+        payload: dict[str, Any] = {"bookbase": {
+            "name": link.zy_book_name,
+            "type": 5,
+            "readpostion": "",
+            "readpercent": 0,
+            "bookid": new,
+            "updatetime": int(time.time() * 1000),
+            "deviceName": "KavitaBridge",
+            "marknum": len(payload_marks), "notenum": len(payload_notes)}}
+        if payload_marks:
+            payload["bookmarks"] = payload_marks
+        if payload_notes:
+            payload["booknotes"] = payload_notes
+        res = upload(payload)
+        if res.get("code") not in (0, None):
+            out["error"] = f"upload: {res}"
+            return out
+    if delete_old:
+        for keys, type_ in ((src_notes, 2), (src_marks, 1)):
+            if not keys:
+                continue
+            try:
+                delete_items(old, [str(k["uniquecheck"]).lower() for k in keys], type_=type_)
+                out["deleted"] = out.get("deleted", 0) + len(keys)
+            except Exception as e:                     # noqa: BLE001
+                out.setdefault("error", []).append(f"del: {e}")
+    return out
 
 
 def repair(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
