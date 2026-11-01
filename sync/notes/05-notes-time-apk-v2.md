@@ -333,7 +333,12 @@ zy_time_link(day, zy_book_id, kavita_series_id, minutes, source, mode)
 
 ## 6. 实测记录 (本次)
 
-* `getUserNotebooks` ✅ (gzip 应答! `res` 是列表, bookid 为 **32 hex 小写** = 云书 64 hex 的前半段)
+* `getUserNotebooks` ✅ (gzip 应答! `res` 是列表, bookid 为 **32 hex 大写** = 云书 64 hex 的前半段)
+  * 2026-11-01 更正: 云端对 **大小写敏感**, 小写与大写是**两个独立身份**, 会各占一行
+    (实测剑来: 小写 20 条 / 大写 1 条, App 笔记本里显示成两条同名书)。
+    掌阅当前版本新建的笔记写**大写** (`mLocalBookFileMd5 = core.getFileMD5(f).toUpperCase()`,
+    `of/a.java:1670`), 历史条目是小的 → 已用 `tools/migrate_note_case.py` 全部迁到大写并删旧身份。
+    桥接代码 `kb32()` 也改大写, `zy_note_link.zy_key` 同步大写。
 * `getUserDataVer?bookids=` ✅ 返回三组版本表 (剑来: notes 17 / bookmarks 3)
 * `downloadDataV2` ⚠️ **本次全部返 200 + `{"msg","fromType","status":0}` 无 `res`**,
   换 md5 (哨兵/空数组/随机/大写) 与 Content-Type 都一样; 再连发几次后变 403 (疑似风控)。

@@ -4,7 +4,8 @@ APK 依据见 notes/05-notes-time-apk-v2.md。要点:
 
 * 身份: `uniquecheck = <bookid32>_<positionstart><positionend>` (划线)
                   `<bookid32>_<markpostion>`          (书签)
-  bookid32 = 云书 64hex book_id 的**前 32 位小写**
+  bookid32 = 云书 64hex book_id 的**前 32 位大写** (2026-11-01 由小写统一; 云端对大小写敏感,
+             小写与大写是两个独立身份, App 笔记本会显示成两条同名书)
 * 位置: `<chapterId+1>_0_0$##3-0-<chapterId+1>-<章内字节偏移>-0##$`
   与 readPosition 同一坐标系 (见 zpct.py)
 * 上传: POST /cloud/storage2/safe/uploadData?isCheck=1  (gzip)
@@ -53,8 +54,19 @@ DEFAULT_COLOR = -36352
 # --------------------------------------------------------------------------
 
 def kb32(zy_book_id: str) -> str:
-    """云书 book_id (64hex) -> 笔记服务用的 32hex 小写。"""
-    return (zy_book_id or "").strip().split("_")[0][:32].lower()
+    """云书 book_id (64hex) -> 笔记服务用的 32hex **大写**。
+
+    2026-11-01 改: 原来用小写, 结果云端同一本书存在**两个身份**
+    (小写 20 条笔记 / 大写 1 条笔记), App 的「笔记本」列表里显示成两条同名的书。
+    掌阅自己的本地书身份 `mLocalBookFileMd5` = `core.getFileMD5(f).toUpperCase()`
+    (of/a.java:1670), 进度上报也用大写, 所以统一大写。
+    """
+    return (zy_book_id or "").strip().split("_")[0][:32].upper()
+
+
+def norm_key(key: str) -> str:
+    """uniquecheck 归一: 前 32 位 bookid 大小写混用过, 位置段全是数字/符号, 整串大写即可。"""
+    return (key or "").strip().upper()
 
 
 def note_key(book32: str, pos_s: str, pos_e: str) -> str:
@@ -224,8 +236,9 @@ def notebooks() -> list[dict]:
 def data_ver(book32: str) -> dict:
     """getUserDataVer: 云端三组 {uniquecheck, marktime} 版本表。"""
     d = _call("/getUserDataVer", extra={"bookids": book32})
+    want = kb32(book32)
     for row in (d.get("res") or []):
-        if str(row.get("bookid", "")).lower() == book32.lower():
+        if kb32(str(row.get("bookid", ""))) == want:
             return row
     return {}
 
@@ -701,7 +714,12 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
     nb_index = {}
     try:
         for row in notebooks():
-            nb_index[str(row.get("bookid", "")).lower()] = row
+            # 同一本书云端可能同时有大小写两个身份 (2026-11-01 之前的历史),
+            # 归一后**大写优先** (掌阅自己的本地书身份就是大写)
+            bid = kb32(str(row.get("bookid", "")))
+            if bid and (bid not in nb_index
+                        or str(row.get("bookid", ""))[:32].isupper()):
+                nb_index[bid] = row
     except Exception as e:                       # 网络问题不该炸整个 pull
         report["errors"].append(f"getUserNotebooks: {e}")
 
@@ -726,7 +744,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             continue
         notes = res.get("booknotes") or []
         marks = res.get("bookmarks") or []
-        dels = set(res.get("delList") or [])
+        dels = {norm_key(x) for x in (res.get("delList") or [])}
         if not res:
             # downloadDataV2 坏通道兜底: 用 getUserDataVer 的位置 + 原书切正文
             try:
@@ -736,7 +754,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 res = {}
             notes = res.get("booknotes") or []
             marks = res.get("bookmarks") or []
-            dels = set(res.get("delList") or [])
+            dels = {norm_key(x) for x in (res.get("delList") or [])}
             if notes or marks:
                 report.setdefault("via_positions", []).append(link.kavita_series_id)
             else:
@@ -756,7 +774,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             "slice" if sliced else "spine")
         # --- 划线
         for n in notes:
-            key = n.get("uniquecheck") or ""
+            key = norm_key(n.get("uniquecheck"))
             if not key or key in dels:
                 continue
             g = pos_to_global(geo, n.get("positionstart", ""))
@@ -786,7 +804,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
 
         # --- 书签
         for m in marks:
-            key = m.get("uniquecheck") or ""
+            key = norm_key(m.get("uniquecheck"))
             if not key or key in dels:
                 continue
             g = pos_to_global(geo, m.get("markpostion", ""))
@@ -897,13 +915,13 @@ def cloud_versions(book32: str) -> dict[str, dict]:
             if not k:
                 continue
             try:
-                out[str(k)] = int(it.get("marktime") or 0)
+                out[norm_key(str(k))] = int(it.get("marktime") or 0)
             except (TypeError, ValueError):
-                out[str(k)] = 0
+                out[norm_key(str(k))] = 0
         return out
 
     return {"note": _pick("booknotesVerList"), "mark": _pick("bookmarksVerList"),
-            "del": {str(x) for x in (row.get("delList") or [])}}
+            "del": {norm_key(str(x)) for x in (row.get("delList") or [])}}
 
 
 def _sig(kind: str, key: str, text: str, remark: str, meta: str = "") -> str:
@@ -1015,7 +1033,7 @@ def push(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
         idx_row = {}
         try:
             for row in notebooks():
-                if str(row.get("bookid", "")).lower() == book32:
+                if kb32(str(row.get("bookid", ""))) == book32:
                     idx_row = row
                     break
         except Exception:

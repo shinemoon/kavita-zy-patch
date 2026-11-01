@@ -20,13 +20,16 @@ def check(name, cond, extra=""):
 
 
 # --- 身份 / 位置 -----------------------------------------------------------
-check("kb32 截 32 位", zy_notes.kb32("70776A64C32C1C065DAB241F3E9F133A55C7D8") ==
-      "70776a64c32c1c065dab241f3e9f133a")
+check("kb32 截 32 位 (统一大写)", zy_notes.kb32("70776a64c32c1c065dab241f3e9f133a55c7d8") ==
+      "70776A64C32C1C065DAB241F3E9F133A")
+check("norm_key 归一大小写", zy_notes.norm_key("ab_cd$##3-0-1-2-0##$") ==
+      "AB_CD$##3-0-1-2-0##$")
 
 ps = "107_0_0$##3-0-107-66812-0##$"
 pe = "107_0_0$##3-0-107-66860-0##$"
 key = zy_notes.note_key(zy_notes.kb32("A" * 64), ps, pe)
-check("note_key 结构", key == ("a" * 32) + "_" + ps + pe)
+check("note_key 结构", key == ("A" * 32) + "_" + ps + pe)
+check("mark_key 结构", zy_notes.mark_key(zy_notes.kb32("B" * 64), ps) == "B" * 32 + "_" + ps)
 check("parse_position", zy_notes.parse_chapter_offset(ps) == (106, 66812), zy_notes.parse_chapter_offset(ps))
 check("build_position 往返", zpct.build_position(106, 66812) == ps, zpct.build_position(106, 66812))
 

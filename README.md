@@ -295,6 +295,12 @@ python3 tests/test_notes_time.py
 
 关键事实（都实测过，细节见 `sync/notes/05-notes-time-apk-v2.md`）：
 
+* **笔记身份统一大写（2026-11-01）**：`uniquecheck = <文件MD5 32hex 大写>_<起止位置>`。
+  云端对大小写敏感 —— 小写与大写是**两个独立身份**，App 的「笔记本」列表会显示成
+  两条同名书（实测剑来：小写 20 条 / 大写 1 条）。掌阅自己的本地书身份就是
+  `core.getFileMD5(f).toUpperCase()`（`of/a.java:1670`），所以统一大写。
+  迁移工具：`python3 tools/migrate_note_case.py [--dry-run] [--delete-old]`（幂等，
+  正文从原书按位置切，批注从 Kavita 注解补）。改完 `zy_note_link.zy_key` 也要大写。
 * **书身份是文件内容 MD5**，不是设备自增 id → 手机/平板读同一份文件落到同一个桶，
   多设备时长/笔记天然合并。自传书的 `local_bid = <文件MD5 32hex 大写>_local`。
   APK 依据：`od.a` 的身份参数 = `BookItem.mLocalBookId` = `MD5(file) + MD5(path)`
