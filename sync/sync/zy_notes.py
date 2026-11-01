@@ -895,7 +895,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
             page, rel, raw, inner = _locate(geo, epub, sc, g, (n.get("summary") or "").strip())
             xp = _kv_xpath(geo, page, rel, sliced)     # 切片版用相对路径, 原书带文件名 id
             ex = _kv_xpath(geo, page, _end_xpath(geo, epub, sc, n, g, page, rel), sliced)
-            lbl = _label_at(geo, g, page)
+            lbl = _label_at(geo, g)
             existing = link_get("note", book32, key)
             if existing and int(existing["marktime"] or 0) == int(n.get("marktime") or 0):
                 # 已同步过: 只补口径修正 (正文少最后一字 / 章节名是书名), 不重推
@@ -936,7 +936,7 @@ def pull(series_ids: list[int] | None = None, *, dry_run: bool = False) -> dict:
                 continue
             page, rel, _raw, _inner = _locate(geo, epub, sc, g, "")
             xp = _kv_xpath(geo, page, rel, sliced)     # 同划线: 切片版相对, 原书带文件名 id
-            lbl = _label_at(geo, g, page)
+            lbl = _label_at(geo, g)
             existing = link_get("bookmark", book32, key)
             if existing and int(existing["marktime"] or 0) == int(m.get("marktime") or 0):
                 if not dry_run and kavita_set_chapter_title(
